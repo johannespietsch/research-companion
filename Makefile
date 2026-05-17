@@ -19,8 +19,12 @@ help:
 	@echo "  PORT=8080 make dev    override the default port"
 	@echo ""
 
+# Only create the venv if one doesn't already exist. Running `python3 -m venv`
+# on top of an existing venv from inside an activated shell (VS Code does this
+# automatically) leaves the venv in a half-rebuilt state. To force a clean
+# rebuild, delete .venv manually.
 $(VENV)/.installed: requirements.txt
-	python3 -m venv $(VENV)
+	@test -x $(PYTHON) || python3 -m venv $(VENV)
 	$(PIP) install --upgrade pip --quiet
 	$(PIP) install -r requirements.txt --quiet
 	$(VENV)/bin/playwright install chromium --with-deps
