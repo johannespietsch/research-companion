@@ -1,0 +1,534 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>filter.fyi</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg:      #141414;
+    --surface: #1e1e1e;
+    --border:  #2e2e2e;
+    --text:    #d4d4d4;
+    --muted:   #6b6b6b;
+    --accent:  #7c6af7;
+    --accent2: #5b4fd6;
+    --danger:  #c0392b;
+    --green:   #27ae60;
+    --radius:  6px;
+    --font:    'Menlo', 'Consolas', 'Monaco', monospace;
+  }
+
+  body { background: var(--bg); color: var(--text); font-family: var(--font); font-size: 13px; line-height: 1.6; }
+
+  #login {
+    display: flex; align-items: center; justify-content: center;
+    min-height: 100vh; flex-direction: column; gap: 12px;
+  }
+  #login h1 { font-size: 18px; color: var(--accent); letter-spacing: 1px; }
+  #login p { color: var(--muted); font-size: 12px; }
+  #login input {
+    width: 320px; padding: 10px 14px; background: var(--surface);
+    border: 1px solid var(--border); color: var(--text); border-radius: var(--radius);
+    font-family: var(--font); font-size: 13px; outline: none;
+  }
+  #login input:focus { border-color: var(--accent); }
+
+  header {
+    display: flex; align-items: center; gap: 20px;
+    padding: 12px 20px; border-bottom: 1px solid var(--border);
+    background: var(--surface); position: sticky; top: 0; z-index: 10;
+  }
+  header h1 { font-size: 14px; color: var(--accent); white-space: nowrap; }
+  nav { display: flex; gap: 4px; flex: 1; }
+  nav button {
+    padding: 5px 14px; border: 1px solid transparent; border-radius: var(--radius);
+    background: none; color: var(--muted); font-family: var(--font); font-size: 12px;
+    cursor: pointer; transition: all 0.15s;
+  }
+  nav button:hover { color: var(--text); }
+  nav button.active { background: var(--bg); border-color: var(--border); color: var(--accent); }
+  #logout-btn {
+    margin-left: auto; padding: 5px 12px; border: 1px solid var(--border);
+    border-radius: var(--radius); background: none; color: var(--muted);
+    font-family: var(--font); font-size: 11px; cursor: pointer;
+  }
+  #logout-btn:hover { color: var(--danger); border-color: var(--danger); }
+
+  main { max-width: 780px; margin: 0 auto; padding: 28px 20px; }
+
+  section { display: none; }
+  section.active { display: block; }
+
+  h2 { font-size: 13px; color: var(--muted); text-transform: uppercase;
+       letter-spacing: 1px; margin-bottom: 16px; }
+
+  /* Submit tab */
+  .mode-tabs { display: flex; gap: 8px; margin-bottom: 16px; }
+  .mode-tab {
+    padding: 4px 12px; border: 1px solid var(--border); border-radius: var(--radius);
+    background: none; color: var(--muted); font-family: var(--font); font-size: 12px;
+    cursor: pointer;
+  }
+  .mode-tab.active { border-color: var(--accent); color: var(--accent); }
+
+  .submit-form { display: none; flex-direction: column; gap: 10px; }
+  .submit-form.active { display: flex; }
+
+  textarea, input[type=text], input[type=url] {
+    width: 100%; padding: 10px 14px; background: var(--surface);
+    border: 1px solid var(--border); color: var(--text); border-radius: var(--radius);
+    font-family: var(--font); font-size: 13px; resize: vertical; outline: none;
+  }
+  textarea:focus, input[type=text]:focus, input[type=url]:focus { border-color: var(--accent); }
+  textarea { min-height: 120px; }
+
+  label.file-label {
+    display: flex; align-items: center; gap: 10px; padding: 10px 14px;
+    background: var(--surface); border: 1px dashed var(--border);
+    border-radius: var(--radius); cursor: pointer; color: var(--muted);
+    transition: border-color 0.15s;
+  }
+  label.file-label:hover { border-color: var(--accent); color: var(--text); }
+  input[type=file] { display: none; }
+  .file-name { font-size: 12px; color: var(--text); }
+
+  .row { display: flex; gap: 10px; align-items: flex-start; }
+  .row textarea, .row input { flex: 1; }
+
+  .btn {
+    padding: 8px 20px; border: none; border-radius: var(--radius);
+    background: var(--accent); color: #fff; font-family: var(--font);
+    font-size: 13px; cursor: pointer; transition: background 0.15s; white-space: nowrap;
+  }
+  .btn:hover { background: var(--accent2); }
+  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .btn-danger { background: var(--danger); }
+  .btn-danger:hover { background: #a93226; }
+  .btn-sm { padding: 4px 10px; font-size: 11px; }
+
+  #result {
+    margin-top: 20px; padding: 16px; background: var(--surface);
+    border: 1px solid var(--border); border-radius: var(--radius);
+    white-space: pre-wrap; font-size: 12px; display: none;
+  }
+  #result.visible { display: block; }
+
+  /* Browse tab */
+  .search-row { display: flex; gap: 10px; margin-bottom: 16px; }
+  .search-row input { flex: 1; }
+
+  #items-list { display: flex; flex-direction: column; gap: 8px; }
+
+  .item-card {
+    padding: 12px 14px; background: var(--surface);
+    border: 1px solid var(--border); border-radius: var(--radius); cursor: pointer;
+    transition: border-color 0.15s;
+  }
+  .item-card:hover { border-color: var(--accent); }
+  .item-card.expanded { border-color: var(--accent); }
+  .item-header { display: flex; gap: 10px; align-items: baseline; }
+  .item-id { color: var(--muted); font-size: 11px; min-width: 36px; }
+  .item-type { color: var(--accent); font-size: 11px; min-width: 70px; }
+  .item-date { color: var(--muted); font-size: 11px; min-width: 80px; }
+  .item-source { color: var(--text); font-size: 12px; flex: 1;
+                  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .item-body { display: none; margin-top: 12px; padding-top: 12px;
+               border-top: 1px solid var(--border); font-size: 12px; }
+  .item-card.expanded .item-body { display: block; }
+  .item-analysis { white-space: pre-wrap; color: var(--text); }
+  .item-actions { margin-top: 10px; display: flex; gap: 8px; }
+  #items-empty { color: var(--muted); font-size: 12px; padding: 20px 0; }
+
+  /* Profile tab */
+  #profile-form { display: flex; flex-direction: column; gap: 10px; }
+  #profile-form textarea { min-height: 160px; }
+  #profile-status { font-size: 12px; color: var(--green); display: none; }
+
+  /* Status / spinner */
+  .status { font-size: 12px; color: var(--muted); margin-top: 8px; }
+  .error { color: #e74c3c; }
+
+  .spinner {
+    display: inline-block; width: 12px; height: 12px; margin-right: 6px;
+    border: 2px solid var(--border); border-top-color: var(--accent);
+    border-radius: 50%; animation: spin 0.7s linear infinite; vertical-align: middle;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .note-hint { font-size: 11px; color: var(--muted); }
+</style>
+</head>
+<body>
+
+<!-- ── Login ─────────────────────────────────────────────────── -->
+<div id="login">
+  <h1>⬡ filter.fyi</h1>
+  <p>Enter your API token to continue</p>
+  <input id="token-input" type="password" placeholder="paste your token here" autocomplete="off">
+  <button class="btn" onclick="doLogin()">Sign in</button>
+  <p id="login-error" class="error" style="display:none"></p>
+</div>
+
+<!-- ── App ───────────────────────────────────────────────────── -->
+<div id="app" style="display:none">
+  <header>
+    <h1>⬡ filter.fyi</h1>
+    <nav>
+      <button class="active" data-tab="submit">Submit</button>
+      <button data-tab="browse">Browse</button>
+      <button data-tab="profile">Profile</button>
+    </nav>
+    <button id="logout-btn" onclick="logout()">sign out</button>
+  </header>
+
+  <main>
+
+    <!-- Submit -->
+    <section id="tab-submit" class="active">
+      <h2>Add to knowledge base</h2>
+
+      <div class="mode-tabs">
+        <button class="mode-tab active" data-mode="text">Text / note</button>
+        <button class="mode-tab" data-mode="url">URL</button>
+        <button class="mode-tab" data-mode="file">File</button>
+      </div>
+
+      <!-- Text form -->
+      <div class="submit-form active" id="form-text">
+        <textarea id="text-input" placeholder="Paste text, a quick note, or anything worth analysing…"></textarea>
+        <input type="text" id="text-note" placeholder="Optional context note">
+        <div><button class="btn" onclick="submitText()">Analyse →</button></div>
+      </div>
+
+      <!-- URL form -->
+      <div class="submit-form" id="form-url">
+        <input type="url" id="url-input" placeholder="https://…">
+        <input type="text" id="url-note" placeholder="Optional context note">
+        <div><button class="btn" onclick="submitUrl()">Fetch &amp; analyse →</button></div>
+      </div>
+
+      <!-- File form -->
+      <div class="submit-form" id="form-file">
+        <label class="file-label" for="file-input">
+          <span>📎</span>
+          <span id="file-name-display">Choose a file — PDF, image, audio, or text</span>
+        </label>
+        <input type="file" id="file-input" accept=".pdf,.txt,.md,.jpg,.jpeg,.png,.gif,.webp,.mp3,.m4a,.ogg,.wav,.flac">
+        <input type="text" id="file-note" placeholder="Optional context note">
+        <div><button class="btn" onclick="submitFile()">Upload &amp; analyse →</button></div>
+      </div>
+
+      <div id="submit-status" class="status"></div>
+      <pre id="result"></pre>
+    </section>
+
+    <!-- Browse -->
+    <section id="tab-browse">
+      <h2>Knowledge base</h2>
+      <div class="search-row">
+        <input type="text" id="search-input" placeholder="Search…" oninput="debounceSearch(this.value)">
+        <button class="btn" onclick="loadItems()">↺ Refresh</button>
+      </div>
+      <div id="items-list"></div>
+    </section>
+
+    <!-- Profile -->
+    <section id="tab-profile">
+      <h2>Your profile</h2>
+      <p class="note-hint" style="margin-bottom:12px">
+        Tell the AI about yourself — background, interests, goals. This personalises every analysis.
+      </p>
+      <div id="profile-form">
+        <textarea id="profile-input" placeholder="e.g. I'm a backend engineer interested in distributed systems and ML infrastructure…"></textarea>
+        <div style="display:flex;gap:10px;align-items:center">
+          <button class="btn" onclick="saveProfile()">Save profile</button>
+          <span id="profile-status">Saved ✓</span>
+        </div>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<script>
+const API = '';  // same origin
+let TOKEN = '';
+
+// ── Auth ──────────────────────────────────────────────────────
+
+function getStoredToken() { return localStorage.getItem('rc_token') || ''; }
+function storeToken(t) { localStorage.setItem('rc_token', t); }
+function clearToken() { localStorage.removeItem('rc_token'); }
+
+async function doLogin() {
+  const t = document.getElementById('token-input').value.trim();
+  if (!t) return;
+  // Validate by calling /api/profile
+  const res = await fetch(`${API}/api/profile`, { headers: { Authorization: `Bearer ${t}` } });
+  if (res.ok) {
+    TOKEN = t;
+    storeToken(t);
+    showApp();
+  } else {
+    const el = document.getElementById('login-error');
+    el.textContent = 'Invalid token.';
+    el.style.display = '';
+  }
+}
+
+function logout() {
+  clearToken();
+  TOKEN = '';
+  document.getElementById('app').style.display = 'none';
+  document.getElementById('login').style.display = '';
+  document.getElementById('token-input').value = '';
+}
+
+function showApp() {
+  document.getElementById('login').style.display = 'none';
+  document.getElementById('app').style.display = '';
+  loadItems();
+  loadProfile();
+}
+
+// Auto-login on page load
+window.addEventListener('DOMContentLoaded', () => {
+  TOKEN = getStoredToken();
+  if (TOKEN) showApp();
+
+  // File input label
+  document.getElementById('file-input').addEventListener('change', e => {
+    const f = e.target.files[0];
+    document.getElementById('file-name-display').textContent = f ? f.name : 'Choose a file';
+  });
+
+  // Enter key in login
+  document.getElementById('token-input').addEventListener('keydown', e => {
+    if (e.key === 'Enter') doLogin();
+  });
+});
+
+// ── API helpers ───────────────────────────────────────────────
+
+async function api(path, opts = {}) {
+  const res = await fetch(`${API}${path}`, {
+    ...opts,
+    headers: { Authorization: `Bearer ${TOKEN}`, ...(opts.headers || {}) },
+  });
+  if (res.status === 401) { logout(); throw new Error('Session expired'); }
+  return res;
+}
+
+// ── Tabs ──────────────────────────────────────────────────────
+
+document.querySelectorAll('nav button').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('nav button').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('main section').forEach(s => s.classList.remove('active'));
+    btn.classList.add('active');
+    document.getElementById(`tab-${btn.dataset.tab}`).classList.add('active');
+    if (btn.dataset.tab === 'browse') loadItems();
+  });
+});
+
+document.querySelectorAll('.mode-tab').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.mode-tab').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.submit-form').forEach(f => f.classList.remove('active'));
+    btn.classList.add('active');
+    document.getElementById(`form-${btn.dataset.mode}`).classList.add('active');
+    clearResult();
+  });
+});
+
+// ── Submit ────────────────────────────────────────────────────
+
+function setStatus(msg, isError = false) {
+  const el = document.getElementById('submit-status');
+  el.innerHTML = msg;
+  el.className = 'status' + (isError ? ' error' : '');
+}
+
+function clearResult() {
+  const el = document.getElementById('result');
+  el.textContent = '';
+  el.style.display = 'none';
+  setStatus('');
+}
+
+function showResult(analysis) {
+  const el = document.getElementById('result');
+  el.textContent = analysis;
+  el.style.display = 'block';
+}
+
+async function submitText() {
+  const text = document.getElementById('text-input').value.trim();
+  const note = document.getElementById('text-note').value.trim();
+  if (!text) return;
+  setStatus('<span class="spinner"></span>Analysing…');
+  const fd = new FormData();
+  fd.append('text', text);
+  if (note) fd.append('user_note', note);
+  try {
+    const res = await api('/api/submit/text', { method: 'POST', body: fd });
+    const data = await res.json();
+    if (res.ok) { showResult(data.analysis); setStatus('Saved to knowledge base ✓'); }
+    else setStatus(`Error: ${data.detail || res.statusText}`, true);
+  } catch (e) { setStatus(`Error: ${e.message}`, true); }
+}
+
+async function submitUrl() {
+  const url = document.getElementById('url-input').value.trim();
+  const note = document.getElementById('url-note').value.trim();
+  if (!url) return;
+  setStatus('<span class="spinner"></span>Fetching and analysing…');
+  const fd = new FormData();
+  fd.append('url', url);
+  if (note) fd.append('user_note', note);
+  try {
+    const res = await api('/api/submit/url', { method: 'POST', body: fd });
+    const data = await res.json();
+    if (res.ok) { showResult(data.analysis); setStatus('Saved to knowledge base ✓'); }
+    else setStatus(`Error: ${data.detail || res.statusText}`, true);
+  } catch (e) { setStatus(`Error: ${e.message}`, true); }
+}
+
+async function submitFile() {
+  const file = document.getElementById('file-input').files[0];
+  const note = document.getElementById('file-note').value.trim();
+  if (!file) return;
+  setStatus('<span class="spinner"></span>Processing file…');
+  const fd = new FormData();
+  fd.append('file', file);
+  if (note) fd.append('user_note', note);
+  try {
+    const res = await api('/api/submit/file', { method: 'POST', body: fd });
+    const data = await res.json();
+    if (res.ok) { showResult(data.analysis); setStatus('Saved to knowledge base ✓'); }
+    else setStatus(`Error: ${data.detail || res.statusText}`, true);
+  } catch (e) { setStatus(`Error: ${e.message}`, true); }
+}
+
+// ── Browse ────────────────────────────────────────────────────
+
+const ICONS = {url:'🔗',note:'📝',voice_memo:'🎙',audio:'🎵',video:'🎬',photo:'📷',document:'📄',email:'✉️',unknown:'❓'};
+
+let _searchTimer;
+function debounceSearch(q) {
+  clearTimeout(_searchTimer);
+  _searchTimer = setTimeout(() => loadItems(q), 300);
+}
+
+async function loadItems(q = '') {
+  const list = document.getElementById('items-list');
+  list.innerHTML = '<div class="status"><span class="spinner"></span>Loading…</div>';
+  const url = q ? `/api/items?q=${encodeURIComponent(q)}` : '/api/items';
+  try {
+    const res = await api(url);
+    const items = await res.json();
+    renderItems(items);
+  } catch (e) {
+    list.innerHTML = `<div class="status error">${e.message}</div>`;
+  }
+}
+
+function renderItems(items) {
+  const list = document.getElementById('items-list');
+  if (!items.length) {
+    list.innerHTML = '<div id="items-empty">No entries yet.</div>';
+    return;
+  }
+  list.innerHTML = '';
+  items.forEach(item => list.appendChild(makeCard(item)));
+}
+
+function makeCard(item) {
+  const card = document.createElement('div');
+  card.className = 'item-card';
+  card.dataset.id = item.id;
+  const icon = ICONS[item.source_type] || '❓';
+  const date = (item.created_at || '').slice(0, 10);
+  const source = item.source || item.user_note || '—';
+  card.innerHTML = `
+    <div class="item-header">
+      <span class="item-id">#${item.id}</span>
+      <span class="item-type">${icon} ${item.source_type}</span>
+      <span class="item-date">${date}</span>
+      <span class="item-source">${esc(source)}</span>
+    </div>
+    <div class="item-body">
+      <div class="item-analysis">${esc(item.analysis || '(no analysis)')}</div>
+      <div class="item-actions">
+        <button class="btn btn-danger btn-sm" onclick="deleteItem(${item.id}, this)">Delete</button>
+      </div>
+    </div>`;
+  card.querySelector('.item-header').addEventListener('click', () => {
+    if (!card.classList.contains('expanded')) {
+      // Lazy-load full item
+      loadFullItem(item.id, card);
+    }
+    card.classList.toggle('expanded');
+  });
+  return card;
+}
+
+async function loadFullItem(id, card) {
+  if (card.dataset.loaded) return;
+  try {
+    const res = await api(`/api/items/${id}`);
+    const item = await res.json();
+    card.querySelector('.item-analysis').textContent = item.analysis || '(no analysis)';
+    card.dataset.loaded = '1';
+  } catch (_) {}
+}
+
+async function deleteItem(id, btn) {
+  if (!confirm(`Delete entry #${id}?`)) return;
+  btn.disabled = true;
+  try {
+    const res = await api(`/api/items/${id}`, { method: 'DELETE' });
+    if (res.status === 204) {
+      const card = document.querySelector(`.item-card[data-id="${id}"]`);
+      card?.remove();
+    }
+  } catch (e) { btn.disabled = false; }
+}
+
+// ── Profile ───────────────────────────────────────────────────
+
+async function loadProfile() {
+  try {
+    const res = await api('/api/profile');
+    const data = await res.json();
+    document.getElementById('profile-input').value = data.content || '';
+  } catch (_) {}
+}
+
+async function saveProfile() {
+  const content = document.getElementById('profile-input').value.trim();
+  const fd = new FormData();
+  fd.append('content', content);
+  try {
+    const res = await api('/api/profile', { method: 'PUT', body: fd });
+    if (res.ok) {
+      const el = document.getElementById('profile-status');
+      el.style.display = '';
+      setTimeout(() => { el.style.display = 'none'; }, 2000);
+    }
+  } catch (_) {}
+}
+
+// ── Utils ─────────────────────────────────────────────────────
+
+function esc(s) {
+  return String(s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;');
+}
+</script>
+</body>
+</html>

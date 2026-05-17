@@ -1,4 +1,6 @@
 __pycache__/
 .env
 research.db
-PROFILE.md
+.venv/
+data/
+.DS_Store

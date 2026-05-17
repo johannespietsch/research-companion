@@ -1,6 +1,10 @@
-from telegram.ext import Application, CommandHandler, MessageHandler, filters
+import os
+import logging
 
-from bot.commands import cmd_delete, cmd_list, cmd_profile, cmd_search, cmd_show
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, TypeHandler, filters
+
+from bot.commands import cmd_start, cmd_delete, cmd_list, cmd_profile, cmd_search, cmd_show, cmd_token
 from bot.handlers import (
     handle_audio,
     handle_document,
@@ -10,9 +14,44 @@ from bot.handlers import (
     handle_voice,
 )
 
+logger = logging.getLogger(__name__)
+
+# Comma-separated Telegram user IDs that may use the bot.
+# Leave unset or empty to allow everyone (useful for local dev / single-user).
+_ALLOWED_IDS: set[str] = {
+    uid.strip()
+    for uid in os.getenv("ALLOWED_USER_IDS", "").split(",")
+    if uid.strip()
+}
+
+
+async def _check_allowlist(update: Update, context) -> None:
+    """Reject updates from users not in the allowlist (when one is configured)."""
+    if not _ALLOWED_IDS:
+        return  # no allowlist configured — open access
+    user = update.effective_user
+    if user and str(user.id) not in _ALLOWED_IDS:
+        logger.warning("Blocked user %s (%s)", user.id, user.username)
+        if update.message:
+            await update.message.reply_text("Sorry, you are not authorised to use this bot.")
+        raise ApplicationHandlerStop()
+
+
+# Import here to avoid circular; only needed for the stop sentinel
+from telegram.ext import ApplicationHandlerStop  # noqa: E402
+
 
 def build_application(token: str) -> Application:
     app = Application.builder().token(token).build()
+
+    # Allowlist check runs first for every update (group -1)
+    app.add_handler(TypeHandler(Update, _check_allowlist), group=-1)
+
+    # Onboarding
+    app.add_handler(CommandHandler("start", cmd_start))
+
+    # Web UI token
+    app.add_handler(CommandHandler("token", cmd_token))
 
     # KB commands
     app.add_handler(CommandHandler("list", cmd_list))

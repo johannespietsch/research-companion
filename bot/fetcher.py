@@ -1,32 +1,47 @@
 import asyncio
 import logging
 import re
+from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
 import requests
-import trafilatura
+
+from bot.config import MAX_CONTENT_CHARS
 
 logger = logging.getLogger(__name__)
 
 _YT_PATTERNS = re.compile(r"(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})")
 
 
+def _youtube_thumbnail(video_id: str) -> str:
+    return f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+
+
 def _youtube_transcript(url: str) -> dict:
-    from youtube_transcript_api import YouTubeTranscriptApi, NoTranscriptFound, TranscriptsDisabled
+    from youtube_transcript_api import YouTubeTranscriptApi
 
     match = _YT_PATTERNS.search(url)
     if not match:
         return _yt_dlp_extract(url)
 
     video_id = match.group(1)
+    thumb = _youtube_thumbnail(video_id)
     try:
-        transcript = YouTubeTranscriptApi.get_transcript(video_id)
-        text = " ".join(t["text"] for t in transcript)
-        return {"text": text[:8000], "title": f"YouTube video ({video_id})", "source_type": "youtube"}
-    except (NoTranscriptFound, TranscriptsDisabled):
+        api = YouTubeTranscriptApi()
+        fetched = api.fetch(video_id)
+        text = " ".join(snippet.text for snippet in fetched)
+        return {
+            "text": text[:MAX_CONTENT_CHARS],
+            "title": f"YouTube video ({video_id})",
+            "source_type": "youtube",
+            "image_urls": [thumb],
+        }
+    except Exception:
         logger.info(f"No transcript for {video_id}, falling back to yt-dlp description")
-        return _yt_dlp_extract(url)
+        result = _yt_dlp_extract(url)
+        result.setdefault("image_urls", []).append(thumb)
+        return result
 
 
 def _tweet_id_from_url(url: str) -> str | None:
@@ -83,10 +98,10 @@ def _format_fxtwitter(tweet: dict, url: str) -> dict:
         title = article.get("title", "")
         body = article.get("text") or tweet.get("text", "")
         text = f"X Article by @{handle}: {title}\n\n{body}"
-        return {"text": text[:8000], "title": title or f"Article by @{handle}", "source_type": "social", "image_urls": image_urls}
+        return {"text": text[:MAX_CONTENT_CHARS], "title": title or f"Article by @{handle}", "source_type": "social", "image_urls": image_urls}
 
     text = f"@{handle} ({author}):\n\n{tweet.get('text', '')}"
-    return {"text": text[:8000], "title": f"Post by @{handle}", "source_type": "social", "image_urls": image_urls}
+    return {"text": text[:MAX_CONTENT_CHARS], "title": f"Post by @{handle}", "source_type": "social", "image_urls": image_urls}
 
 
 def _format_syndication(data: dict, url: str) -> dict:
@@ -98,7 +113,7 @@ def _format_syndication(data: dict, url: str) -> dict:
         if m.get("type") == "photo" and m.get("media_url_https")
     ]
     text = f"@{handle} ({author}):\n\n{data.get('text', '')}"
-    return {"text": text[:8000], "title": f"Post by @{handle}", "source_type": "social", "image_urls": image_urls}
+    return {"text": text[:MAX_CONTENT_CHARS], "title": f"Post by @{handle}", "source_type": "social", "image_urls": image_urls}
 
 
 def _fetch_tweet(url: str) -> dict:
@@ -120,51 +135,309 @@ def _fetch_tweet(url: str) -> dict:
 
 
 def _yt_dlp_extract(url: str) -> dict:
-    import yt_dlp
+    """Extract metadata + subtitles from a video URL via yt-dlp.
 
-    # ignore_no_formats_error: return info dict even when the tweet has no video
+    Returns info dict with text/title/source_type; does NOT transcribe audio
+    (use _yt_dlp_transcribe for that).
+    """
+    import yt_dlp
+    import tempfile, os
+
     ydl_opts = {
         "quiet": True,
         "skip_download": True,
         "ignore_no_formats_error": True,
+        "writesubtitles": True,
+        "writeautomaticsub": True,
+        "subtitleslangs": ["all"],   # grab whatever is available, filter after
+        "subtitlesformat": "vtt",
+        "outtmpl": os.path.join("%(id)s", "%(id)s.%(ext)s"),
     }
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-        if not info:
-            raise ValueError("yt-dlp returned no info")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ydl_opts["paths"] = {"home": tmpdir}
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+            if not info:
+                raise ValueError("yt-dlp returned no info")
+
+            # Walk the whole tmpdir — yt-dlp may nest files under a subdirectory
+            subtitle_text = ""
+            for dirpath, _, filenames in os.walk(tmpdir):
+                for fname in filenames:
+                    if not fname.endswith(".vtt"):
+                        continue
+                    with open(os.path.join(dirpath, fname), encoding="utf-8", errors="ignore") as f:
+                        raw = f.read()
+                    lines, seen = [], set()
+                    for line in raw.splitlines():
+                        line = line.strip()
+                        if not line or line.startswith("WEBVTT") or "-->" in line or line.isdigit():
+                            continue
+                        if line not in seen:   # VTT often repeats lines across cue windows
+                            seen.add(line)
+                            lines.append(line)
+                    subtitle_text = " ".join(lines)
+                    if subtitle_text:
+                        logger.debug(f"Subtitles from {fname}: {len(subtitle_text)} chars")
+                        break
+                if subtitle_text:
+                    break
+
         uploader = info.get("uploader") or info.get("channel") or ""
+        title = info.get("title") or url
         description = info.get("description") or ""
-        text = f"Author: {uploader}\n\n{description}".strip()
-        return {"text": text[:8000], "title": info.get("title") or url, "source_type": "social"}
+
+        if subtitle_text:
+            text = f"{title}\nBy: {uploader}\n\nTranscript:\n{subtitle_text}"
+        else:
+            text = f"{title}\nBy: {uploader}\n\n{description}".strip()
+
+        source_type = "youtube" if "vimeo" not in url and "youtube" in url else "video"
+        return {"text": text[:MAX_CONTENT_CHARS], "title": title, "source_type": source_type}
     except Exception as e:
         logger.warning(f"yt-dlp failed for {url}: {e}")
         return {"text": "", "title": url, "source_type": "unknown"}
 
 
+def _yt_dlp_transcribe(url: str) -> dict:
+    """Download audio from a video URL via yt-dlp and transcribe with Whisper."""
+    import yt_dlp
+    import tempfile, os
+
+    ydl_opts = {
+        "quiet": True,
+        "format": "bestaudio/best",
+        "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3"}],
+        "outtmpl": "audio.%(ext)s",
+    }
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ydl_opts["paths"] = {"home": tmpdir}
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+            if not info:
+                raise ValueError("yt-dlp returned no info")
+
+            audio_file = next(
+                (os.path.join(tmpdir, f) for f in os.listdir(tmpdir) if f.endswith(".mp3")),
+                None,
+            )
+            if not audio_file:
+                raise ValueError("No audio file produced")
+
+            from bot.transcriber import _transcribe_sync
+            transcript = _transcribe_sync(audio_file)
+
+        uploader = info.get("uploader") or info.get("channel") or ""
+        title = info.get("title") or url
+        text = f"{title}\nBy: {uploader}\n\nTranscript:\n{transcript}".strip()
+        return {"text": text[:MAX_CONTENT_CHARS], "title": title, "source_type": "video"}
+    except Exception as e:
+        logger.warning(f"yt-dlp transcribe failed for {url}: {e}")
+        return {"text": "", "title": url, "source_type": "unknown"}
+
+
+async def _streamyard_fetch(url: str) -> dict:
+    """Render the StreamYard watch page, intercept the signed mp4, and transcribe with Whisper."""
+    import json as _json, tempfile, os, asyncio as _asyncio
+
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        logger.warning("playwright not installed — falling back to generic fetch for StreamYard")
+        return await _generic_fetch(url)
+
+    # Step 1: intercept the signed vod mp4 URL via headless browser
+    video_url = None
+    title = url
+
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page()
+
+            got_video = _asyncio.Event()
+
+            async def on_request(request):
+                nonlocal video_url
+                if "vods-storage.streamyard.com" in request.url and ".mp4" in request.url:
+                    video_url = request.url
+                    got_video.set()
+
+            page.on("request", on_request)
+            await page.goto(url, wait_until="networkidle", timeout=30_000)
+
+            # Extract title from __NEXT_DATA__
+            next_data = await page.evaluate(
+                "() => { const el = document.getElementById('__NEXT_DATA__'); return el ? el.textContent : null; }"
+            )
+            if next_data:
+                try:
+                    data = _json.loads(next_data)
+                    title = data.get("props", {}).get("pageProps", {}).get("metadata", {}).get("title") or url
+                except Exception:
+                    pass
+
+            # Wait a bit for the video request to fire
+            try:
+                await _asyncio.wait_for(got_video.wait(), timeout=10)
+            except _asyncio.TimeoutError:
+                pass
+
+            await browser.close()
+    except Exception as e:
+        logger.warning(f"Playwright failed for {url}: {e}")
+        return {"text": "", "title": url, "source_type": "video"}
+
+    if not video_url:
+        logger.warning(f"StreamYard: no video URL intercepted for {url}")
+        return {"text": title, "title": title, "source_type": "video"}
+
+    logger.info(f"StreamYard: intercepted video URL, downloading and transcribing")
+
+    # Step 2: download the mp4 to a temp file and transcribe
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+            tmp_path = f.name
+        async with httpx.AsyncClient(follow_redirects=True, timeout=300) as client:
+            async with client.stream("GET", video_url) as resp:
+                with open(tmp_path, "wb") as f:
+                    async for chunk in resp.aiter_bytes(chunk_size=1024 * 1024):
+                        f.write(chunk)
+
+        from bot.storage import save_file_from_path
+        stored_file_path = save_file_from_path(tmp_path, ".mp4")
+
+        from bot.transcriber import _transcribe_sync
+        loop = asyncio.get_running_loop()
+        transcript = await loop.run_in_executor(None, _transcribe_sync, tmp_path)
+        text = f"{title}\n\nTranscript:\n{transcript}".strip()
+        return {"text": text[:MAX_CONTENT_CHARS], "title": title, "source_type": "video", "file_path": stored_file_path}
+    except Exception as e:
+        logger.warning(f"StreamYard transcription failed for {url}: {e}")
+        return {"text": title, "title": title, "source_type": "video"}
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+
+async def _pdf_fetch(url: str) -> dict:
+    """Download a PDF and extract text with pdfplumber."""
+    import io
+    import pdfplumber
+
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=60) as client:
+            resp = await client.get(
+                url,
+                headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"},
+            )
+            resp.raise_for_status()
+            pdf_bytes = resp.content
+    except Exception as e:
+        logger.warning(f"PDF download failed for {url}: {e}")
+        return {"text": "", "title": url, "source_type": "unknown"}
+
+    try:
+        pages_text = []
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            title = (pdf.metadata or {}).get("Title") or url
+            for page in pdf.pages:
+                page_text = page.extract_text()
+                if page_text:
+                    pages_text.append(page_text)
+        text = "\n\n".join(pages_text)
+    except Exception as e:
+        logger.warning(f"pdfplumber extraction failed for {url}: {e}")
+        return {"text": "", "title": url, "source_type": "unknown"}
+
+    if not text.strip():
+        logger.warning(f"PDF at {url} yielded no text — likely image-based; OCR not available")
+
+    return {"text": text[:MAX_CONTENT_CHARS], "title": title, "source_type": "pdf"}
+
+
 async def _generic_fetch(url: str) -> dict:
     try:
         async with httpx.AsyncClient(follow_redirects=True, timeout=15) as client:
-            resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
+            resp = await client.get(
+                url,
+                headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"},
+            )
             html = resp.text
-        text = trafilatura.extract(html, include_comments=False, include_tables=False)
-        if not text:
-            text = ""
-        return {"text": text[:8000], "title": url, "source_type": "article"}
     except Exception as e:
         logger.warning(f"Generic fetch failed for {url}: {e}")
         return {"text": "", "title": url, "source_type": "unknown"}
+
+    logger.debug(f"Fetched {url} — status={resp.status_code} len={len(html)}")
+
+    import trafilatura  # heavy import — defer to first generic fetch
+
+    # 1. trafilatura strict
+    text = trafilatura.extract(html, include_comments=False, include_tables=False)
+
+    # 2. trafilatura with recall mode (less strict)
+    if not text:
+        text = trafilatura.extract(html, include_comments=False, include_tables=True, favor_recall=True)
+        if text:
+            logger.debug(f"trafilatura favor_recall extracted {len(text)} chars from {url}")
+
+    if not text:
+        logger.debug(f"trafilatura failed for {url}, trying BeautifulSoup")
+
+    # 3. BeautifulSoup fallback — extract visible text from article/main/body
+    if not text:
+        try:
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(html, "html.parser")
+            for tag in soup(["script", "style", "nav", "footer", "header"]):
+                tag.decompose()
+            container = soup.find("article") or soup.find("main") or soup.find("body")
+            if container:
+                text = container.get_text(separator="\n", strip=True)
+        except Exception as e:
+            logger.warning(f"BeautifulSoup fallback failed for {url}: {e}")
+
+    title = url
+    try:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html, "html.parser")
+        if soup.title and soup.title.string:
+            title = soup.title.string.strip()
+    except Exception:
+        pass
+
+    return {"text": (text or "")[:MAX_CONTENT_CHARS], "title": title, "source_type": "article"}
+
+
+def _domain_matches(domain: str, *targets: str) -> bool:
+    """Check if domain equals or is a subdomain of any target."""
+    return any(domain == t or domain.endswith(f".{t}") for t in targets)
 
 
 async def fetch_url(url: str) -> dict:
     domain = urlparse(url).netloc.lower()
 
-    if any(d in domain for d in ("youtube.com", "youtu.be")):
+    if _domain_matches(domain, "youtube.com", "youtu.be"):
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, _youtube_transcript, url)
 
-    if any(d in domain for d in ("twitter.com", "x.com", "t.co")):
+    if _domain_matches(domain, "streamyard.com"):
+        return await _streamyard_fetch(url)
+
+    if _domain_matches(domain, "vimeo.com"):
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(None, _yt_dlp_extract, url)
+        if result["text"].strip():
+            return result
+        logger.info(f"No subtitles for {url}, falling back to Whisper transcription")
+        return await loop.run_in_executor(None, _yt_dlp_transcribe, url)
+
+    if _domain_matches(domain, "twitter.com", "x.com", "t.co"):
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, _fetch_tweet, url)
+
+    if urlparse(url).path.lower().endswith(".pdf"):
+        return await _pdf_fetch(url)
 
     return await _generic_fetch(url)

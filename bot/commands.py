@@ -1,14 +1,11 @@
 import html
 import logging
-from pathlib import Path
 
 from telegram import Update
 from telegram.ext import ContextTypes
 
-from bot.db import get_all_items, get_item, search_items, delete_item
+from bot.db import get_all_items, get_item, search_items, delete_item, get_profile, set_profile, set_profile_field
 from bot.formatting import format_analysis
-
-_PROFILE_PATH = Path(__file__).parent.parent / "PROFILE.md"
 
 logger = logging.getLogger(__name__)
 
@@ -20,9 +17,25 @@ _TYPE_ICONS = {
 _LIST_LIMIT = 20
 
 
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/start — welcome message."""
+    await update.message.reply_text(
+        "Welcome to filter.fyi — your personal research filter.\n\n"
+        "Send me any URL, text, voice memo, image, or document and I'll analyze and save it "
+        "to your knowledge base.\n\n"
+        "Commands:\n"
+        "/list — recent entries\n"
+        "/search <query> — search your KB\n"
+        "/show <id> — full entry\n"
+        "/delete <id> — remove an entry\n"
+        "/profile [text] — view or update your profile"
+    )
+
+
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/list — show the most recent knowledge base entries."""
-    rows = get_all_items()
+    user_id = str(update.effective_user.id)
+    rows = get_all_items(user_id)
     if not rows:
         await update.message.reply_text("Knowledge base is empty.")
         return
@@ -40,12 +53,13 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_show(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/show <id> — show full analysis and source for an entry."""
+    user_id = str(update.effective_user.id)
     args = context.args
     if not args or not args[0].isdigit():
         await update.message.reply_text("Usage: /show &lt;id&gt;", parse_mode="HTML")
         return
 
-    row = get_item(int(args[0]))
+    row = get_item(int(args[0]), user_id)
     if not row:
         await update.message.reply_text(f"No entry with id {args[0]}.")
         return
@@ -72,12 +86,13 @@ async def cmd_show(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/search <query> — search source, content, and analysis."""
+    user_id = str(update.effective_user.id)
     if not context.args:
         await update.message.reply_text("Usage: /search &lt;query&gt;", parse_mode="HTML")
         return
 
     query = " ".join(context.args)
-    rows = search_items(query)
+    rows = search_items(query, user_id)
 
     if not rows:
         await update.message.reply_text(f"No results for <i>{html.escape(query)}</i>.", parse_mode="HTML")
@@ -107,45 +122,57 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/profile [text] — show or update your personal profile."""
+    user_id = str(update.effective_user.id)
     message = update.effective_message
     if not message:
         return
 
     if context.args:
         text = " ".join(context.args)
-        _PROFILE_PATH.write_text(text, encoding="utf-8")
+        set_profile(user_id, text)
         await message.reply_text("Profile updated.")
         return
 
-    if not _PROFILE_PATH.exists():
-        await message.reply_text(
-            "No profile set yet. Use /profile <text> to set one, "
-            "or edit PROFILE.md directly for multi-line content."
-        )
-        return
-
-    content = _PROFILE_PATH.read_text(encoding="utf-8").strip()
+    content = get_profile(user_id)
     if not content:
-        await message.reply_text("Profile file exists but is empty.")
+        await message.reply_text(
+            "No profile set yet. Use /profile <your background> to set one.\n\n"
+            "Example: /profile I'm a software engineer interested in ML and distributed systems."
+        )
         return
 
     await message.reply_text(f"<b>Your profile:</b>\n\n{html.escape(content)}", parse_mode="HTML")
 
 
+async def cmd_token(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/token — (re)generate your web UI API token."""
+    user_id = str(update.effective_user.id)
+    from bot.auth import generate_token
+    token = generate_token()
+    set_profile_field(user_id, api_token=token)
+    await update.message.reply_text(
+        "Your API token (keep this secret — generating a new one invalidates the old one):\n\n"
+        f"<code>{token}</code>\n\n"
+        "Use this as a Bearer token in the web UI.",
+        parse_mode="HTML",
+    )
+
+
 async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/delete <id> — remove an entry from the knowledge base."""
+    user_id = str(update.effective_user.id)
     args = context.args
     if not args or not args[0].isdigit():
         await update.message.reply_text("Usage: /delete &lt;id&gt;", parse_mode="HTML")
         return
 
     item_id = int(args[0])
-    row = get_item(item_id)
+    row = get_item(item_id, user_id)
     if not row:
         await update.message.reply_text(f"No entry with id {item_id}.")
         return
 
-    delete_item(item_id)
+    delete_item(item_id, user_id)
     icon = _TYPE_ICONS.get(row["source_type"], "❓")
     source = html.escape(row["source"] or "—")
     await update.message.reply_text(
