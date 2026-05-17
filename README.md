@@ -27,7 +27,6 @@ A Telegram bot that acts as a personal AI research analyst. Send it links, artic
 | Photos | Vision model extracts text and key info, then analyzed |
 | PDFs | Text extracted with pdfplumber |
 | Text documents | Read directly |
-| Inbound email | Parsed via Mailgun webhook, body and attachments analyzed |
 
 ## Setup
 
@@ -68,9 +67,6 @@ OPENAI_API_KEY=your-openai-key
 
 # Optional -- set for production webhook mode
 WEBHOOK_URL=https://your-domain.com
-
-# Optional -- Mailgun inbound email webhook security (HMAC-SHA256 verification)
-MAILGUN_SIGNING_KEY=your-mailgun-signing-key
 
 # Required for the public /api/try endpoint -- the filter.fyi Cloudflare
 # Worker authenticates with a matching `x-filter-fyi-secret` header.
@@ -213,14 +209,6 @@ Error responses (Worker maps these to user-friendly notices):
 
 The endpoint is **stateless**: nothing is persisted to the bot's SQLite. The Worker is the system of record for anonymous tries (D1 `summaries` table, keyed by `anon_id` for later claim-on-signup).
 
-### Inbound Email
-
-Forward emails to the bot via Mailgun's inbound parse webhook. The sender's email address is matched against registered user profiles.
-
-1. Set up a Mailgun receiving route pointing to `https://your-domain.com/inbound-email`
-2. Register your email in your profile via the web UI
-3. Optionally set `MAILGUN_SIGNING_KEY` in `.env` to verify webhook signatures
-
 ## Deployment (Fly.io)
 
 The backend runs as a single long-lived container with a mounted volume for the SQLite DB and uploaded files. First-time setup:
@@ -286,7 +274,6 @@ research-companion/
     ├── db.py            # SQLite interface + schema migrations (per-user)
     ├── auth.py          # Bearer token authentication for the REST API
     ├── api.py           # REST API endpoints (FastAPI router, token-authenticated)
-    ├── email_handler.py # Mailgun inbound email webhook handler
     ├── storage.py       # Persistent file store helpers
     └── config.py        # Shared constants (MAX_CONTENT_CHARS, etc.)
 ```

@@ -7,7 +7,7 @@ Always run via uvicorn:
 Modes (auto-detected from environment):
   - No WEBHOOK_URL   → Telegram long-polling runs as a background task alongside the web server
   - WEBHOOK_URL set  → Telegram uses webhook; register at /webhook
-  - No TELEGRAM_TOKEN → web UI + email only (no Telegram)
+  - No TELEGRAM_TOKEN → web UI only (no Telegram)
 """
 
 import logging
@@ -64,7 +64,6 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 from bot.api import router as api_router  # noqa: E402
-from bot.email_handler import handle_inbound_email  # noqa: E402
 
 app.include_router(api_router)
 
@@ -84,11 +83,6 @@ async def webhook(request: Request) -> Response:
     update = Update.de_json(data, telegram_app.bot)
     await telegram_app.process_update(update)
     return Response(status_code=200)
-
-
-@app.post("/inbound-email")
-async def inbound_email(request: Request):
-    return await handle_inbound_email(request)
 
 
 @app.get("/health")
