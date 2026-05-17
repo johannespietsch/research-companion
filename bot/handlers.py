@@ -2,13 +2,12 @@ import base64
 import logging
 import tempfile
 from pathlib import Path
-import pdfplumber
 
 import httpx
 from telegram import Update
 from telegram.ext import ContextTypes
 
-from bot.analyzer import analyze, analyze_image
+from bot.analyzer import analyze, analyze_image, to_json_str
 from bot.config import MAX_CONTENT_CHARS
 from bot.db import save_item
 from bot.fetcher import fetch_url
@@ -58,7 +57,7 @@ async def _analyze_and_reply(
         source_type=source_type,
         source=source,
         content=text,
-        analysis=analysis,
+        analysis=to_json_str(analysis),
         user_note=user_note,
         file_path=file_path,
     )
@@ -234,6 +233,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await doc_file.download_to_drive(path)
 
         if "pdf" in mime:
+            import pdfplumber  # heavy import — defer to PDF branch
             text = ""
             with pdfplumber.open(path) as pdf:
                 for page in pdf.pages:

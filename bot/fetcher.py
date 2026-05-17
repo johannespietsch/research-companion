@@ -6,13 +6,16 @@ from urllib.parse import urlparse
 
 import httpx
 import requests
-import trafilatura
 
 from bot.config import MAX_CONTENT_CHARS
 
 logger = logging.getLogger(__name__)
 
 _YT_PATTERNS = re.compile(r"(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})")
+
+
+def _youtube_thumbnail(video_id: str) -> str:
+    return f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
 
 
 def _youtube_transcript(url: str) -> dict:
@@ -23,14 +26,22 @@ def _youtube_transcript(url: str) -> dict:
         return _yt_dlp_extract(url)
 
     video_id = match.group(1)
+    thumb = _youtube_thumbnail(video_id)
     try:
         api = YouTubeTranscriptApi()
         fetched = api.fetch(video_id)
         text = " ".join(snippet.text for snippet in fetched)
-        return {"text": text[:MAX_CONTENT_CHARS], "title": f"YouTube video ({video_id})", "source_type": "youtube"}
+        return {
+            "text": text[:MAX_CONTENT_CHARS],
+            "title": f"YouTube video ({video_id})",
+            "source_type": "youtube",
+            "image_urls": [thumb],
+        }
     except Exception:
         logger.info(f"No transcript for {video_id}, falling back to yt-dlp description")
-        return _yt_dlp_extract(url)
+        result = _yt_dlp_extract(url)
+        result.setdefault("image_urls", []).append(thumb)
+        return result
 
 
 def _tweet_id_from_url(url: str) -> str | None:
@@ -343,7 +354,7 @@ async def _pdf_fetch(url: str) -> dict:
     if not text.strip():
         logger.warning(f"PDF at {url} yielded no text — likely image-based; OCR not available")
 
-    return {"text": text[:MAX_CONTENT_CHARS], "title": title, "source_type": "article"}
+    return {"text": text[:MAX_CONTENT_CHARS], "title": title, "source_type": "pdf"}
 
 
 async def _generic_fetch(url: str) -> dict:
@@ -359,6 +370,8 @@ async def _generic_fetch(url: str) -> dict:
         return {"text": "", "title": url, "source_type": "unknown"}
 
     logger.debug(f"Fetched {url} — status={resp.status_code} len={len(html)}")
+
+    import trafilatura  # heavy import — defer to first generic fetch
 
     # 1. trafilatura strict
     text = trafilatura.extract(html, include_comments=False, include_tables=False)

@@ -71,6 +71,14 @@ WEBHOOK_URL=https://your-domain.com
 
 # Optional -- Mailgun inbound email webhook security (HMAC-SHA256 verification)
 MAILGUN_SIGNING_KEY=your-mailgun-signing-key
+
+# Required for the public /api/try endpoint -- the filter.fyi Cloudflare
+# Worker authenticates with a matching `x-filter-fyi-secret` header.
+FILTER_FYI_TRY_SECRET=long-random-string
+
+# Optional -- override the data directory (SQLite DB + file store).
+# Set to /data in containerised deploys with a mounted volume.
+# DATA_DIR=/data
 ```
 
 ## Usage
@@ -160,6 +168,51 @@ Key endpoints (all under `/api`):
 | `POST /api/ingest/url` | Ingest a URL |
 | `POST /api/ingest/file` | Upload and ingest a file |
 
+### Public `/api/try` (anonymous)
+
+Used by the [filter.fyi](https://filter.fyi) landing page so anonymous visitors can submit a URL and get a verdict without signing up. Authenticated via a shared secret rather than a user token:
+
+```
+POST /api/try
+content-type: application/json
+x-filter-fyi-secret: <FILTER_FYI_TRY_SECRET>
+
+{ "url": "https://example.com/post" }
+```
+
+Response shape (the contract the Cloudflare Worker consumes):
+
+```jsonc
+{
+  "url": "https://example.com/post",
+  "title": "…",
+  "source_type": "article" | "youtube" | "social" | "pdf",
+  "image_urls": [],
+  "content_preview": "first ~2000 chars of extracted text",
+  "verdict": "watch" | "skim" | "skip",
+  "analysis": {
+    "main_idea": "…",
+    "why_it_matters": "…",
+    "category": "kebab-case",
+    "suggested_experiment": "…",
+    "time_required": "12 min read"
+  }
+}
+```
+
+Error responses (Worker maps these to user-friendly notices):
+
+| Status | Body                            | Cause                                       |
+|--------|---------------------------------|---------------------------------------------|
+| 400    | `{"error":"invalid-url"}`       | Not a valid http(s) URL                     |
+| 401    | `{"error":"unauthorized"}`      | Missing or wrong `x-filter-fyi-secret`      |
+| 422    | `{"error":"no-transcript"}`     | YouTube/video with no transcript available  |
+| 422    | `{"error":"extraction-failed"}` | Couldn't pull text from the page            |
+| 502    | `{"error":"fetch-failed"}`      | Upstream fetch crashed                      |
+| 502    | `{"error":"analyze-failed"}`    | LLM call crashed                            |
+
+The endpoint is **stateless**: nothing is persisted to the bot's SQLite. The Worker is the system of record for anonymous tries (D1 `summaries` table, keyed by `anon_id` for later claim-on-signup).
+
 ### Inbound Email
 
 Forward emails to the bot via Mailgun's inbound parse webhook. The sender's email address is matched against registered user profiles.
@@ -167,6 +220,31 @@ Forward emails to the bot via Mailgun's inbound parse webhook. The sender's emai
 1. Set up a Mailgun receiving route pointing to `https://your-domain.com/inbound-email`
 2. Register your email in your profile via the web UI
 3. Optionally set `MAILGUN_SIGNING_KEY` in `.env` to verify webhook signatures
+
+## Deployment (Fly.io)
+
+The backend runs as a single long-lived container with a mounted volume for the SQLite DB and uploaded files. First-time setup:
+
+```bash
+fly launch --no-deploy --name filter-fyi-backend --region fra
+fly volume create filter_fyi_data --region fra --size 3
+fly secrets set \
+  ANTHROPIC_API_KEY=... \
+  TELEGRAM_TOKEN=... \
+  FILTER_FYI_TRY_SECRET=... \
+  WEBHOOK_URL=https://filter-fyi-backend.fly.dev
+fly deploy
+```
+
+After that, `fly deploy` from this directory ships changes. The volume mounts at `/data` (`DATA_DIR=/data` in `fly.toml`) so the DB and `data/files/` persist across redeploys.
+
+**Wiring to the frontend Worker:** set the Worker's `BOT_API_URL` to `https://<your-fly-app>.fly.dev/api/try` and `BOT_API_KEY` to the same string as `FILTER_FYI_TRY_SECRET`:
+
+```bash
+cd ../filter.fyi-frontend
+npx wrangler secret put BOT_API_URL
+npx wrangler secret put BOT_API_KEY
+```
 
 ## Personalisation
 

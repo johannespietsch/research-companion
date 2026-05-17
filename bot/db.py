@@ -1,7 +1,12 @@
+import os
 import sqlite3
 from pathlib import Path
 
-DB_PATH = Path(__file__).parent.parent / "research.db"
+# DATA_DIR lets us point at a mounted volume in prod (Fly) while keeping the
+# default of "project root" so local dev / tests keep working unchanged.
+_DATA_DIR = Path(os.getenv("DATA_DIR") or (Path(__file__).parent.parent))
+_DATA_DIR.mkdir(parents=True, exist_ok=True)
+DB_PATH = _DATA_DIR / "research.db"
 
 _CREATE_ITEMS_SQL = """\
 CREATE TABLE IF NOT EXISTS items (

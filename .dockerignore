@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+.git/
+.gitignore
+.env
+.env.*
+PROFILE.md
+research.db
+data/
+.DS_Store
+*.log
+README.md

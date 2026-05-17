@@ -3,3 +3,4 @@ __pycache__/
 research.db
 .venv/
 data/
+.DS_Store

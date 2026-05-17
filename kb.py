@@ -14,6 +14,7 @@ Usage:
 
 import sys
 
+from bot.analyzer import parse_stored, to_plain_text
 from bot.db import get_all_items, get_item, search_items, delete_item
 
 WIDTH = 80
@@ -75,7 +76,9 @@ def cmd_show(item_id: int):
             print(f"  ... ({len(row['content']) - 500} more chars)")
 
     print(f"\n--- Analysis ---")
-    print(row["analysis"] or "(no analysis)")
+    stored = row["analysis"] or ""
+    parsed = parse_stored(stored)
+    print(to_plain_text(parsed) if parsed else (stored or "(no analysis)"))
     print()
 
 

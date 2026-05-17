@@ -19,7 +19,7 @@ import os
 
 from fastapi import Request
 
-from bot.analyzer import analyze
+from bot.analyzer import analyze, to_json_str
 from bot.config import MAX_CONTENT_CHARS
 from bot.db import get_profile_by_email, save_item
 
@@ -91,7 +91,7 @@ async def handle_inbound_email(request: Request) -> dict:
         source_type="email",
         source=sender_email,
         content=body,
-        analysis=analysis,
+        analysis=to_json_str(analysis),
         user_note=subject,
     )
 
