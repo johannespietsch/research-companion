@@ -20,7 +20,7 @@ _LIST_LIMIT = 20
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/start — welcome message."""
     await update.message.reply_text(
-        "Welcome to your personal research companion.\n\n"
+        "Welcome to filter.fyi — your personal research filter.\n\n"
         "Send me any URL, text, voice memo, image, or document and I'll analyze and save it "
         "to your knowledge base.\n\n"
         "Commands:\n"

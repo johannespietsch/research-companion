@@ -1,5 +1,5 @@
 """
-Research Companion — unified entry point.
+filter.fyi backend — unified entry point.
 
 Always run via uvicorn:
     uvicorn main:app --reload --host 0.0.0.0 --port 8080
