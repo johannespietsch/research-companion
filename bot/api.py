@@ -18,10 +18,10 @@ from bot.db import (
     delete_item,
     get_all_items,
     get_item,
-    get_profile,
+    get_user_profile,
     save_item,
     search_items,
-    set_profile,
+    set_user_profile,
 )
 from bot.fetcher import fetch_url
 from bot.storage import full_path, save_file
@@ -47,13 +47,13 @@ _VIDEO_SOURCE_TYPES = {"youtube", "video"}
 # ---------------------------------------------------------------------------
 
 @router.get("/items")
-async def list_items(q: str | None = None, user_id: str = Depends(require_token)):
+async def list_items(q: str | None = None, user_id: int = Depends(require_token)):
     rows = search_items(q, user_id) if q else get_all_items(user_id)
     return [dict(r) for r in rows]
 
 
 @router.get("/items/{item_id}")
-async def show_item(item_id: int, user_id: str = Depends(require_token)):
+async def show_item(item_id: int, user_id: int = Depends(require_token)):
     row = get_item(item_id, user_id)
     if not row:
         raise HTTPException(status_code=404, detail="Not found")
@@ -61,14 +61,14 @@ async def show_item(item_id: int, user_id: str = Depends(require_token)):
 
 
 @router.delete("/items/{item_id}", status_code=204)
-async def remove_item(item_id: int, user_id: str = Depends(require_token)):
+async def remove_item(item_id: int, user_id: int = Depends(require_token)):
     if not get_item(item_id, user_id):
         raise HTTPException(status_code=404, detail="Not found")
     delete_item(item_id, user_id)
 
 
 @router.get("/items/{item_id}/file")
-async def download_file(item_id: int, user_id: str = Depends(require_token)):
+async def download_file(item_id: int, user_id: int = Depends(require_token)):
     row = get_item(item_id, user_id)
     if not row or not row["file_path"]:
         raise HTTPException(status_code=404, detail="No file stored for this item")
@@ -86,7 +86,7 @@ async def download_file(item_id: int, user_id: str = Depends(require_token)):
 async def submit_text(
     text: str = Form(...),
     user_note: str = Form(""),
-    user_id: str = Depends(require_token),
+    user_id: int = Depends(require_token),
 ):
     analysis = analyze(text, user_id)
     save_item(user_id, "note", "", text, to_json_str(analysis), user_note)
@@ -97,7 +97,7 @@ async def submit_text(
 async def submit_url(
     url: str = Form(...),
     user_note: str = Form(""),
-    user_id: str = Depends(require_token),
+    user_id: int = Depends(require_token),
 ):
     fetched = await fetch_url(url)
     if not fetched["text"].strip():
@@ -111,7 +111,7 @@ async def submit_url(
 async def submit_file(
     file: UploadFile = File(...),
     user_note: str = Form(""),
-    user_id: str = Depends(require_token),
+    user_id: int = Depends(require_token),
 ):
     mime = file.content_type or ""
     name = file.filename or "file"
@@ -160,16 +160,16 @@ async def submit_file(
 # ---------------------------------------------------------------------------
 
 @router.get("/profile")
-async def get_profile_endpoint(user_id: str = Depends(require_token)):
-    return {"content": get_profile(user_id)}
+async def get_profile_endpoint(user_id: int = Depends(require_token)):
+    return {"content": get_user_profile(user_id)}
 
 
 @router.put("/profile", status_code=200)
 async def set_profile_endpoint(
     content: str = Form(...),
-    user_id: str = Depends(require_token),
+    user_id: int = Depends(require_token),
 ):
-    set_profile(user_id, content)
+    set_user_profile(user_id, content)
     return {"ok": True}
 
 
@@ -227,7 +227,7 @@ async def try_url(req: TryRequest, _: None = Depends(_require_try_secret)):
         raise HTTPException(status_code=422, detail={"error": "extraction-failed"})
 
     try:
-        analysis = analyze(text, user_id="")
+        analysis = analyze(text, user_id=None)
     except Exception as e:
         logger.exception("analyze crashed for %s: %s", url, e)
         raise HTTPException(status_code=502, detail={"error": "analyze-failed"})

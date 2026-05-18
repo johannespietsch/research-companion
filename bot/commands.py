@@ -4,7 +4,16 @@ import logging
 from telegram import Update
 from telegram.ext import ContextTypes
 
-from bot.db import get_all_items, get_item, search_items, delete_item, get_profile, set_profile, set_profile_field
+from bot.db import (
+    delete_item,
+    get_all_items,
+    get_item,
+    get_or_create_user_by_telegram,
+    get_user_profile,
+    search_items,
+    set_user_field,
+    set_user_profile,
+)
 from bot.formatting import format_analysis
 
 logger = logging.getLogger(__name__)
@@ -34,7 +43,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/list — show the most recent knowledge base entries."""
-    user_id = str(update.effective_user.id)
+    user_id = get_or_create_user_by_telegram(update.effective_user.id)
     rows = get_all_items(user_id)
     if not rows:
         await update.message.reply_text("Knowledge base is empty.")
@@ -53,7 +62,7 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_show(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/show <id> — show full analysis and source for an entry."""
-    user_id = str(update.effective_user.id)
+    user_id = get_or_create_user_by_telegram(update.effective_user.id)
     args = context.args
     if not args or not args[0].isdigit():
         await update.message.reply_text("Usage: /show &lt;id&gt;", parse_mode="HTML")
@@ -86,7 +95,7 @@ async def cmd_show(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/search <query> — search source, content, and analysis."""
-    user_id = str(update.effective_user.id)
+    user_id = get_or_create_user_by_telegram(update.effective_user.id)
     if not context.args:
         await update.message.reply_text("Usage: /search &lt;query&gt;", parse_mode="HTML")
         return
@@ -122,18 +131,18 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/profile [text] — show or update your personal profile."""
-    user_id = str(update.effective_user.id)
+    user_id = get_or_create_user_by_telegram(update.effective_user.id)
     message = update.effective_message
     if not message:
         return
 
     if context.args:
         text = " ".join(context.args)
-        set_profile(user_id, text)
+        set_user_profile(user_id, text)
         await message.reply_text("Profile updated.")
         return
 
-    content = get_profile(user_id)
+    content = get_user_profile(user_id)
     if not content:
         await message.reply_text(
             "No profile set yet. Use /profile <your background> to set one.\n\n"
@@ -146,10 +155,10 @@ async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def cmd_token(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/token — (re)generate your web UI API token."""
-    user_id = str(update.effective_user.id)
+    user_id = get_or_create_user_by_telegram(update.effective_user.id)
     from bot.auth import generate_token
     token = generate_token()
-    set_profile_field(user_id, api_token=token)
+    set_user_field(user_id, api_token=token)
     await update.message.reply_text(
         "Your API token (keep this secret — generating a new one invalidates the old one):\n\n"
         f"<code>{token}</code>\n\n"
@@ -160,7 +169,7 @@ async def cmd_token(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/delete <id> — remove an entry from the knowledge base."""
-    user_id = str(update.effective_user.id)
+    user_id = get_or_create_user_by_telegram(update.effective_user.id)
     args = context.args
     if not args or not args[0].isdigit():
         await update.message.reply_text("Usage: /delete &lt;id&gt;", parse_mode="HTML")

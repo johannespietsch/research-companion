@@ -81,6 +81,20 @@ _ANTHROPIC_TOOL = {
     "input_schema": _TOOL_SCHEMA,
 }
 
+# Fallback profile used when no real one is available: the anonymous /api/try
+# path, or a signed-in user who hasn't set their own profile yet. Mirrors the
+# landing-page positioning ("For everyone trying to keep up with AI") so the
+# LLM always has a real audience to be specific about.
+DEFAULT_PROFILE = (
+    "The reader is someone trying to keep up with AI — a developer, researcher, "
+    "founder, or technical practitioner who wants signal, not noise. They value: "
+    "practical relevance to AI/tech work, an honest time-to-value assessment, and "
+    "clear \"watch / skim / skip\" verdicts. They're skeptical of hype, allergic "
+    "to generic news takes, and engage best with concrete patterns, benchmarks, "
+    "and architecture."
+)
+
+
 _PROMPT = """You are my personal AI research analyst.
 {profile_block}
 Analyze the following content and produce a structured analysis covering the required fields. Be concrete and specific to this person.
@@ -97,9 +111,11 @@ _OPENAI_JSON_SUFFIX = (
 )
 
 
-def _load_profile(user_id: str) -> str:
-    from bot.db import get_profile
-    return get_profile(user_id)
+def _load_profile(user_id: int | None) -> str:
+    if user_id is None:
+        return DEFAULT_PROFILE
+    from bot.db import get_user_profile
+    return get_user_profile(user_id) or DEFAULT_PROFILE
 
 
 def _normalize(raw: dict) -> dict:
@@ -112,7 +128,7 @@ def _normalize(raw: dict) -> dict:
     return out
 
 
-def analyze(text: str, user_id: str) -> dict:
+def analyze(text: str, user_id: int | None = None) -> dict:
     """Returns a dict with keys: main_idea, why_it_matters, category, suggested_experiment, time_required, verdict."""
     profile = _load_profile(user_id)
     profile_block = f"\nAbout the person you are analysing for:\n{profile}\n" if profile else ""
