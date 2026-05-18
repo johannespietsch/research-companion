@@ -10,6 +10,8 @@ from bot.db import (
     get_item,
     get_or_create_user_by_telegram,
     get_user_profile,
+    link_telegram_to_user,
+    redeem_link_code,
     search_items,
     set_user_field,
     set_user_profile,
@@ -151,6 +153,50 @@ async def cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     await message.reply_text(f"<b>Your profile:</b>\n\n{html.escape(content)}", parse_mode="HTML")
+
+
+async def cmd_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/link <code> — link this Telegram chat to an existing filter.fyi web account.
+
+    The user generates the 6-digit code from `/me` on the website while signed in,
+    then DMs the bot `/link 123456`. Their Telegram KB (if any) gets merged into
+    the web account; from then on, both surfaces share the same library.
+    """
+    user_id = get_or_create_user_by_telegram(update.effective_user.id)
+    args = context.args
+    if not args or len(args[0]) != 6 or not args[0].isdigit():
+        await update.message.reply_text(
+            "Usage: <code>/link 123456</code>\n\n"
+            "Get a 6-digit code from filter.fyi/me while signed in.",
+            parse_mode="HTML",
+        )
+        return
+
+    code = args[0]
+    web_user_id = redeem_link_code(code)
+    if web_user_id is None:
+        await update.message.reply_text(
+            "That code is invalid or expired. Generate a fresh one from filter.fyi/me."
+        )
+        return
+
+    if web_user_id == user_id:
+        await update.message.reply_text("This chat is already linked to that account.")
+        return
+
+    try:
+        link_telegram_to_user(
+            web_user_id=web_user_id,
+            telegram_chat_id=update.effective_user.id,
+        )
+    except ValueError as e:
+        logger.warning("Link rejected for tg=%s web=%s: %s", user_id, web_user_id, e)
+        await update.message.reply_text(f"Couldn't link: {e}")
+        return
+
+    await update.message.reply_text(
+        "✓ Linked! Your Telegram entries and your filter.fyi web library are now one library."
+    )
 
 
 async def cmd_token(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

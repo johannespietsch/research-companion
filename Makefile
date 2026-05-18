@@ -6,13 +6,14 @@ PORT    ?= 8080
 
 .DEFAULT_GOAL := help
 
-.PHONY: help install dev run kb adduser
+.PHONY: help install dev run test kb adduser
 
 help:
 	@echo ""
 	@echo "  make install          create .venv and install dependencies"
 	@echo "  make dev              start with auto-reload (local dev)"
 	@echo "  make run              start without auto-reload (production)"
+	@echo "  make test             run the pytest suite"
 	@echo "  make kb               open the admin CLI (python kb.py)"
 	@echo "  make adduser          create a web-only user  (EMAIL=foo@bar.com)"
 	@echo ""
@@ -37,6 +38,9 @@ dev: install
 
 run: install
 	$(UVICORN) main:app --host 0.0.0.0 --port $(PORT)
+
+test: install
+	$(PYTHON) -m pytest tests/ -v
 
 kb: install
 	$(PYTHON) kb.py $(ARGS)

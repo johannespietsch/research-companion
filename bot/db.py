@@ -1,5 +1,7 @@
 import os
+import secrets
 import sqlite3
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # DATA_DIR lets us point at a mounted volume in prod (Fly) while keeping the
@@ -38,9 +40,24 @@ CREATE TABLE IF NOT EXISTS items (
     FOREIGN KEY (user_id) REFERENCES users(id)
 )"""
 
+# Short-lived codes a logged-in web user generates to link their Telegram
+# account. The Telegram bot redeems the code via /link <code>, which stitches
+# the chat_id onto the existing web users row. One outstanding code per user.
+_CREATE_LINK_CODES_SQL = """\
+CREATE TABLE IF NOT EXISTS link_codes (
+    code       TEXT PRIMARY KEY,
+    user_id    INTEGER NOT NULL,
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S', 'now')),
+    FOREIGN KEY (user_id) REFERENCES users(id)
+)"""
+
 _CREATE_INDEXES_SQL = [
     "CREATE INDEX IF NOT EXISTS idx_items_user ON items(user_id, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_link_codes_expires ON link_codes(expires_at)",
 ]
+
+LINK_CODE_TTL_SECONDS = 600
 
 
 def _get_conn() -> sqlite3.Connection:
@@ -117,8 +134,13 @@ def _init() -> None:
         else:
             conn.execute(_CREATE_USERS_SQL)
             conn.execute(_CREATE_ITEMS_SQL)
+        conn.execute(_CREATE_LINK_CODES_SQL)
         for stmt in _CREATE_INDEXES_SQL:
             conn.execute(stmt)
+
+
+def _utcnow_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
 
 
 _init()
@@ -276,3 +298,94 @@ def delete_item(item_id: int, user_id: int | None = None) -> None:
             )
         else:
             conn.execute("DELETE FROM items WHERE id = ?", (item_id,))
+
+
+# ---------------------------------------------------------------------------
+# Account linking (web ↔ Telegram)
+# ---------------------------------------------------------------------------
+
+def create_link_code(user_id: int) -> str:
+    """Generate a 6-digit code the given user can read in DM to link their Telegram chat.
+    Only one outstanding code per user; older codes for the same user are cleared."""
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    expires_at = (
+        datetime.now(timezone.utc) + timedelta(seconds=LINK_CODE_TTL_SECONDS)
+    ).strftime("%Y-%m-%dT%H:%M:%S")
+    with _get_conn() as conn:
+        conn.execute("DELETE FROM link_codes WHERE user_id = ?", (user_id,))
+        conn.execute(
+            "INSERT INTO link_codes (code, user_id, expires_at) VALUES (?, ?, ?)",
+            (code, user_id, expires_at),
+        )
+    return code
+
+
+def redeem_link_code(code: str) -> int | None:
+    """Look up which web users.id this code points to, single-use. Returns None if
+    invalid or expired. Also opportunistically clears expired rows."""
+    now = _utcnow_iso()
+    with _get_conn() as conn:
+        row = conn.execute(
+            "SELECT user_id FROM link_codes WHERE code = ? AND expires_at > ?",
+            (code, now),
+        ).fetchone()
+        if not row:
+            return None
+        conn.execute("DELETE FROM link_codes WHERE code = ?", (code,))
+        conn.execute("DELETE FROM link_codes WHERE expires_at <= ?", (now,))
+        return row["user_id"]
+
+
+def link_telegram_to_user(web_user_id: int, telegram_chat_id: int) -> None:
+    """Stitch a Telegram chat onto the given web user. Idempotent.
+
+    If a separate `users` row already exists for `telegram_chat_id` (the typical
+    case — the person has been using the bot for a while), its items are moved
+    onto `web_user_id` and the orphan row is deleted. Web-side `profile` and
+    `api_token` win unless they're empty, in which case the Telegram-side values
+    are copied over. Raises ValueError if the web user is already linked to a
+    different Telegram chat.
+    """
+    with _get_conn() as conn:
+        web = conn.execute(
+            "SELECT id, telegram_chat_id, profile, api_token FROM users WHERE id = ?",
+            (web_user_id,),
+        ).fetchone()
+        if not web:
+            raise ValueError(f"web user {web_user_id} not found")
+        if web["telegram_chat_id"] is not None and web["telegram_chat_id"] != telegram_chat_id:
+            raise ValueError(
+                f"web user {web_user_id} is already linked to Telegram chat "
+                f"{web['telegram_chat_id']}"
+            )
+
+        tg = conn.execute(
+            "SELECT id, profile, api_token FROM users WHERE telegram_chat_id = ?",
+            (telegram_chat_id,),
+        ).fetchone()
+
+        if tg and tg["id"] == web_user_id:
+            return  # already linked, no-op
+
+        if tg:
+            conn.execute(
+                "UPDATE items SET user_id = ? WHERE user_id = ?",
+                (web_user_id, tg["id"]),
+            )
+            updates: dict[str, str] = {}
+            if not web["profile"] and tg["profile"]:
+                updates["profile"] = tg["profile"]
+            if not web["api_token"] and tg["api_token"]:
+                updates["api_token"] = tg["api_token"]
+            if updates:
+                set_clause = ", ".join(f"{k} = ?" for k in updates)
+                conn.execute(
+                    f"UPDATE users SET {set_clause} WHERE id = ?",
+                    list(updates.values()) + [web_user_id],
+                )
+            conn.execute("DELETE FROM users WHERE id = ?", (tg["id"],))
+
+        conn.execute(
+            "UPDATE users SET telegram_chat_id = ? WHERE id = ?",
+            (telegram_chat_id, web_user_id),
+        )

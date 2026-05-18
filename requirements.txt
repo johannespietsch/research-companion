@@ -19,3 +19,5 @@ faster-whisper>=1.0.0
 pdfplumber>=0.11.0
 # web UI file uploads
 python-multipart>=0.0.9
+# tests
+pytest>=8.0.0

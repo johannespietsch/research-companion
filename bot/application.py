@@ -4,7 +4,16 @@ import logging
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, TypeHandler, filters
 
-from bot.commands import cmd_start, cmd_delete, cmd_list, cmd_profile, cmd_search, cmd_show, cmd_token
+from bot.commands import (
+    cmd_delete,
+    cmd_link,
+    cmd_list,
+    cmd_profile,
+    cmd_search,
+    cmd_show,
+    cmd_start,
+    cmd_token,
+)
 from bot.handlers import (
     handle_audio,
     handle_document,
@@ -52,6 +61,9 @@ def build_application(token: str) -> Application:
 
     # Web UI token
     app.add_handler(CommandHandler("token", cmd_token))
+
+    # Account linking (web ↔ Telegram)
+    app.add_handler(CommandHandler("link", cmd_link))
 
     # KB commands
     app.add_handler(CommandHandler("list", cmd_list))
