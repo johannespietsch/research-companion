@@ -25,18 +25,22 @@ _TYPE_ICONS = {
 }
 
 
-def _parse_user_flag(args: list[str]) -> tuple[str | None, list[str]]:
+def _parse_user_flag(args: list[str]) -> tuple[int | None, list[str]]:
     """Extract --user <id> from args, return (user_id, remaining_args)."""
     if "--user" in args:
         idx = args.index("--user")
         if idx + 1 < len(args):
-            user_id = args[idx + 1]
+            raw = args[idx + 1]
             remaining = args[:idx] + args[idx + 2:]
-            return user_id, remaining
+            try:
+                return int(raw), remaining
+            except ValueError:
+                print(f"--user expects an integer id, got {raw!r}")
+                sys.exit(2)
     return None, args
 
 
-def cmd_list(user_id: str | None = None):
+def cmd_list(user_id: int | None = None):
     rows = get_all_items(user_id)
     if not rows:
         print("No items in knowledge base yet.")
@@ -82,7 +86,7 @@ def cmd_show(item_id: int):
     print()
 
 
-def cmd_search(query: str, user_id: str | None = None):
+def cmd_search(query: str, user_id: int | None = None):
     rows = search_items(query, user_id)
     if not rows:
         print(f"No results for '{query}'.")
@@ -111,15 +115,12 @@ def cmd_delete(item_id: int):
 
 
 def cmd_adduser(email: str):
-    """Create a new web-only user and print their API token."""
+    """Create a new web-only user (or attach an api_token to an existing one) and print the token."""
     from bot.auth import generate_token
-    from bot.db import create_web_user
+    from bot.db import upsert_user_by_email, set_user_field
     token = generate_token()
-    try:
-        user_id = create_web_user(email=email, api_token=token)
-    except ValueError as e:
-        print(f"Error: {e}")
-        return
+    user_id = upsert_user_by_email(email)
+    set_user_field(user_id, api_token=token)
     print(f"Created user : {user_id}")
     print(f"Email        : {email}")
     print(f"API token    : {token}")

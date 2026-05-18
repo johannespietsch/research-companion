@@ -9,7 +9,7 @@ from telegram.ext import ContextTypes
 
 from bot.analyzer import analyze, analyze_image, to_json_str
 from bot.config import MAX_CONTENT_CHARS
-from bot.db import save_item
+from bot.db import get_or_create_user_by_telegram, save_item
 from bot.fetcher import fetch_url
 from bot.formatting import format_analysis
 from bot.storage import save_file_from_path
@@ -39,7 +39,7 @@ async def _describe_images(image_urls: list[str]) -> str:
 
 async def _analyze_and_reply(
     update: Update,
-    user_id: str,
+    user_id: int,
     text: str,
     source_type: str = "note",
     source: str = "",
@@ -73,7 +73,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not text:
         return
 
-    user_id = str(update.effective_user.id)
+    user_id = get_or_create_user_by_telegram(update.effective_user.id)
     entities = message.entities or []
     urls = [
         text[e.offset: e.offset + e.length] if e.type == "url" else e.url
@@ -112,7 +112,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 # --- Voice messages ---
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = str(update.effective_user.id)
+    user_id = get_or_create_user_by_telegram(update.effective_user.id)
     await update.message.reply_text("Transcribing voice message...")
     with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as f:
         path = f.name
@@ -134,7 +134,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # --- Audio files ---
 
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = str(update.effective_user.id)
+    user_id = get_or_create_user_by_telegram(update.effective_user.id)
     audio = update.message.audio
     suffix = f".{audio.mime_type.split('/')[-1]}" if audio.mime_type else ".mp3"
     await update.message.reply_text(f"Transcribing audio: {audio.file_name or 'file'}...")
@@ -161,7 +161,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # --- Video & video notes ---
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = str(update.effective_user.id)
+    user_id = get_or_create_user_by_telegram(update.effective_user.id)
     video = update.message.video or update.message.video_note
     await update.message.reply_text("Extracting and transcribing video audio...")
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
@@ -183,7 +183,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # --- Photos (vision) ---
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = str(update.effective_user.id)
+    user_id = get_or_create_user_by_telegram(update.effective_user.id)
     await update.message.reply_text("Analyzing image...")
     photo = update.message.photo[-1]  # largest available size
     with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
@@ -214,7 +214,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # --- Documents (PDF, text files, audio attachments) ---
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = str(update.effective_user.id)
+    user_id = get_or_create_user_by_telegram(update.effective_user.id)
     doc = update.message.document
     mime = doc.mime_type or ""
     name = doc.file_name or "document"

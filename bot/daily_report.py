@@ -2,7 +2,7 @@ from bot.analyzer import parse_stored, to_plain_text
 from bot.db import get_all_items
 
 
-def generate_brief(user_id: str | None = None) -> str:
+def generate_brief(user_id: int | None = None) -> str:
     items = get_all_items(user_id)
     report = "Daily Research Brief\n\n"
     for item in items[-5:]:
