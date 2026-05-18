@@ -258,12 +258,12 @@ async def try_url(req: TryRequest, _: None = Depends(_require_try_secret)):
 # only legitimate caller.
 # ---------------------------------------------------------------------------
 
-class _ProfileUpsertRequest(BaseModel):
+class _UserUpsertRequest(BaseModel):
     email: str
 
 
-@router.post("/profile/upsert")
-async def profile_upsert(req: _ProfileUpsertRequest, _: None = Depends(_require_try_secret)):
+@router.post("/users/upsert")
+async def user_upsert(req: _UserUpsertRequest, _: None = Depends(_require_try_secret)):
     """Get-or-create a users row by email. Returns the canonical INTEGER id."""
     email = (req.email or "").strip()
     if not email or "@" not in email:

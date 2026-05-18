@@ -1,0 +1,224 @@
+"""DB-layer tests: schema migration, user/item helpers, link codes, merge."""
+from __future__ import annotations
+
+import os
+import sqlite3
+
+import pytest
+
+
+def _seed_old_schema(db_path: str) -> None:
+    """Write a `profiles` + `items(user_id TEXT)` database the way pre-rebuild prod looked."""
+    c = sqlite3.connect(db_path)
+    c.executescript("""
+        CREATE TABLE items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL DEFAULT '',
+            source_type TEXT NOT NULL DEFAULT 'unknown',
+            source TEXT NOT NULL DEFAULT '',
+            content TEXT NOT NULL DEFAULT '',
+            analysis TEXT NOT NULL DEFAULT '',
+            user_note TEXT NOT NULL DEFAULT '',
+            file_path TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S', 'now'))
+        );
+        CREATE TABLE profiles (
+            user_id TEXT PRIMARY KEY,
+            content TEXT NOT NULL DEFAULT '',
+            email TEXT UNIQUE,
+            api_token TEXT UNIQUE
+        );
+        INSERT INTO profiles VALUES ('98765', 'I am a developer.', NULL, NULL);
+        INSERT INTO profiles VALUES ('11111', 'I trade crypto.', 'real@tg.com', 'token_real');
+        INSERT INTO profiles VALUES ('web:ghost@example.com', 'unused', 'ghost@example.com', 'token_ghost');
+        INSERT INTO items (user_id, source_type, content, analysis) VALUES ('98765', 'note', 'hello A', '{}');
+        INSERT INTO items (user_id, source_type, content, analysis) VALUES ('11111', 'url', 'hello B', '{}');
+        INSERT INTO items (user_id, source_type, content, analysis) VALUES ('web:ghost@example.com', 'note', 'orphan web', '{}');
+        INSERT INTO items (user_id, source_type, content, analysis) VALUES ('', 'note', 'pre-multiuser', '{}');
+    """)
+    c.commit()
+    c.close()
+
+
+# ---------------------------------------------------------------------------
+# Migration from the old `profiles` schema
+# ---------------------------------------------------------------------------
+
+class TestMigration:
+    def test_fresh_install_creates_users_and_items(self, db):
+        # The autouse fixture runs _init() against a fresh dir; we should already
+        # have empty users + items + link_codes tables.
+        conn = db._get_conn()
+        names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        assert {"users", "items", "link_codes"}.issubset(names)
+        assert "profiles" not in names
+
+    def test_migration_moves_telegram_users_only(self, monkeypatch):
+        # Seed old schema, then import bot.db which triggers the migration
+        data_dir = os.environ["DATA_DIR"]
+        _seed_old_schema(os.path.join(data_dir, "research.db"))
+
+        import bot.db as db
+
+        conn = db._get_conn()
+        users = list(conn.execute("SELECT telegram_chat_id, email, api_token, profile FROM users ORDER BY telegram_chat_id"))
+        assert len(users) == 2, "web:<email> row should be dropped"
+        assert users[0]["telegram_chat_id"] == 11111
+        assert users[0]["email"] == "real@tg.com"
+        assert users[0]["api_token"] == "token_real"
+        assert users[0]["profile"] == "I trade crypto."
+        assert users[1]["telegram_chat_id"] == 98765
+        assert users[1]["profile"] == "I am a developer."
+
+    def test_migration_remaps_item_user_ids(self, monkeypatch):
+        data_dir = os.environ["DATA_DIR"]
+        _seed_old_schema(os.path.join(data_dir, "research.db"))
+
+        import bot.db as db
+
+        conn = db._get_conn()
+        items = list(conn.execute("SELECT id, user_id, content FROM items ORDER BY id"))
+        # The web:<email> item and the empty-user-id item are dropped (orphans).
+        assert len(items) == 2
+        assert items[0]["content"] == "hello A"
+        assert items[1]["content"] == "hello B"
+        # Items should reference real users.id INTEGERs, not the old text.
+        user_ids = {u["id"] for u in conn.execute("SELECT id FROM users")}
+        for item in items:
+            assert item["user_id"] in user_ids
+
+    def test_migration_preserves_item_ids(self, monkeypatch):
+        """`/show <id>` keeps working post-migration."""
+        data_dir = os.environ["DATA_DIR"]
+        _seed_old_schema(os.path.join(data_dir, "research.db"))
+
+        import bot.db as db
+
+        conn = db._get_conn()
+        # Old items 1 and 2 had user_ids '98765' and '11111' — they should still
+        # be items 1 and 2 with their content intact.
+        rows = list(conn.execute("SELECT id, content FROM items ORDER BY id"))
+        assert rows[0]["id"] == 1
+        assert rows[0]["content"] == "hello A"
+        assert rows[1]["id"] == 2
+        assert rows[1]["content"] == "hello B"
+
+    def test_init_is_idempotent(self, db):
+        """Running _init twice on the new schema should be a no-op."""
+        db._init()
+        db._init()
+        conn = db._get_conn()
+        names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        assert {"users", "items", "link_codes"}.issubset(names)
+
+
+# ---------------------------------------------------------------------------
+# User helpers
+# ---------------------------------------------------------------------------
+
+class TestUserHelpers:
+    def test_get_or_create_user_by_telegram(self, db):
+        uid = db.get_or_create_user_by_telegram(12345)
+        again = db.get_or_create_user_by_telegram(12345)
+        assert uid == again
+
+    def test_upsert_user_by_email_is_case_insensitive(self, db):
+        a = db.upsert_user_by_email("Alice@Example.com")
+        b = db.upsert_user_by_email("alice@example.com")
+        c = db.upsert_user_by_email("  alice@example.com  ")
+        assert a == b == c
+
+    def test_set_and_get_user_profile(self, db):
+        uid = db.get_or_create_user_by_telegram(1)
+        assert db.get_user_profile(uid) == ""
+        db.set_user_profile(uid, "I build chess engines.")
+        assert db.get_user_profile(uid) == "I build chess engines."
+
+
+# ---------------------------------------------------------------------------
+# Link codes
+# ---------------------------------------------------------------------------
+
+class TestLinkCodes:
+    def test_create_returns_6_digit_code(self, db):
+        uid = db.upsert_user_by_email("a@b.com")
+        code = db.create_link_code(uid)
+        assert len(code) == 6
+        assert code.isdigit()
+
+    def test_redeem_returns_user_id_then_consumes(self, db):
+        uid = db.upsert_user_by_email("a@b.com")
+        code = db.create_link_code(uid)
+        assert db.redeem_link_code(code) == uid
+        assert db.redeem_link_code(code) is None, "second redemption must fail"
+
+    def test_redeem_returns_none_for_invalid_code(self, db):
+        assert db.redeem_link_code("000000") is None
+
+    def test_one_outstanding_code_per_user(self, db):
+        uid = db.upsert_user_by_email("a@b.com")
+        first = db.create_link_code(uid)
+        second = db.create_link_code(uid)
+        # The first code is replaced by the second
+        assert db.redeem_link_code(first) is None
+        assert db.redeem_link_code(second) == uid
+
+
+# ---------------------------------------------------------------------------
+# link_telegram_to_user merge logic
+# ---------------------------------------------------------------------------
+
+class TestLinkTelegramMerge:
+    def test_moves_items_from_telegram_to_web_user(self, db):
+        web_uid = db.upsert_user_by_email("alice@example.com")
+        tg_uid = db.get_or_create_user_by_telegram(555111)
+        db.save_item(tg_uid, "note", "", "tg note", '{"verdict":"watch"}')
+
+        db.link_telegram_to_user(web_user_id=web_uid, telegram_chat_id=555111)
+
+        assert db.get_user(tg_uid) is None, "orphan tg row deleted"
+        web_items = db.get_all_items(web_uid)
+        assert len(web_items) == 1
+        assert web_items[0]["content"] == "tg note"
+
+    def test_fills_empty_web_profile_from_telegram(self, db):
+        web_uid = db.upsert_user_by_email("alice@example.com")
+        tg_uid = db.get_or_create_user_by_telegram(555111)
+        db.set_user_profile(tg_uid, "I love haiku.")
+
+        db.link_telegram_to_user(web_user_id=web_uid, telegram_chat_id=555111)
+
+        assert db.get_user(web_uid)["profile"] == "I love haiku."
+
+    def test_keeps_web_profile_when_set(self, db):
+        web_uid = db.upsert_user_by_email("alice@example.com")
+        db.set_user_profile(web_uid, "Already set on web.")
+        tg_uid = db.get_or_create_user_by_telegram(555111)
+        db.set_user_profile(tg_uid, "Conflicting tg version.")
+
+        db.link_telegram_to_user(web_user_id=web_uid, telegram_chat_id=555111)
+
+        assert db.get_user(web_uid)["profile"] == "Already set on web."
+
+    def test_attaches_telegram_chat_id(self, db):
+        web_uid = db.upsert_user_by_email("alice@example.com")
+        # No prior tg row at all — just attach
+        db.link_telegram_to_user(web_user_id=web_uid, telegram_chat_id=555111)
+        assert db.get_user(web_uid)["telegram_chat_id"] == 555111
+
+    def test_idempotent_relink(self, db):
+        web_uid = db.upsert_user_by_email("alice@example.com")
+        db.link_telegram_to_user(web_user_id=web_uid, telegram_chat_id=555111)
+        # Second call is a no-op (would raise on conflict otherwise)
+        db.link_telegram_to_user(web_user_id=web_uid, telegram_chat_id=555111)
+        assert db.get_user(web_uid)["telegram_chat_id"] == 555111
+
+    def test_raises_when_already_linked_to_different_chat(self, db):
+        web_uid = db.upsert_user_by_email("alice@example.com")
+        db.link_telegram_to_user(web_user_id=web_uid, telegram_chat_id=555111)
+        with pytest.raises(ValueError, match="already linked"):
+            db.link_telegram_to_user(web_user_id=web_uid, telegram_chat_id=999999)
+
+    def test_raises_when_web_user_not_found(self, db):
+        with pytest.raises(ValueError, match="not found"):
+            db.link_telegram_to_user(web_user_id=999, telegram_chat_id=555111)
