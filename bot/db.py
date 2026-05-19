@@ -1,3 +1,4 @@
+import json
 import os
 import secrets
 import sqlite3
@@ -52,12 +53,24 @@ CREATE TABLE IF NOT EXISTS link_codes (
     FOREIGN KEY (user_id) REFERENCES users(id)
 )"""
 
+# Cache of fetched URL → extracted text + metadata. Keyed by exact URL.
+# Lets us skip repeated upstream calls (which is the main vector for the
+# YouTube 429s we see in prod) and makes user retries instant.
+_CREATE_URL_CACHE_SQL = """\
+CREATE TABLE IF NOT EXISTS url_cache (
+    url        TEXT PRIMARY KEY,
+    payload    TEXT NOT NULL,
+    fetched_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S', 'now'))
+)"""
+
 _CREATE_INDEXES_SQL = [
     "CREATE INDEX IF NOT EXISTS idx_items_user ON items(user_id, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_link_codes_expires ON link_codes(expires_at)",
+    "CREATE INDEX IF NOT EXISTS idx_url_cache_fetched_at ON url_cache(fetched_at)",
 ]
 
 LINK_CODE_TTL_SECONDS = 600
+URL_CACHE_TTL_SECONDS = 30 * 24 * 3600
 
 
 def _get_conn() -> sqlite3.Connection:
@@ -135,6 +148,7 @@ def _init() -> None:
             conn.execute(_CREATE_USERS_SQL)
             conn.execute(_CREATE_ITEMS_SQL)
         conn.execute(_CREATE_LINK_CODES_SQL)
+        conn.execute(_CREATE_URL_CACHE_SQL)
         for stmt in _CREATE_INDEXES_SQL:
             conn.execute(stmt)
 
@@ -334,6 +348,45 @@ def redeem_link_code(code: str) -> int | None:
         conn.execute("DELETE FROM link_codes WHERE code = ?", (code,))
         conn.execute("DELETE FROM link_codes WHERE expires_at <= ?", (now,))
         return row["user_id"]
+
+
+# ---------------------------------------------------------------------------
+# URL cache
+# ---------------------------------------------------------------------------
+
+def get_cached_fetch(url: str, max_age_seconds: int = URL_CACHE_TTL_SECONDS) -> dict | None:
+    """Return a previously-cached fetch result for `url`, or None if there's
+    no entry or the entry is older than `max_age_seconds`."""
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(seconds=max_age_seconds)
+    ).strftime("%Y-%m-%dT%H:%M:%S")
+    with _get_conn() as conn:
+        row = conn.execute(
+            "SELECT payload FROM url_cache WHERE url = ? AND fetched_at > ?",
+            (url, cutoff),
+        ).fetchone()
+    if not row:
+        return None
+    try:
+        decoded = json.loads(row["payload"])
+        return decoded if isinstance(decoded, dict) else None
+    except json.JSONDecodeError:
+        return None
+
+
+def set_cached_fetch(url: str, payload: dict) -> None:
+    """Store (or refresh) a successful fetch for `url`. Caller should skip
+    calling this for failed fetches so retries are not poisoned by a cached
+    empty result."""
+    body = json.dumps(payload, ensure_ascii=False)
+    with _get_conn() as conn:
+        conn.execute(
+            "INSERT INTO url_cache (url, payload, fetched_at) "
+            "VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%S', 'now')) "
+            "ON CONFLICT(url) DO UPDATE SET "
+            "  payload = excluded.payload, fetched_at = excluded.fetched_at",
+            (url, body),
+        )
 
 
 def link_telegram_to_user(web_user_id: int, telegram_chat_id: int) -> None:
