@@ -412,14 +412,19 @@ async def _pdf_fetch(url: str) -> dict:
     return {"text": text[:MAX_CONTENT_CHARS], "title": title, "source_type": "pdf"}
 
 
+def _curl_cffi_get(url: str):
+    """Sync GET with Chrome TLS/HTTP2 impersonation. Clears Cloudflare managed
+    challenges that plain httpx trips on (e.g. blog.cathy-moore.com), and is a
+    drop-in superset for vanilla HTML article fetches."""
+    from curl_cffi import requests as cr
+    return cr.get(url, impersonate="chrome124", timeout=15, allow_redirects=True)
+
+
 async def _generic_fetch(url: str) -> dict:
     try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=15) as client:
-            resp = await client.get(
-                url,
-                headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"},
-            )
-            html = resp.text
+        loop = asyncio.get_running_loop()
+        resp = await loop.run_in_executor(None, _curl_cffi_get, url)
+        html = resp.text
     except Exception as e:
         logger.warning(f"Generic fetch failed for {url}: {e}")
         return {"text": "", "title": url, "source_type": "unknown"}
