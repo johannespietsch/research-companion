@@ -18,6 +18,13 @@ def _youtube_thumbnail(video_id: str) -> str:
     return f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
 
 
+# Whisper fallback is only attempted for videos short enough that the
+# audio download + transcription has a real chance of completing within the
+# Worker's 25 s timeout on `/api/try` / `/api/library/add`. Long videos fall
+# back to title + uploader + description.
+_WHISPER_FALLBACK_MAX_DURATION_S = 180
+
+
 def _youtube_transcript(url: str) -> dict:
     from youtube_transcript_api import YouTubeTranscriptApi
 
@@ -38,10 +45,32 @@ def _youtube_transcript(url: str) -> dict:
             "image_urls": [thumb],
         }
     except Exception:
-        logger.info(f"No transcript for {video_id}, falling back to yt-dlp description")
-        result = _yt_dlp_extract(url)
-        result.setdefault("image_urls", []).append(thumb)
-        return result
+        logger.info(f"No transcript for {video_id}, falling back to yt-dlp")
+
+    extract = _yt_dlp_extract(url)
+
+    # If yt-dlp also got us a transcript (or extraction died entirely), use what
+    # we have. The Whisper branch only kicks in when we're left with a
+    # description-only answer AND the video is short enough.
+    if extract.get("has_transcript") or not extract.get("text"):
+        extract.setdefault("image_urls", []).append(thumb)
+        return extract
+
+    duration = extract.get("duration") or 0
+    if duration and duration <= _WHISPER_FALLBACK_MAX_DURATION_S:
+        logger.info(
+            f"YouTube {video_id}: no subtitles, trying audio + Whisper "
+            f"(duration {duration}s)"
+        )
+        whisper = _yt_dlp_transcribe(url)
+        if whisper.get("text"):
+            whisper["source_type"] = "youtube"
+            whisper.setdefault("image_urls", []).append(thumb)
+            return whisper
+        logger.info(f"YouTube {video_id}: Whisper fallback also failed, returning description")
+
+    extract.setdefault("image_urls", []).append(thumb)
+    return extract
 
 
 def _tweet_id_from_url(url: str) -> str | None:
@@ -135,34 +164,60 @@ def _fetch_tweet(url: str) -> dict:
 
 
 def _yt_dlp_extract(url: str) -> dict:
-    """Extract metadata + subtitles from a video URL via yt-dlp.
+    """Extract metadata + best-effort subtitles from a video URL via yt-dlp.
 
-    Returns info dict with text/title/source_type; does NOT transcribe audio
-    (use _yt_dlp_transcribe for that).
+    Two-pass: metadata first (cheap, hits a different YouTube endpoint and is
+    much less rate-limited than subtitle download), then a separate subtitle
+    pass whose failures are non-fatal — if YouTube 429s the subtitle download
+    we still return title + uploader + description so the analyser has
+    *something* to work with.
+
+    Returns: text, title, source_type, has_transcript (bool), duration (s).
     """
     import yt_dlp
     import tempfile, os
 
-    ydl_opts = {
-        "quiet": True,
-        "skip_download": True,
-        "ignore_no_formats_error": True,
-        "writesubtitles": True,
-        "writeautomaticsub": True,
-        "subtitleslangs": ["all"],   # grab whatever is available, filter after
-        "subtitlesformat": "vtt",
-        "outtmpl": os.path.join("%(id)s", "%(id)s.%(ext)s"),
-    }
+    # Pass 1: metadata only. No subtitle/audio downloads — far less likely to 429.
+    info = None
+    try:
+        with yt_dlp.YoutubeDL({
+            "quiet": True,
+            "skip_download": True,
+            "writesubtitles": False,
+            "ignore_no_formats_error": True,
+        }) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as e:
+        logger.warning(f"yt-dlp metadata extract failed for {url}: {e}")
+
+    if not info:
+        return {"text": "", "title": url, "source_type": "unknown", "has_transcript": False, "duration": 0}
+
+    title = info.get("title") or url
+    uploader = info.get("uploader") or info.get("channel") or ""
+    description = info.get("description") or ""
+    duration = int(info.get("duration") or 0)
+    source_type = "youtube" if "vimeo" not in url and "youtube" in url else "video"
+
+    # Pass 2: best-effort subtitle download. A 429 here drops us back to the
+    # description; it does NOT take the whole extract down with it.
+    subtitle_text = ""
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
-            ydl_opts["paths"] = {"home": tmpdir}
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-            if not info:
-                raise ValueError("yt-dlp returned no info")
+            sub_opts = {
+                "quiet": True,
+                "skip_download": True,
+                "ignore_no_formats_error": True,
+                "writesubtitles": True,
+                "writeautomaticsub": True,
+                "subtitleslangs": ["en", "en-US", "en-GB"],
+                "subtitlesformat": "vtt",
+                "paths": {"home": tmpdir},
+                "outtmpl": os.path.join("%(id)s", "%(id)s.%(ext)s"),
+            }
+            with yt_dlp.YoutubeDL(sub_opts) as ydl:
+                ydl.download([url])
 
-            # Walk the whole tmpdir — yt-dlp may nest files under a subdirectory
-            subtitle_text = ""
             for dirpath, _, filenames in os.walk(tmpdir):
                 for fname in filenames:
                     if not fname.endswith(".vtt"):
@@ -183,21 +238,21 @@ def _yt_dlp_extract(url: str) -> dict:
                         break
                 if subtitle_text:
                     break
-
-        uploader = info.get("uploader") or info.get("channel") or ""
-        title = info.get("title") or url
-        description = info.get("description") or ""
-
-        if subtitle_text:
-            text = f"{title}\nBy: {uploader}\n\nTranscript:\n{subtitle_text}"
-        else:
-            text = f"{title}\nBy: {uploader}\n\n{description}".strip()
-
-        source_type = "youtube" if "vimeo" not in url and "youtube" in url else "video"
-        return {"text": text[:MAX_CONTENT_CHARS], "title": title, "source_type": source_type}
     except Exception as e:
-        logger.warning(f"yt-dlp failed for {url}: {e}")
-        return {"text": "", "title": url, "source_type": "unknown"}
+        logger.info(f"yt-dlp subtitle download failed for {url} (continuing with description): {e}")
+
+    if subtitle_text:
+        text = f"{title}\nBy: {uploader}\n\nTranscript:\n{subtitle_text}"
+    else:
+        text = f"{title}\nBy: {uploader}\n\n{description}".strip()
+
+    return {
+        "text": text[:MAX_CONTENT_CHARS],
+        "title": title,
+        "source_type": source_type,
+        "has_transcript": bool(subtitle_text),
+        "duration": duration,
+    }
 
 
 def _yt_dlp_transcribe(url: str) -> dict:

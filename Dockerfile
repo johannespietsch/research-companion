@@ -6,10 +6,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 # System deps:
 #   ffmpeg     — required by faster-whisper for audio/video decoding
+#   nodejs     — JS runtime yt-dlp uses to solve YouTube's signature challenges
+#                (without one, yt-dlp falls back to a deprecated path that 429s
+#                much more aggressively)
 #   ca-certs   — outbound TLS to Telegram / Anthropic / etc.
 #   curl       — useful for healthcheck debugging
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ffmpeg \
+      nodejs \
       ca-certificates \
       curl \
     && rm -rf /var/lib/apt/lists/*
