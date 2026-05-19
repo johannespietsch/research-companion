@@ -367,25 +367,30 @@ def link_telegram_to_user(web_user_id: int, telegram_chat_id: int) -> None:
         if tg and tg["id"] == web_user_id:
             return  # already linked, no-op
 
+        # Always set telegram_chat_id at the end. When a separate tg row exists,
+        # capture its donatable fields, move its items, then DELETE it BEFORE
+        # we copy anything onto the web row — both rows can't hold the same
+        # UNIQUE value (api_token, telegram_chat_id) simultaneously.
+        profile_to_copy = tg["profile"] if tg and not web["profile"] and tg["profile"] else None
+        api_token_to_copy = (
+            tg["api_token"] if tg and not web["api_token"] and tg["api_token"] else None
+        )
+
         if tg:
             conn.execute(
                 "UPDATE items SET user_id = ? WHERE user_id = ?",
                 (web_user_id, tg["id"]),
             )
-            updates: dict[str, str] = {}
-            if not web["profile"] and tg["profile"]:
-                updates["profile"] = tg["profile"]
-            if not web["api_token"] and tg["api_token"]:
-                updates["api_token"] = tg["api_token"]
-            if updates:
-                set_clause = ", ".join(f"{k} = ?" for k in updates)
-                conn.execute(
-                    f"UPDATE users SET {set_clause} WHERE id = ?",
-                    list(updates.values()) + [web_user_id],
-                )
             conn.execute("DELETE FROM users WHERE id = ?", (tg["id"],))
 
+        updates: dict[str, object] = {"telegram_chat_id": telegram_chat_id}
+        if profile_to_copy is not None:
+            updates["profile"] = profile_to_copy
+        if api_token_to_copy is not None:
+            updates["api_token"] = api_token_to_copy
+
+        set_clause = ", ".join(f"{k} = ?" for k in updates)
         conn.execute(
-            "UPDATE users SET telegram_chat_id = ? WHERE id = ?",
-            (telegram_chat_id, web_user_id),
+            f"UPDATE users SET {set_clause} WHERE id = ?",
+            list(updates.values()) + [web_user_id],
         )
