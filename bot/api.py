@@ -21,6 +21,7 @@ from bot.db import (
     delete_item,
     get_all_items,
     get_item,
+    get_user,
     get_user_profile,
     save_item,
     search_items,
@@ -269,6 +270,23 @@ async def user_upsert(req: _UserUpsertRequest, _: None = Depends(_require_try_se
     if not email or "@" not in email:
         raise HTTPException(status_code=400, detail={"error": "invalid-email"})
     return {"user_id": upsert_user_by_email(email)}
+
+
+@router.get("/users/{user_id}")
+async def user_get(user_id: int, _: None = Depends(_require_try_secret)):
+    """Return user identifiers. `api_token` is exposed only as a presence
+    boolean (`has_api_token`) — never the literal token."""
+    row = get_user(user_id)
+    if not row:
+        raise HTTPException(status_code=404, detail={"error": "not-found"})
+    return {
+        "id": row["id"],
+        "email": row["email"],
+        "telegram_chat_id": row["telegram_chat_id"],
+        "has_api_token": bool(row["api_token"]),
+        "profile": row["profile"],
+        "created_at": row["created_at"],
+    }
 
 
 class _LibraryAddRequest(BaseModel):

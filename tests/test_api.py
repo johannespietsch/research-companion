@@ -38,6 +38,38 @@ class TestUserUpsert:
         assert r.status_code == 400
 
 
+class TestUserGet:
+    def test_returns_user_identifiers_no_api_token_leak(self, client, auth_headers, db):
+        uid = client.post(
+            "/api/users/upsert", json={"email": "alice@example.com"}, headers=auth_headers
+        ).json()["user_id"]
+        db.set_user_field(uid, api_token="secret_token_xyz")
+
+        r = client.get(f"/api/users/{uid}", headers=auth_headers)
+        assert r.status_code == 200
+        body = r.json()
+        assert body["id"] == uid
+        assert body["email"] == "alice@example.com"
+        assert body["telegram_chat_id"] is None
+        assert body["has_api_token"] is True
+        assert "api_token" not in body, "raw token must not leak"
+
+    def test_telegram_chat_id_reflects_linked_state(self, client, auth_headers, db):
+        uid = client.post(
+            "/api/users/upsert", json={"email": "bob@example.com"}, headers=auth_headers
+        ).json()["user_id"]
+        # Not linked yet
+        assert client.get(f"/api/users/{uid}", headers=auth_headers).json()["telegram_chat_id"] is None
+
+        # Link
+        db.link_telegram_to_user(web_user_id=uid, telegram_chat_id=42)
+        assert client.get(f"/api/users/{uid}", headers=auth_headers).json()["telegram_chat_id"] == 42
+
+    def test_404_for_unknown_user(self, client, auth_headers):
+        r = client.get("/api/users/99999", headers=auth_headers)
+        assert r.status_code == 404
+
+
 # ---------------------------------------------------------------------------
 # POST /api/library/add
 # ---------------------------------------------------------------------------
