@@ -471,6 +471,31 @@ def _domain_matches(domain: str, *targets: str) -> bool:
 
 
 async def fetch_url(url: str) -> dict:
+    """Public entry point. Wraps `_fetch_url_uncached` with a per-URL cache so
+    repeat submissions, retries, and concurrent fetches of the same URL don't
+    each hit upstream. Failed fetches (empty `text`) are NOT cached so the
+    next attempt is fresh."""
+    from bot.db import get_cached_fetch, set_cached_fetch
+
+    cached = get_cached_fetch(url)
+    if cached is not None:
+        logger.info(f"url_cache hit for {url}")
+        return cached
+
+    result = await _fetch_url_uncached(url)
+
+    if (result.get("text") or "").strip():
+        try:
+            set_cached_fetch(url, result)
+        except Exception as e:
+            logger.warning(f"url_cache write failed for {url}: {e}")
+
+    return result
+
+
+async def _fetch_url_uncached(url: str) -> dict:
+    """The actual routing logic — keep this as the only place that knows the
+    source-specific fetchers. `fetch_url` is the cache layer in front."""
     domain = urlparse(url).netloc.lower()
 
     if _domain_matches(domain, "youtube.com", "youtu.be"):

@@ -249,3 +249,54 @@ class TestLinkTelegramMerge:
 
         assert db.get_user(web_uid)["api_token"] == "web_tok"
         assert db.get_user(tg_uid) is None
+
+
+# ---------------------------------------------------------------------------
+# URL cache
+# ---------------------------------------------------------------------------
+
+class TestUrlCache:
+    def test_set_then_get_roundtrips_payload(self, db):
+        payload = {"text": "hello", "title": "Hi", "source_type": "article", "image_urls": []}
+        db.set_cached_fetch("https://example.com/a", payload)
+        assert db.get_cached_fetch("https://example.com/a") == payload
+
+    def test_get_misses_for_unknown_url(self, db):
+        assert db.get_cached_fetch("https://nope.example/") is None
+
+    def test_set_upserts_same_url(self, db):
+        db.set_cached_fetch(
+            "https://example.com/a",
+            {"text": "v1", "title": "Hi", "source_type": "article"},
+        )
+        db.set_cached_fetch(
+            "https://example.com/a",
+            {"text": "v2", "title": "Hi2", "source_type": "article"},
+        )
+        assert db.get_cached_fetch("https://example.com/a")["text"] == "v2"
+
+    def test_get_respects_max_age(self, db):
+        """A row older than `max_age_seconds` is treated as a miss."""
+        import sqlite3
+        from datetime import datetime, timedelta, timezone
+
+        db.set_cached_fetch(
+            "https://example.com/a",
+            {"text": "stale", "title": "", "source_type": "article"},
+        )
+
+        # Force fetched_at backwards in time.
+        old = (datetime.now(timezone.utc) - timedelta(seconds=600)).strftime(
+            "%Y-%m-%dT%H:%M:%S"
+        )
+        conn = sqlite3.connect(db.DB_PATH)
+        conn.execute("UPDATE url_cache SET fetched_at = ?", (old,))
+        conn.commit()
+        conn.close()
+
+        assert db.get_cached_fetch("https://example.com/a", max_age_seconds=300) is None
+        # Same row is fresh under a longer window.
+        assert (
+            db.get_cached_fetch("https://example.com/a", max_age_seconds=3600)["text"]
+            == "stale"
+        )

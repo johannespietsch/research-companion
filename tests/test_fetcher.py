@@ -1,4 +1,4 @@
-"""Tests for the YouTube fallback chain in bot.fetcher.
+"""Tests for the YouTube fallback chain + the URL cache in bot.fetcher.
 
 The chain (highest-quality first → cheapest-degraded last):
   youtube_transcript_api  →  yt-dlp subtitles  →  yt-dlp audio + Whisper
@@ -9,7 +9,8 @@ These tests mock yt-dlp and youtube_transcript_api so they run offline.
 """
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+import asyncio
+from unittest.mock import AsyncMock, MagicMock, patch
 
 
 YOUTUBE_URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
@@ -141,3 +142,51 @@ class TestYouTubeFallbackChain:
 
         transcribe.assert_not_called()
         assert result["text"] == ""
+
+
+class TestUrlCacheLayer:
+    """`fetch_url` wraps `_fetch_url_uncached` with the url_cache."""
+
+    def test_successful_fetch_is_cached_and_reused(self):
+        from bot import fetcher
+
+        with patch.object(fetcher, "_fetch_url_uncached", new_callable=AsyncMock) as inner:
+            inner.return_value = {
+                "text": "first body", "title": "Hi", "source_type": "article",
+            }
+
+            r1 = asyncio.run(fetcher.fetch_url("https://example.com/a"))
+            r2 = asyncio.run(fetcher.fetch_url("https://example.com/a"))
+
+        assert inner.call_count == 1, "second call must come from cache, not upstream"
+        assert r1 == r2
+        assert "first body" in r2["text"]
+
+    def test_empty_text_is_not_cached(self):
+        from bot import fetcher
+
+        with patch.object(fetcher, "_fetch_url_uncached", new_callable=AsyncMock) as inner:
+            inner.return_value = {"text": "", "title": "url", "source_type": "unknown"}
+
+            asyncio.run(fetcher.fetch_url("https://example.com/empty"))
+            asyncio.run(fetcher.fetch_url("https://example.com/empty"))
+
+        assert inner.call_count == 2, "failed fetch shouldn't poison the cache"
+
+    def test_different_urls_get_separate_entries(self):
+        from bot import fetcher
+
+        with patch.object(fetcher, "_fetch_url_uncached", new_callable=AsyncMock) as inner:
+            def by_url(url):
+                return {"text": f"body for {url}", "title": "", "source_type": "article"}
+            inner.side_effect = lambda u: by_url(u)
+
+            asyncio.run(fetcher.fetch_url("https://example.com/a"))
+            asyncio.run(fetcher.fetch_url("https://example.com/b"))
+
+            r_a2 = asyncio.run(fetcher.fetch_url("https://example.com/a"))
+            r_b2 = asyncio.run(fetcher.fetch_url("https://example.com/b"))
+
+        assert inner.call_count == 2
+        assert "https://example.com/a" in r_a2["text"]
+        assert "https://example.com/b" in r_b2["text"]
