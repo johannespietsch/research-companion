@@ -222,3 +222,30 @@ class TestLinkTelegramMerge:
     def test_raises_when_web_user_not_found(self, db):
         with pytest.raises(ValueError, match="not found"):
             db.link_telegram_to_user(web_user_id=999, telegram_chat_id=555111)
+
+    def test_no_unique_conflict_when_tg_has_api_token_and_web_does_not(self, db):
+        """Regression: prior code UPDATED web.api_token = tg.api_token BEFORE
+        DELETEing tg, briefly violating users.api_token UNIQUE."""
+        web_uid = db.upsert_user_by_email("alice@example.com")
+        tg_uid = db.get_or_create_user_by_telegram(555111)
+        db.set_user_field(tg_uid, api_token="tok_xyz")
+
+        db.link_telegram_to_user(web_user_id=web_uid, telegram_chat_id=555111)
+
+        web_after = db.get_user(web_uid)
+        assert web_after["telegram_chat_id"] == 555111
+        assert web_after["api_token"] == "tok_xyz", "tg-side api_token should have moved over"
+        assert db.get_user(tg_uid) is None, "orphan tg row deleted"
+
+    def test_no_conflict_when_both_have_api_tokens(self, db):
+        """When both rows already have a token, web's wins — tg's is discarded
+        with its row (no UNIQUE violation either)."""
+        web_uid = db.upsert_user_by_email("alice@example.com")
+        db.set_user_field(web_uid, api_token="web_tok")
+        tg_uid = db.get_or_create_user_by_telegram(555111)
+        db.set_user_field(tg_uid, api_token="tg_tok")
+
+        db.link_telegram_to_user(web_user_id=web_uid, telegram_chat_id=555111)
+
+        assert db.get_user(web_uid)["api_token"] == "web_tok"
+        assert db.get_user(tg_uid) is None
