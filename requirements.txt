@@ -11,7 +11,9 @@ trafilatura>=1.12.0
 playwright>=1.40.0
 beautifulsoup4>=4.12.0
 yt-dlp[default]>=2026.3.3
-# curl_cffi (browser impersonation) is pulled in by yt-dlp[default]
+# curl_cffi: Chrome TLS/HTTP2 impersonation — used by _generic_fetch to clear
+# Cloudflare managed challenges. Also a transitive dep of yt-dlp[default].
+curl_cffi>=0.7.0
 youtube-transcript-api>=1.2.4
 # transcription (requires ffmpeg installed on system)
 faster-whisper>=1.0.0
