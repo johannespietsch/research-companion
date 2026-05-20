@@ -22,6 +22,7 @@ NO_TEXT_EXTRACTED = "no_text_extracted"
 VIDEO_UNAVAILABLE = "video_unavailable"
 JS_REQUIRED = "js_required"
 PAYWALLED = "paywalled"
+BLOCKED_URL = "blocked_url"
 
 
 _USER_MESSAGES: dict[str, str] = {
@@ -77,6 +78,10 @@ _USER_MESSAGES: dict[str, str] = {
         "This looks like it's behind a paywall or login — only the teaser was "
         "visible, so there's no full article to analyse. If you have access, "
         "paste the text directly and I'll analyse it."
+    ),
+    BLOCKED_URL: (
+        "That URL can't be fetched — only public web addresses are supported. "
+        "Private, local, or internal-network addresses are blocked."
     ),
 }
 

@@ -9,6 +9,7 @@ import requests
 
 from bot import fetch_errors
 from bot.config import MAX_CONTENT_CHARS
+from bot.ssrf import BlockedURLError, assert_public_url
 
 logger = logging.getLogger(__name__)
 
@@ -609,6 +610,15 @@ async def fetch_url(url: str) -> dict:
 async def _fetch_url_uncached(url: str) -> dict:
     """The actual routing logic — keep this as the only place that knows the
     source-specific fetchers. `fetch_url` is the cache layer in front."""
+    # SSRF guard: refuse anything that resolves to a non-public address before
+    # any network client touches it. Empty text + reason flows through the
+    # normal "couldn't extract" path so the user gets a clean message.
+    try:
+        assert_public_url(url)
+    except BlockedURLError as e:
+        logger.warning("Blocked non-public URL %s: %s", url, e)
+        return {"text": "", "title": url, "source_type": "unknown", "reason": fetch_errors.BLOCKED_URL}
+
     domain = urlparse(url).netloc.lower()
 
     if _domain_matches(domain, "youtube.com", "youtu.be"):
