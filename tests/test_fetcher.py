@@ -144,6 +144,48 @@ class TestYouTubeFallbackChain:
         assert result["text"] == ""
 
 
+class TestWallDetection:
+    """_wall_reason flags JS/ad-block walls and paywall teasers that return
+    short boilerplate instead of article text."""
+
+    def test_js_wall_is_flagged(self):
+        from bot import fetcher, fetch_errors
+
+        # The exact string WSJ's preference-center page returns.
+        assert fetcher._wall_reason("Please enable JS and disable any ad blocker") == fetch_errors.JS_REQUIRED
+
+    def test_paywall_teaser_is_flagged(self):
+        from bot import fetcher, fetch_errors
+
+        assert fetcher._wall_reason("Subscribe to continue reading this article.") == fetch_errors.PAYWALLED
+
+    def test_empty_text_is_no_text_extracted(self):
+        from bot import fetcher, fetch_errors
+
+        assert fetcher._wall_reason("") == fetch_errors.NO_TEXT_EXTRACTED
+        assert fetcher._wall_reason(None) == fetch_errors.NO_TEXT_EXTRACTED
+
+    def test_short_non_wall_text_is_no_text_extracted(self):
+        from bot import fetcher, fetch_errors
+
+        assert fetcher._wall_reason("Hello there.") == fetch_errors.NO_TEXT_EXTRACTED
+
+    def test_real_article_passes(self):
+        from bot import fetcher
+
+        article = "This is a substantive article about retrieval-augmented generation. " * 20
+        assert fetcher._wall_reason(article) is None
+
+    def test_long_article_mentioning_subscribe_is_not_a_wall(self):
+        from bot import fetcher
+
+        # A 2000+ char article that happens to contain "subscribe to continue"
+        # in a footer should NOT be nuked — signatures only apply to short text.
+        article = ("Detailed analysis of the topic at hand. " * 60) + " Subscribe to continue getting updates."
+        assert len(article) > fetcher._WALL_SIGNATURE_MAX_CHARS
+        assert fetcher._wall_reason(article) is None
+
+
 class TestUrlCacheLayer:
     """`fetch_url` wraps `_fetch_url_uncached` with the url_cache."""
 

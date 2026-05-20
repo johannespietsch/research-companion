@@ -20,6 +20,8 @@ RATE_LIMITED = "rate_limited"
 FETCH_FAILED = "fetch_failed"
 NO_TEXT_EXTRACTED = "no_text_extracted"
 VIDEO_UNAVAILABLE = "video_unavailable"
+JS_REQUIRED = "js_required"
+PAYWALLED = "paywalled"
 
 
 _USER_MESSAGES: dict[str, str] = {
@@ -65,6 +67,16 @@ _USER_MESSAGES: dict[str, str] = {
     ),
     VIDEO_UNAVAILABLE: (
         "This video is unavailable — it may be private, deleted, or region-locked."
+    ),
+    JS_REQUIRED: (
+        "This page needs JavaScript or blocks automated browsers, so only a "
+        "placeholder was readable — not the article. If you can see it in your "
+        "browser, paste the text directly and I'll analyse it."
+    ),
+    PAYWALLED: (
+        "This looks like it's behind a paywall or login — only the teaser was "
+        "visible, so there's no full article to analyse. If you have access, "
+        "paste the text directly and I'll analyse it."
     ),
 }
 

@@ -446,6 +446,56 @@ def _curl_cffi_get(url: str):
     return cr.get(url, impersonate="chrome124", timeout=15, allow_redirects=True)
 
 
+# A real article is essentially never this short. Anything below this from a
+# generic HTML fetch is a wall/placeholder, not content.
+_MIN_ARTICLE_CHARS = 200
+# Signature phrases only count as a wall when the whole extraction is short —
+# a long article that merely *mentions* "subscribe to continue" isn't a wall.
+_WALL_SIGNATURE_MAX_CHARS = 1000
+
+_JS_WALL_SIGNATURES = (
+    "enable js",
+    "enable javascript",
+    "javascript is disabled",
+    "javascript is required",
+    "please enable cookies",
+    "disable any ad blocker",
+    "turn off your ad blocker",
+)
+_PAYWALL_SIGNATURES = (
+    "subscribe to continue",
+    "subscribe to read",
+    "sign in to read",
+    "sign in to continue",
+    "create a free account",
+    "create an account to continue",
+    "this article is for subscribers",
+    "this post is for paid subscribers",
+    "become a paid subscriber",
+    "you've reached your",
+    "you have reached your",
+)
+
+
+def _wall_reason(text: str | None) -> str | None:
+    """Detect JS/ad-block walls and paywall teasers in extracted article text.
+
+    Walls return short boilerplate ("Please enable JS", "Subscribe to continue")
+    that would otherwise be analysed as if it were the article. Returns a
+    fetch_errors reason, or None when the text looks like real content.
+    """
+    clean = (text or "").strip()
+    low = clean.lower()
+    if len(clean) < _WALL_SIGNATURE_MAX_CHARS:
+        if any(s in low for s in _JS_WALL_SIGNATURES):
+            return fetch_errors.JS_REQUIRED
+        if any(s in low for s in _PAYWALL_SIGNATURES):
+            return fetch_errors.PAYWALLED
+    if len(clean) < _MIN_ARTICLE_CHARS:
+        return fetch_errors.NO_TEXT_EXTRACTED
+    return None
+
+
 async def _generic_fetch(url: str) -> dict:
     try:
         loop = asyncio.get_running_loop()
@@ -493,10 +543,13 @@ async def _generic_fetch(url: str) -> dict:
     except Exception:
         pass
 
-    result: dict = {"text": (text or "")[:MAX_CONTENT_CHARS], "title": title, "source_type": "article"}
-    if not (text or "").strip():
-        result["reason"] = fetch_errors.NO_TEXT_EXTRACTED
-    return result
+    reason = _wall_reason(text)
+    if reason:
+        if reason in (fetch_errors.JS_REQUIRED, fetch_errors.PAYWALLED):
+            logger.info(f"Wall detected ({reason}) for {url}: {(text or '').strip()[:80]!r}")
+        return {"text": "", "title": title, "source_type": "article", "reason": reason}
+
+    return {"text": text[:MAX_CONTENT_CHARS], "title": title, "source_type": "article"}
 
 
 def _domain_matches(domain: str, *targets: str) -> bool:
