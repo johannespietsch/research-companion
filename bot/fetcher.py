@@ -19,6 +19,31 @@ def _youtube_thumbnail(video_id: str) -> str:
     return f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
 
 
+def _youtube_oembed_title(url: str) -> str | None:
+    """Fetch a video's real title via YouTube's public oEmbed endpoint.
+
+    The youtube_transcript_api path gives us the transcript but no metadata, so
+    without this we fall back to a "YouTube video (<id>)" placeholder. oEmbed is
+    free, unauthenticated, and hits a different endpoint than the transcript API
+    (so it rarely shares its rate limits) — much cheaper than a full yt-dlp
+    metadata pass just to recover the title.
+    """
+    try:
+        resp = requests.get(
+            "https://www.youtube.com/oembed",
+            params={"url": url, "format": "json"},
+            timeout=10,
+            headers={"User-Agent": "research-companion-bot/1.0"},
+        )
+        if resp.status_code != 200:
+            return None
+        title = resp.json().get("title")
+        return title.strip() if isinstance(title, str) and title.strip() else None
+    except Exception as e:
+        logger.warning(f"YouTube oEmbed title fetch failed for {url}: {e}")
+        return None
+
+
 # Whisper fallback is only attempted for videos short enough that the
 # audio download + transcription has a real chance of completing within the
 # Worker's 25 s timeout on `/api/try` / `/api/library/add`. Long videos fall
@@ -39,9 +64,10 @@ def _youtube_transcript(url: str) -> dict:
         api = YouTubeTranscriptApi()
         fetched = api.fetch(video_id)
         text = " ".join(snippet.text for snippet in fetched)
+        title = _youtube_oembed_title(url) or f"YouTube video ({video_id})"
         return {
-            "text": text[:MAX_CONTENT_CHARS],
-            "title": f"YouTube video ({video_id})",
+            "text": f"{title}\n\nTranscript:\n{text}"[:MAX_CONTENT_CHARS],
+            "title": title,
             "source_type": "youtube",
             "image_urls": [thumb],
         }

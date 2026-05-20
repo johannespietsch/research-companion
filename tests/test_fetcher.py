@@ -21,7 +21,8 @@ class TestYouTubeFallbackChain:
     def test_uses_transcript_api_when_available(self):
         from bot import fetcher
 
-        with patch("youtube_transcript_api.YouTubeTranscriptApi") as TranscriptApi:
+        with patch("youtube_transcript_api.YouTubeTranscriptApi") as TranscriptApi, \
+             patch.object(fetcher, "_youtube_oembed_title", return_value="Real Title"):
             TranscriptApi.return_value.fetch.return_value = [
                 MagicMock(text="hello"),
                 MagicMock(text="world"),
@@ -31,6 +32,18 @@ class TestYouTubeFallbackChain:
         assert "hello world" in result["text"]
         assert result["source_type"] == "youtube"
         assert any("ytimg.com" in u for u in result.get("image_urls", []))
+        # Real video title surfaces instead of the "YouTube video (<id>)" placeholder.
+        assert result["title"] == "Real Title"
+
+    def test_transcript_api_title_falls_back_to_placeholder(self):
+        from bot import fetcher
+
+        with patch("youtube_transcript_api.YouTubeTranscriptApi") as TranscriptApi, \
+             patch.object(fetcher, "_youtube_oembed_title", return_value=None):
+            TranscriptApi.return_value.fetch.return_value = [MagicMock(text="hi")]
+            result = fetcher._youtube_transcript(YOUTUBE_URL)
+
+        assert result["title"] == f"YouTube video ({VIDEO_ID})"
 
     def test_uses_yt_dlp_subtitles_when_transcript_api_fails(self):
         from bot import fetcher
