@@ -13,6 +13,7 @@ Modes (auto-detected from environment):
 import asyncio
 import logging
 import os
+import secrets
 from contextlib import asynccontextmanager
 from datetime import datetime, time as dtime, timedelta, timezone
 from pathlib import Path
@@ -39,6 +40,10 @@ install_sqlite_log_handler()
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+# Shared secret echoed by Telegram in the X-Telegram-Bot-Api-Secret-Token header.
+# Without it, anyone who learns the webhook URL could POST forged updates and act
+# as any chat. Required whenever WEBHOOK_URL is set (see lifespan + /webhook).
+WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET")
 
 telegram_app = None
 if TOKEN:
@@ -79,9 +84,20 @@ async def lifespan(app: FastAPI):
     if telegram_app:
         await telegram_app.initialize()
         if WEBHOOK_URL:
-            webhook_endpoint = f"{WEBHOOK_URL.rstrip('/')}/webhook"
-            await telegram_app.bot.set_webhook(webhook_endpoint)
-            logger.info("Telegram webhook set to %s", webhook_endpoint)
+            if not WEBHOOK_SECRET:
+                # Fail closed: registering an unauthenticated webhook would let
+                # anyone forge updates. Don't set it — the bot stays silent
+                # until TELEGRAM_WEBHOOK_SECRET is configured.
+                logger.error(
+                    "WEBHOOK_URL is set but TELEGRAM_WEBHOOK_SECRET is missing — "
+                    "refusing to register an unauthenticated webhook"
+                )
+            else:
+                webhook_endpoint = f"{WEBHOOK_URL.rstrip('/')}/webhook"
+                await telegram_app.bot.set_webhook(
+                    webhook_endpoint, secret_token=WEBHOOK_SECRET
+                )
+                logger.info("Telegram webhook set to %s", webhook_endpoint)
         else:
             # Dev / local: polling as a background task on uvicorn's event loop
             await telegram_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
@@ -123,10 +139,25 @@ async def serve_ui():
     return FileResponse(_STATIC_DIR / "index.html")
 
 
+def _webhook_secret_ok(provided: str | None) -> bool:
+    """True iff the request carries the configured Telegram secret token.
+
+    Fail closed: if no secret is configured, no request is accepted.
+    """
+    if not WEBHOOK_SECRET:
+        return False
+    return secrets.compare_digest(provided or "", WEBHOOK_SECRET)
+
+
 @app.post("/webhook")
 async def webhook(request: Request) -> Response:
     if not telegram_app or not WEBHOOK_URL:
         return Response(status_code=404)
+    # Reject anything that doesn't echo our secret token — this is the only
+    # thing standing between the public URL and forged Telegram updates.
+    if not _webhook_secret_ok(request.headers.get("X-Telegram-Bot-Api-Secret-Token")):
+        logger.warning("Rejected /webhook call with missing/invalid secret token")
+        return Response(status_code=403)
     data = await request.json()
     update = Update.de_json(data, telegram_app.bot)
     await telegram_app.process_update(update)
