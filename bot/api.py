@@ -15,6 +15,7 @@ from pydantic import BaseModel
 from bot.analyzer import analyze, analyze_image, to_json_str, to_plain_text
 from bot.auth import require_token
 from bot.config import MAX_CONTENT_CHARS
+from bot.fetch_errors import user_message as fetch_error_message
 from bot.db import (
     LINK_CODE_TTL_SECONDS,
     create_link_code,
@@ -106,7 +107,10 @@ async def submit_url(
 ):
     fetched = await fetch_url(url)
     if not fetched["text"].strip():
-        raise HTTPException(status_code=422, detail="Could not extract content from URL")
+        raise HTTPException(
+            status_code=422,
+            detail=fetch_error_message(fetched.get("reason"), url),
+        )
     analysis = analyze(fetched["text"], user_id)
     save_item(user_id, "url", url, fetched["text"], to_json_str(analysis), user_note)
     return {"analysis": to_plain_text(analysis), "analysis_data": analysis}
@@ -226,10 +230,26 @@ async def try_url(req: TryRequest, _: None = Depends(_require_try_secret)):
 
     if not text:
         # Distinguish video-with-no-transcript from generic extraction failure
-        # so the Worker can show the right message.
+        # so the Worker can show the right message. `reason` + `message` carry
+        # the specific limitation (e.g. image_only_pdf, rate_limited).
+        reason = fetched.get("reason")
         if source_type in _VIDEO_SOURCE_TYPES:
-            raise HTTPException(status_code=422, detail={"error": "no-transcript"})
-        raise HTTPException(status_code=422, detail={"error": "extraction-failed"})
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "no-transcript",
+                    "reason": reason,
+                    "message": fetch_error_message(reason, url),
+                },
+            )
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "extraction-failed",
+                "reason": reason,
+                "message": fetch_error_message(reason, url),
+            },
+        )
 
     try:
         analysis = analyze(text, user_id=None)
@@ -317,9 +337,24 @@ async def library_add(req: _LibraryAddRequest, _: None = Depends(_require_try_se
     source_type = fetched.get("source_type") or "article"
 
     if not text:
+        reason = fetched.get("reason")
         if source_type in _VIDEO_SOURCE_TYPES:
-            raise HTTPException(status_code=422, detail={"error": "no-transcript"})
-        raise HTTPException(status_code=422, detail={"error": "extraction-failed"})
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "no-transcript",
+                    "reason": reason,
+                    "message": fetch_error_message(reason, url),
+                },
+            )
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "extraction-failed",
+                "reason": reason,
+                "message": fetch_error_message(reason, url),
+            },
+        )
 
     try:
         analysis = analyze(text, user_id=req.user_id)

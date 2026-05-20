@@ -75,6 +75,17 @@ FILTER_FYI_TRY_SECRET=long-random-string
 # Optional -- override the data directory (SQLite DB + file store).
 # Set to /data in containerised deploys with a mounted volume.
 # DATA_DIR=/data
+
+# Optional -- enable the daily error-log scanner that files GH issues for
+# unhandled bugs (see "Error log + auto-filed bug issues" below). Disabled by
+# default so local dev doesn't post issues by accident.
+# SCAN_ERRORS_ENABLED=true
+# SCAN_ERRORS_HOUR_UTC=3
+# GH_REPO=johannespietsch/research-companion
+# GitHub App credentials (issues are filed as <app-name>[bot]):
+# GH_APP_ID=123456
+# GH_APP_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----"
+# GH_APP_INSTALLATION_ID=  # optional; auto-discovered from GH_REPO if unset
 ```
 
 ## Usage
@@ -232,6 +243,43 @@ After that, `fly deploy` from this directory ships changes. The volume mounts at
 cd ../filter.fyi-frontend
 npx wrangler secret put BOT_API_URL
 npx wrangler secret put BOT_API_KEY
+```
+
+## Error log + auto-filed bug issues
+
+WARNING+ log records are captured to an `error_log` table in the SQLite DB. A daily background task inside the bot reads the last 24h of records, groups by fingerprint, asks Claude Haiku to classify each group as one of:
+
+- **known_user_limit** — already covered by `bot/fetch_errors.py` (PDF download failed, video too long for Whisper, rate-limited, …); the user already sees a friendly message. Ignored.
+- **bug** — unexpected exception; a GH issue is filed against this repo. Dedup is by `<!-- fingerprint: ... -->` marker in the body.
+- **noise** — not actionable. Ignored.
+
+It runs **in-process** (not as a separate Fly machine) because the SQLite DB lives on a single-attach volume, so it can't be read from a second machine simultaneously.
+
+### Authentication: GitHub App
+
+Issues are filed by a GitHub App so they appear as `<app-name>[bot]` rather than a personal account, and so the bot authenticates with short-lived (≈1h) installation tokens minted from a private key instead of a long-lived PAT.
+
+One-time setup:
+
+1. Create the App at **Settings → Developer settings → GitHub Apps → New GitHub App** (or [the docs](https://docs.github.com/en/apps/creating-github-apps/about-creating-github-apps/about-creating-github-apps)). Repository permission **Issues: Read & write** is all it needs; no webhook.
+2. Generate a private key (downloads a `.pem`) and note the **App ID**.
+3. **Install** the App on this repository (App settings → Install App).
+4. Set the secrets on Fly (the private key is multi-line — `fly secrets set` accepts it directly, or pass it with literal `\n`):
+
+```bash
+fly secrets set \
+  SCAN_ERRORS_ENABLED=true \
+  GH_APP_ID=123456 \
+  GH_APP_PRIVATE_KEY="$(cat path/to/app.private-key.pem)"
+```
+
+The installation ID is auto-discovered from `GH_REPO`; set `GH_APP_INSTALLATION_ID` only to skip that lookup.
+
+Run manually for testing (won't post issues with `--dry-run`):
+
+```bash
+make scan-errors-dry
+make scan-errors            # actually files issues; needs the GH App secrets
 ```
 
 ## Personalisation

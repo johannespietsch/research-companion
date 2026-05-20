@@ -7,6 +7,7 @@ from urllib.parse import urlparse
 import httpx
 import requests
 
+from bot import fetch_errors
 from bot.config import MAX_CONTENT_CHARS
 
 logger = logging.getLogger(__name__)
@@ -48,12 +49,12 @@ def _youtube_transcript(url: str) -> dict:
         logger.info(f"No transcript for {video_id}, falling back to yt-dlp")
 
     extract = _yt_dlp_extract(url)
+    extract.setdefault("image_urls", []).append(thumb)
 
     # If yt-dlp also got us a transcript (or extraction died entirely), use what
     # we have. The Whisper branch only kicks in when we're left with a
     # description-only answer AND the video is short enough.
     if extract.get("has_transcript") or not extract.get("text"):
-        extract.setdefault("image_urls", []).append(thumb)
         return extract
 
     duration = extract.get("duration") or 0
@@ -68,8 +69,13 @@ def _youtube_transcript(url: str) -> dict:
             whisper.setdefault("image_urls", []).append(thumb)
             return whisper
         logger.info(f"YouTube {video_id}: Whisper fallback also failed, returning description")
+        # Description-only answer: still useful, but mark the limitation.
+        extract["reason"] = fetch_errors.WHISPER_FAILED
+    elif duration > _WHISPER_FALLBACK_MAX_DURATION_S:
+        extract["reason"] = fetch_errors.VIDEO_TOO_LONG_FOR_WHISPER
+    else:
+        extract["reason"] = fetch_errors.NO_TRANSCRIPT
 
-    extract.setdefault("image_urls", []).append(thumb)
     return extract
 
 
@@ -160,7 +166,10 @@ def _fetch_tweet(url: str) -> dict:
             return _format_syndication(data, url)
 
     # 3. yt-dlp as last resort
-    return _yt_dlp_extract(url)
+    result = _yt_dlp_extract(url)
+    if not (result.get("text") or "").strip():
+        result["reason"] = fetch_errors.TWEET_UNAVAILABLE
+    return result
 
 
 def _yt_dlp_extract(url: str) -> dict:
@@ -179,6 +188,7 @@ def _yt_dlp_extract(url: str) -> dict:
 
     # Pass 1: metadata only. No subtitle/audio downloads — far less likely to 429.
     info = None
+    extract_error: str | None = None
     try:
         with yt_dlp.YoutubeDL({
             "quiet": True,
@@ -188,10 +198,25 @@ def _yt_dlp_extract(url: str) -> dict:
         }) as ydl:
             info = ydl.extract_info(url, download=False)
     except Exception as e:
+        extract_error = str(e)
         logger.warning(f"yt-dlp metadata extract failed for {url}: {e}")
 
     if not info:
-        return {"text": "", "title": url, "source_type": "unknown", "has_transcript": False, "duration": 0}
+        reason = fetch_errors.FETCH_FAILED
+        if extract_error:
+            low = extract_error.lower()
+            if "429" in low or "rate" in low and "limit" in low:
+                reason = fetch_errors.RATE_LIMITED
+            elif "private" in low or "unavailable" in low or "removed" in low:
+                reason = fetch_errors.VIDEO_UNAVAILABLE
+        return {
+            "text": "",
+            "title": url,
+            "source_type": "unknown",
+            "has_transcript": False,
+            "duration": 0,
+            "reason": reason,
+        }
 
     title = info.get("title") or url
     uploader = info.get("uploader") or info.get("channel") or ""
@@ -290,7 +315,7 @@ def _yt_dlp_transcribe(url: str) -> dict:
         return {"text": text[:MAX_CONTENT_CHARS], "title": title, "source_type": "video"}
     except Exception as e:
         logger.warning(f"yt-dlp transcribe failed for {url}: {e}")
-        return {"text": "", "title": url, "source_type": "unknown"}
+        return {"text": "", "title": url, "source_type": "unknown", "reason": fetch_errors.WHISPER_FAILED}
 
 
 async def _streamyard_fetch(url: str) -> dict:
@@ -343,11 +368,11 @@ async def _streamyard_fetch(url: str) -> dict:
             await browser.close()
     except Exception as e:
         logger.warning(f"Playwright failed for {url}: {e}")
-        return {"text": "", "title": url, "source_type": "video"}
+        return {"text": "", "title": url, "source_type": "video", "reason": fetch_errors.STREAMYARD_INTERCEPT_FAILED}
 
     if not video_url:
         logger.warning(f"StreamYard: no video URL intercepted for {url}")
-        return {"text": title, "title": title, "source_type": "video"}
+        return {"text": title, "title": title, "source_type": "video", "reason": fetch_errors.STREAMYARD_INTERCEPT_FAILED}
 
     logger.info(f"StreamYard: intercepted video URL, downloading and transcribing")
 
@@ -371,7 +396,7 @@ async def _streamyard_fetch(url: str) -> dict:
         return {"text": text[:MAX_CONTENT_CHARS], "title": title, "source_type": "video", "file_path": stored_file_path}
     except Exception as e:
         logger.warning(f"StreamYard transcription failed for {url}: {e}")
-        return {"text": title, "title": title, "source_type": "video"}
+        return {"text": title, "title": title, "source_type": "video", "reason": fetch_errors.WHISPER_FAILED}
     finally:
         Path(tmp_path).unlink(missing_ok=True)
 
@@ -391,7 +416,7 @@ async def _pdf_fetch(url: str) -> dict:
             pdf_bytes = resp.content
     except Exception as e:
         logger.warning(f"PDF download failed for {url}: {e}")
-        return {"text": "", "title": url, "source_type": "unknown"}
+        return {"text": "", "title": url, "source_type": "unknown", "reason": fetch_errors.PDF_DOWNLOAD_FAILED}
 
     try:
         pages_text = []
@@ -404,10 +429,11 @@ async def _pdf_fetch(url: str) -> dict:
         text = "\n\n".join(pages_text)
     except Exception as e:
         logger.warning(f"pdfplumber extraction failed for {url}: {e}")
-        return {"text": "", "title": url, "source_type": "unknown"}
+        return {"text": "", "title": url, "source_type": "unknown", "reason": fetch_errors.NO_TEXT_EXTRACTED}
 
     if not text.strip():
         logger.warning(f"PDF at {url} yielded no text — likely image-based; OCR not available")
+        return {"text": "", "title": title, "source_type": "pdf", "reason": fetch_errors.IMAGE_ONLY_PDF}
 
     return {"text": text[:MAX_CONTENT_CHARS], "title": title, "source_type": "pdf"}
 
@@ -427,7 +453,7 @@ async def _generic_fetch(url: str) -> dict:
         html = resp.text
     except Exception as e:
         logger.warning(f"Generic fetch failed for {url}: {e}")
-        return {"text": "", "title": url, "source_type": "unknown"}
+        return {"text": "", "title": url, "source_type": "unknown", "reason": fetch_errors.FETCH_FAILED}
 
     logger.debug(f"Fetched {url} — status={resp.status_code} len={len(html)}")
 
@@ -467,7 +493,10 @@ async def _generic_fetch(url: str) -> dict:
     except Exception:
         pass
 
-    return {"text": (text or "")[:MAX_CONTENT_CHARS], "title": title, "source_type": "article"}
+    result: dict = {"text": (text or "")[:MAX_CONTENT_CHARS], "title": title, "source_type": "article"}
+    if not (text or "").strip():
+        result["reason"] = fetch_errors.NO_TEXT_EXTRACTED
+    return result
 
 
 def _domain_matches(domain: str, *targets: str) -> bool:

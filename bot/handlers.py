@@ -10,6 +10,7 @@ from telegram.ext import ContextTypes
 from bot.analyzer import analyze, analyze_image, to_json_str
 from bot.config import MAX_CONTENT_CHARS
 from bot.db import get_or_create_user_by_telegram, save_item
+from bot.fetch_errors import user_message as fetch_error_message
 from bot.fetcher import fetch_url
 from bot.formatting import format_analysis
 from bot.storage import save_file_from_path
@@ -92,7 +93,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await message.reply_text(f"Fetching {url} ...")
             fetched = await fetch_url(url)
             if not fetched["text"].strip():
-                await message.reply_text(f"Could not extract content from {url}.")
+                await message.reply_text(fetch_error_message(fetched.get("reason"), url))
                 continue
             await message.reply_text("Analyzing...")
             text = fetched["text"]

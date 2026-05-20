@@ -10,9 +10,11 @@ Modes (auto-detected from environment):
   - No TELEGRAM_TOKEN → web UI only (no Telegram)
 """
 
+import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
+from datetime import datetime, time as dtime, timedelta, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -29,6 +31,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Capture WARNING+ records into the SQLite error_log table so scripts/scan_errors.py
+# can scan them daily and file GH issues for unhandled bugs. See bot/error_logging.py.
+from bot.error_logging import install as install_sqlite_log_handler  # noqa: E402
+
+install_sqlite_log_handler()
+
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
@@ -36,6 +44,34 @@ telegram_app = None
 if TOKEN:
     from bot.application import build_application
     telegram_app = build_application(TOKEN)
+
+
+# Daily error scan: runs once a day inside the bot process because the Fly
+# volume holding the SQLite DB can only be attached to one machine at a time.
+# Disabled when SCAN_ERRORS_ENABLED is unset/false so local dev doesn't file
+# issues by accident.
+_SCAN_ERRORS_ENABLED = os.getenv("SCAN_ERRORS_ENABLED", "").lower() in ("1", "true", "yes")
+_SCAN_HOUR_UTC = int(os.getenv("SCAN_ERRORS_HOUR_UTC", "3"))
+
+
+async def _daily_error_scan_loop() -> None:
+    """Wake once a day at SCAN_HOUR_UTC and run scripts.scan_errors.run_scan."""
+    from scripts.scan_errors import run_scan
+
+    while True:
+        now = datetime.now(timezone.utc)
+        next_run = datetime.combine(now.date(), dtime(_SCAN_HOUR_UTC, 0), tzinfo=timezone.utc)
+        if next_run <= now:
+            next_run += timedelta(days=1)
+        sleep_s = (next_run - now).total_seconds()
+        logger.info("Next error scan at %s UTC (%.0fs)", next_run.isoformat(), sleep_s)
+        try:
+            await asyncio.sleep(sleep_s)
+            await asyncio.to_thread(run_scan, since_hours=24, dry_run=False)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Daily error scan failed; will retry tomorrow")
 
 
 @asynccontextmanager
@@ -52,7 +88,19 @@ async def lifespan(app: FastAPI):
             logger.info("Telegram polling started")
         await telegram_app.start()
 
+    scan_task: asyncio.Task | None = None
+    if _SCAN_ERRORS_ENABLED:
+        scan_task = asyncio.create_task(_daily_error_scan_loop())
+        logger.info("Daily error scan enabled (hour=%d UTC)", _SCAN_HOUR_UTC)
+
     yield
+
+    if scan_task:
+        scan_task.cancel()
+        try:
+            await scan_task
+        except asyncio.CancelledError:
+            pass
 
     if telegram_app:
         if not WEBHOOK_URL:

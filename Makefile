@@ -6,7 +6,7 @@ PORT    ?= 8080
 
 .DEFAULT_GOAL := help
 
-.PHONY: help install dev run test kb adduser
+.PHONY: help install dev run test kb adduser scan-errors scan-errors-dry
 
 help:
 	@echo ""
@@ -16,6 +16,8 @@ help:
 	@echo "  make test             run the pytest suite"
 	@echo "  make kb               open the admin CLI (python kb.py)"
 	@echo "  make adduser          create a web-only user  (EMAIL=foo@bar.com)"
+	@echo "  make scan-errors-dry  classify last 24h of error_log, no GH writes"
+	@echo "  make scan-errors      classify and file GH issues for new bugs"
 	@echo ""
 	@echo "  PORT=8080 make dev    override the default port"
 	@echo ""
@@ -50,3 +52,9 @@ ifndef EMAIL
 	$(error EMAIL is not set — usage: make adduser EMAIL=alice@example.com)
 endif
 	$(PYTHON) kb.py adduser $(EMAIL)
+
+scan-errors-dry: install
+	$(PYTHON) -m scripts.scan_errors --dry-run
+
+scan-errors: install
+	$(PYTHON) -m scripts.scan_errors

@@ -63,10 +63,28 @@ CREATE TABLE IF NOT EXISTS url_cache (
     fetched_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S', 'now'))
 )"""
 
+# WARNING+ log records captured by the SQLiteLogHandler. The scan_errors
+# script reads from here daily, groups by fingerprint, and files GH issues
+# for unhandled bugs. `fingerprint` is a stable hash of logger + a normalized
+# message — exact tracebacks differ across invocations, but the bug signature
+# stays the same.
+_CREATE_ERROR_LOG_SQL = """\
+CREATE TABLE IF NOT EXISTS error_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S', 'now')),
+    logger      TEXT NOT NULL DEFAULT '',
+    level       TEXT NOT NULL DEFAULT '',
+    message     TEXT NOT NULL DEFAULT '',
+    traceback   TEXT NOT NULL DEFAULT '',
+    fingerprint TEXT NOT NULL DEFAULT ''
+)"""
+
 _CREATE_INDEXES_SQL = [
     "CREATE INDEX IF NOT EXISTS idx_items_user ON items(user_id, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_link_codes_expires ON link_codes(expires_at)",
     "CREATE INDEX IF NOT EXISTS idx_url_cache_fetched_at ON url_cache(fetched_at)",
+    "CREATE INDEX IF NOT EXISTS idx_error_log_ts ON error_log(ts DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_error_log_fingerprint ON error_log(fingerprint)",
 ]
 
 LINK_CODE_TTL_SECONDS = 600
@@ -149,6 +167,7 @@ def _init() -> None:
             conn.execute(_CREATE_ITEMS_SQL)
         conn.execute(_CREATE_LINK_CODES_SQL)
         conn.execute(_CREATE_URL_CACHE_SQL)
+        conn.execute(_CREATE_ERROR_LOG_SQL)
         for stmt in _CREATE_INDEXES_SQL:
             conn.execute(stmt)
 
@@ -387,6 +406,43 @@ def set_cached_fetch(url: str, payload: dict) -> None:
             "  payload = excluded.payload, fetched_at = excluded.fetched_at",
             (url, body),
         )
+
+
+# ---------------------------------------------------------------------------
+# Error log (populated by the SQLiteLogHandler; read by scripts/scan_errors.py)
+# ---------------------------------------------------------------------------
+
+def insert_error_log(
+    *,
+    logger: str,
+    level: str,
+    message: str,
+    traceback: str,
+    fingerprint: str,
+) -> None:
+    with _get_conn() as conn:
+        conn.execute(
+            "INSERT INTO error_log (logger, level, message, traceback, fingerprint) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (logger, level, message, traceback, fingerprint),
+        )
+
+
+def get_recent_errors(since_iso: str) -> list[sqlite3.Row]:
+    """All error_log rows with ts >= since_iso, newest first."""
+    with _get_conn() as conn:
+        return conn.execute(
+            "SELECT id, ts, logger, level, message, traceback, fingerprint "
+            "FROM error_log WHERE ts >= ? ORDER BY ts DESC",
+            (since_iso,),
+        ).fetchall()
+
+
+def prune_error_log(older_than_iso: str) -> int:
+    """Delete rows older than the given timestamp. Returns rows removed."""
+    with _get_conn() as conn:
+        cur = conn.execute("DELETE FROM error_log WHERE ts < ?", (older_than_iso,))
+        return cur.rowcount or 0
 
 
 def link_telegram_to_user(web_user_id: int, telegram_chat_id: int) -> None:
