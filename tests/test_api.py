@@ -160,6 +160,63 @@ class TestLibrary:
 
 
 # ---------------------------------------------------------------------------
+# GET /api/users/{id}/export + DELETE /api/users/{id}  (GDPR portability + erasure)
+# ---------------------------------------------------------------------------
+
+class TestAccount:
+    def _user_with_one_item(self, client, auth_headers, email="a@b.com"):
+        uid = client.post("/api/users/upsert", json={"email": email}, headers=auth_headers).json()["user_id"]
+        client.post(
+            "/api/library/add",
+            json={"user_id": uid, "url": "https://example.com/x"},
+            headers=auth_headers,
+        )
+        return uid
+
+    def test_export_returns_user_and_items_without_token(self, client, auth_headers):
+        uid = self._user_with_one_item(client, auth_headers)
+        r = client.get(f"/api/users/{uid}/export", headers=auth_headers)
+        assert r.status_code == 200
+        body = r.json()
+        assert body["user"]["id"] == uid
+        assert body["user"]["email"] == "a@b.com"
+        assert "api_token" not in body["user"]  # never leak the token
+        assert len(body["items"]) == 1
+        assert "content" in body["items"][0]
+
+    def test_export_404_for_unknown_user(self, client, auth_headers):
+        r = client.get("/api/users/99999/export", headers=auth_headers)
+        assert r.status_code == 404
+
+    def test_export_requires_secret(self, client):
+        assert client.get("/api/users/1/export").status_code == 401
+
+    def test_delete_purges_user_and_items(self, client, auth_headers):
+        uid = self._user_with_one_item(client, auth_headers)
+        r = client.delete(f"/api/users/{uid}", headers=auth_headers)
+        assert r.status_code == 204
+        # User gone, library empty, export 404s.
+        assert client.get(f"/api/users/{uid}", headers=auth_headers).status_code == 404
+        assert client.get(f"/api/library?user_id={uid}", headers=auth_headers).json() == []
+        assert client.get(f"/api/users/{uid}/export", headers=auth_headers).status_code == 404
+
+    def test_delete_is_idempotent(self, client, auth_headers):
+        # Deleting a never-existed user still reports the desired end state.
+        assert client.delete("/api/users/99999", headers=auth_headers).status_code == 204
+
+    def test_delete_requires_secret(self, client):
+        assert client.delete("/api/users/1").status_code == 401
+
+    def test_delete_only_touches_target_user(self, client, auth_headers):
+        keep = self._user_with_one_item(client, auth_headers, email="keep@b.com")
+        drop = self._user_with_one_item(client, auth_headers, email="drop@b.com")
+        assert client.delete(f"/api/users/{drop}", headers=auth_headers).status_code == 204
+        # The other user's data is untouched.
+        assert client.get(f"/api/users/{keep}", headers=auth_headers).status_code == 200
+        assert len(client.get(f"/api/library?user_id={keep}", headers=auth_headers).json()) == 1
+
+
+# ---------------------------------------------------------------------------
 # POST /api/claim
 # ---------------------------------------------------------------------------
 

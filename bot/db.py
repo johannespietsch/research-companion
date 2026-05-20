@@ -253,6 +253,35 @@ def set_user_field(user_id: int, **fields) -> None:
         )
 
 
+def delete_user(user_id: int) -> dict:
+    """Hard-delete a user and everything they own (GDPR erasure).
+
+    Removes items and link codes, then the user row, in one transaction.
+    Returns the deleted items' non-empty `file_path`s so the caller can unlink
+    them from disk, plus row counts for erasure logging.
+    """
+    with _get_conn() as conn:
+        file_paths = [
+            r["file_path"]
+            for r in conn.execute(
+                "SELECT file_path FROM items WHERE user_id = ? AND file_path != ''",
+                (user_id,),
+            ).fetchall()
+        ]
+        items_deleted = conn.execute(
+            "DELETE FROM items WHERE user_id = ?", (user_id,)
+        ).rowcount
+        conn.execute("DELETE FROM link_codes WHERE user_id = ?", (user_id,))
+        user_deleted = conn.execute(
+            "DELETE FROM users WHERE id = ?", (user_id,)
+        ).rowcount
+    return {
+        "items_deleted": items_deleted,
+        "user_deleted": user_deleted,
+        "file_paths": file_paths,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Items
 # ---------------------------------------------------------------------------

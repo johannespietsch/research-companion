@@ -5,6 +5,7 @@ import logging
 import os
 import secrets
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -20,6 +21,7 @@ from bot.db import (
     LINK_CODE_TTL_SECONDS,
     create_link_code,
     delete_item,
+    delete_user,
     get_all_items,
     get_item,
     get_user,
@@ -307,6 +309,60 @@ async def user_get(user_id: int, _: None = Depends(_require_try_secret)):
         "profile": row["profile"],
         "created_at": row["created_at"],
     }
+
+
+@router.get("/users/{user_id}/export")
+async def user_export(user_id: int, _: None = Depends(_require_try_secret)):
+    """Full data export for a user (GDPR portability). Worker-gated.
+
+    Never includes `api_token`; the raw telegram_chat_id is reduced to a
+    linked/not-linked boolean.
+    """
+    user = get_user(user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail={"error": "not-found"})
+    items = get_all_items(user_id)
+    return {
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "user": {
+            "id": user["id"],
+            "email": user["email"],
+            "telegram_linked": user["telegram_chat_id"] is not None,
+            "profile": user["profile"],
+            "created_at": user["created_at"],
+        },
+        "items": [
+            {
+                "id": i["id"],
+                "source_type": i["source_type"],
+                "source": i["source"],
+                "content": i["content"],
+                "analysis": i["analysis"],
+                "user_note": i["user_note"],
+                "created_at": i["created_at"],
+            }
+            for i in items
+        ],
+    }
+
+
+@router.delete("/users/{user_id}", status_code=204)
+async def user_delete(user_id: int, _: None = Depends(_require_try_secret)):
+    """Hard-delete a user and all their data (GDPR erasure). Worker-gated.
+
+    Idempotent: deleting an unknown user is a no-op 204 — the requested end
+    state (no such user) already holds. Also unlinks any stored files.
+    """
+    result = delete_user(user_id)
+    for rel in result["file_paths"]:
+        try:
+            full_path(rel).unlink(missing_ok=True)
+        except OSError as e:
+            logger.warning("erasure: could not remove file %s: %s", rel, e)
+    logger.info(
+        "erasure: user=%s items_deleted=%s files=%s",
+        user_id, result["items_deleted"], len(result["file_paths"]),
+    )
 
 
 class _LibraryAddRequest(BaseModel):
