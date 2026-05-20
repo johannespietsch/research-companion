@@ -139,6 +139,25 @@ class TestLibrary:
         r = client.get(f"/api/library/{item_id}?user_id=99999", headers=auth_headers)
         assert r.status_code == 404
 
+    def test_delete_removes_item(self, client, auth_headers):
+        uid, item_id = self._user_with_one_item(client, auth_headers)
+        r = client.delete(f"/api/library/{item_id}?user_id={uid}", headers=auth_headers)
+        assert r.status_code == 204
+        # Gone afterwards.
+        assert client.get(f"/api/library/{item_id}?user_id={uid}", headers=auth_headers).status_code == 404
+        assert client.get(f"/api/library?user_id={uid}", headers=auth_headers).json() == []
+
+    def test_delete_404_for_wrong_user_leaves_item(self, client, auth_headers):
+        uid, item_id = self._user_with_one_item(client, auth_headers)
+        r = client.delete(f"/api/library/{item_id}?user_id=99999", headers=auth_headers)
+        assert r.status_code == 404
+        # The real owner's item is untouched.
+        assert client.get(f"/api/library/{item_id}?user_id={uid}", headers=auth_headers).status_code == 200
+
+    def test_delete_requires_secret(self, client):
+        r = client.delete("/api/library/1?user_id=1")
+        assert r.status_code == 401
+
 
 # ---------------------------------------------------------------------------
 # POST /api/claim

@@ -431,6 +431,18 @@ async def library_show(item_id: int, user_id: int, _: None = Depends(_require_tr
     return dict(row)
 
 
+@router.delete("/library/{item_id}", status_code=204)
+async def library_delete(item_id: int, user_id: int, _: None = Depends(_require_try_secret)):
+    """Delete one of the user's saved items — backs the `/me` delete action.
+
+    Ownership-scoped: a 404 (rather than 403) for someone else's id avoids
+    leaking which ids exist for other users.
+    """
+    if not get_item(item_id, user_id):
+        raise HTTPException(status_code=404, detail={"error": "not-found"})
+    delete_item(item_id, user_id)
+
+
 class _ClaimRow(BaseModel):
     url: str
     title: str | None = None
