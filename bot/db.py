@@ -474,6 +474,42 @@ def prune_error_log(older_than_iso: str) -> int:
         return cur.rowcount or 0
 
 
+# How long to keep diagnostic error_log rows. The daily scanner only looks back
+# 24h, so anything older is just disk.
+ERROR_LOG_RETENTION_DAYS = 30
+
+
+def _ts(dt) -> str:
+    """Format a datetime to the storage timestamp shape (UTC, no tz suffix)."""
+    return dt.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def prune_maintenance(now=None) -> dict:
+    """Delete rows nothing needs to keep, to bound unbounded disk growth.
+
+    Idempotent and safe to run repeatedly (e.g. daily). Covers:
+      - error_log older than ERROR_LOG_RETENTION_DAYS
+      - url_cache rows past their TTL
+      - link_codes that have already expired (unredeemed)
+    `now` is injectable for tests. Returns per-table delete counts.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    now = now or datetime.now(timezone.utc)
+    err_cutoff = _ts(now - timedelta(days=ERROR_LOG_RETENTION_DAYS))
+    cache_cutoff = _ts(now - timedelta(seconds=URL_CACHE_TTL_SECONDS))
+    now_str = _ts(now)
+    with _get_conn() as conn:
+        errors = conn.execute("DELETE FROM error_log WHERE ts < ?", (err_cutoff,)).rowcount or 0
+        cache = conn.execute(
+            "DELETE FROM url_cache WHERE fetched_at < ?", (cache_cutoff,)
+        ).rowcount or 0
+        codes = conn.execute(
+            "DELETE FROM link_codes WHERE expires_at < ?", (now_str,)
+        ).rowcount or 0
+    return {"error_log": errors, "url_cache": cache, "link_codes": codes}
+
+
 def link_telegram_to_user(web_user_id: int, telegram_chat_id: int) -> None:
     """Stitch a Telegram chat onto the given web user. Idempotent.
 

@@ -300,3 +300,54 @@ class TestUrlCache:
             db.get_cached_fetch("https://example.com/a", max_age_seconds=3600)["text"]
             == "stale"
         )
+
+
+class TestPruneMaintenance:
+    """prune_maintenance() bounds disk growth without touching live rows."""
+
+    def test_prunes_old_rows_only(self, db):
+        from datetime import datetime, timezone
+
+        OLD = "2000-01-01T00:00:00"   # well past every retention window
+        NEW = "2999-01-01T00:00:00"   # far future — always kept
+
+        with db._get_conn() as conn:
+            conn.execute(
+                "INSERT INTO error_log (ts, logger, level, message) VALUES (?, 'x', 'WARNING', 'old')",
+                (OLD,),
+            )
+            conn.execute(
+                "INSERT INTO error_log (ts, logger, level, message) VALUES (?, 'x', 'WARNING', 'new')",
+                (NEW,),
+            )
+            conn.execute(
+                "INSERT INTO url_cache (url, payload, fetched_at) VALUES ('https://old', '{}', ?)",
+                (OLD,),
+            )
+            conn.execute(
+                "INSERT INTO url_cache (url, payload, fetched_at) VALUES ('https://new', '{}', ?)",
+                (NEW,),
+            )
+            uid = conn.execute("INSERT INTO users (email) VALUES ('a@b.com')").lastrowid
+            conn.execute(
+                "INSERT INTO link_codes (code, user_id, expires_at) VALUES ('OLD', ?, ?)",
+                (uid, OLD),
+            )
+            conn.execute(
+                "INSERT INTO link_codes (code, user_id, expires_at) VALUES ('NEW', ?, ?)",
+                (uid, NEW),
+            )
+
+        counts = db.prune_maintenance(now=datetime(2026, 5, 20, tzinfo=timezone.utc))
+        assert counts == {"error_log": 1, "url_cache": 1, "link_codes": 1}
+
+        with db._get_conn() as conn:
+            assert [r["message"] for r in conn.execute("SELECT message FROM error_log")] == ["new"]
+            assert [r["url"] for r in conn.execute("SELECT url FROM url_cache")] == ["https://new"]
+            assert [r["code"] for r in conn.execute("SELECT code FROM link_codes")] == ["NEW"]
+
+    def test_idempotent_on_empty(self, db):
+        from datetime import datetime, timezone
+
+        counts = db.prune_maintenance(now=datetime(2026, 5, 20, tzinfo=timezone.utc))
+        assert counts == {"error_log": 0, "url_cache": 0, "link_codes": 0}

@@ -1,0 +1,18 @@
+# Litestream continuous backup for the SQLite database on the Fly volume.
+#
+# Active only when LITESTREAM_REPLICA_URL is set — docker-entrypoint.sh runs
+# the app under `litestream replicate` when it is, and plain uvicorn when it
+# isn't (so local dev and un-provisioned environments are unaffected).
+#
+# LITESTREAM_REPLICA_URL example (S3-compatible, e.g. Tigris/Backblaze/R2):
+#   s3://my-bucket/filter-fyi-backend
+# with LITESTREAM_ACCESS_KEY_ID / LITESTREAM_SECRET_ACCESS_KEY in the env.
+#
+# Docs: https://litestream.io/reference/config/
+dbs:
+  - path: ${DATA_DIR}/research.db
+    replicas:
+      - url: ${LITESTREAM_REPLICA_URL}
+        # Keep ~30 days of point-in-time history.
+        retention: 720h
+        snapshot-interval: 24h
