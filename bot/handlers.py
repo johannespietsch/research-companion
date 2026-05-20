@@ -7,7 +7,7 @@ import httpx
 from telegram import Update
 from telegram.ext import ContextTypes
 
-from bot.analyzer import analyze, analyze_image, to_json_str
+from bot.analyzer import analyze, analyze_image, summarize_content, to_json_str
 from bot.config import MAX_CONTENT_CHARS
 from bot.db import get_or_create_user_by_telegram, save_item
 from bot.fetch_errors import user_message as fetch_error_message
@@ -46,6 +46,7 @@ async def _analyze_and_reply(
     source: str = "",
     user_note: str = "",
     file_path: str = "",
+    store_content: str | None = None,
 ) -> None:
     try:
         analysis = analyze(text, user_id)
@@ -57,7 +58,10 @@ async def _analyze_and_reply(
         user_id=user_id,
         source_type=source_type,
         source=source,
-        content=text,
+        # `store_content` lets callers persist a condensed summary instead of
+        # the full text (used for fetched third-party URLs); defaults to `text`
+        # for the user's own notes/uploads.
+        content=store_content if store_content is not None else text,
         analysis=to_json_str(analysis),
         user_note=user_note,
         file_path=file_path,
@@ -104,6 +108,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 update, user_id, text,
                 source_type="url", source=url, user_note=user_note,
                 file_path=fetched.get("file_path", ""),
+                # Store only a condensed summary of fetched third-party content.
+                store_content=summarize_content(text),
             )
     else:
         await message.reply_text("Analyzing...")

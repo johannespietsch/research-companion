@@ -13,7 +13,7 @@ from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Uploa
 from fastapi.responses import FileResponse as FastAPIFileResponse
 from pydantic import BaseModel
 
-from bot.analyzer import analyze, analyze_image, to_json_str, to_plain_text
+from bot.analyzer import analyze, analyze_image, summarize_content, to_json_str, to_plain_text
 from bot.auth import require_token
 from bot.config import MAX_CONTENT_CHARS
 from bot.fetch_errors import user_message as fetch_error_message
@@ -114,7 +114,8 @@ async def submit_url(
             detail=fetch_error_message(fetched.get("reason"), url),
         )
     analysis = analyze(fetched["text"], user_id)
-    save_item(user_id, "url", url, fetched["text"], to_json_str(analysis), user_note)
+    # Store a condensed summary, not a full copy of the fetched content.
+    save_item(user_id, "url", url, summarize_content(fetched["text"]), to_json_str(analysis), user_note)
     return {"analysis": to_plain_text(analysis), "analysis_data": analysis}
 
 
@@ -263,12 +264,16 @@ async def try_url(req: TryRequest, _: None = Depends(_require_try_secret)):
     # five fields. analyzer.analyze() returns all six in one dict — split here.
     verdict = analysis.pop("verdict", "skim")
 
+    # The Worker stores content_preview in D1 (for claim-on-signup), so send the
+    # condensed summary rather than a verbatim slice of the source.
+    summary = summarize_content(text)
+
     return {
         "url": url,
         "title": fetched.get("title") or url,
         "source_type": source_type,
         "image_urls": fetched.get("image_urls") or [],
-        "content_preview": text[:TRY_PREVIEW_CHARS],
+        "content_preview": summary[:TRY_PREVIEW_CHARS],
         "verdict": verdict,
         "analysis": analysis,
     }
@@ -418,12 +423,17 @@ async def library_add(req: _LibraryAddRequest, _: None = Depends(_require_try_se
         logger.exception("analyze crashed for %s: %s", url, e)
         raise HTTPException(status_code=502, detail={"error": "analyze-failed"})
 
-    # Persist full analysis (incl. verdict) to items.analysis as JSON.
+    # Data minimisation: store a condensed, audience-neutral summary instead of
+    # a full copy of the fetched third-party content. The full text stays in
+    # memory only for this request; the summary is enough to re-derive verdicts
+    # later under a different profile.
+    summary = summarize_content(text)
+
     save_item(
         user_id=req.user_id,
         source_type=source_type,
         source=url,
-        content=text,
+        content=summary,
         analysis=to_json_str(analysis),
         user_note=req.user_note,
     )
@@ -439,7 +449,7 @@ async def library_add(req: _LibraryAddRequest, _: None = Depends(_require_try_se
         "title": fetched.get("title") or url,
         "source_type": source_type,
         "image_urls": fetched.get("image_urls") or [],
-        "content_preview": text[:TRY_PREVIEW_CHARS],
+        "content_preview": summary[:TRY_PREVIEW_CHARS],
         "verdict": verdict,
         "analysis": analysis,
     }

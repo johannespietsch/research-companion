@@ -161,6 +161,55 @@ def analyze(text: str, user_id: int | None = None) -> dict:
     return _normalize(raw)
 
 
+_SUMMARY_PROMPT = """Summarize the following content into a concise, neutral brief \
+that faithfully preserves its key facts, claims, structure, and notable specifics \
+(names, numbers, conclusions). This summary is STORED IN PLACE OF the original and \
+later used to generate personalized "watch / skim / skip" verdicts for different \
+readers — so keep it audience-neutral and accurate, and do not add opinions or \
+recommendations. Aim for 120–250 words.
+
+CONTENT:
+{text}"""
+
+# Cap on the stored summary. Far smaller than the source — enough to re-derive a
+# verdict, not a full copy (data-minimisation + copyright posture).
+SUMMARY_MAX_CHARS = 4000
+
+
+def summarize_content(text: str) -> str:
+    """Produce a concise, audience-neutral summary of source content.
+
+    Stored instead of the full fetched text so we don't retain a full copy of
+    third-party content. Falls back to a truncated slice if the model call
+    fails, so persistence never breaks on an LLM hiccup.
+    """
+    text = (text or "").strip()
+    if not text:
+        return ""
+    prompt = _SUMMARY_PROMPT.format(text=text)
+    try:
+        client = _get_client()
+        if _PROVIDER == "anthropic":
+            resp = client.messages.create(
+                model=_MODEL,
+                max_tokens=600,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            out = "".join(
+                b.text for b in resp.content if getattr(b, "type", None) == "text"
+            ).strip()
+        else:
+            resp = client.chat.completions.create(
+                model=_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            out = (resp.choices[0].message.content or "").strip()
+        return out[:SUMMARY_MAX_CHARS] if out else text[:SUMMARY_MAX_CHARS]
+    except Exception as e:
+        logger.warning("summarize_content failed; storing truncated slice: %s", e)
+        return text[:SUMMARY_MAX_CHARS]
+
+
 def analyze_image(b64: str, caption: str = "") -> str:
     """Describe and extract key info from a base64-encoded JPEG image."""
     prompt = "Extract and describe all text and key information visible in this image."

@@ -139,6 +139,14 @@ class TestLibrary:
         r = client.get(f"/api/library/{item_id}?user_id=99999", headers=auth_headers)
         assert r.status_code == 404
 
+    def test_stores_summary_not_full_fetched_text(self, client, auth_headers):
+        # Data minimisation: items.content holds the condensed summary, never a
+        # full copy of the fetched source.
+        uid, item_id = self._user_with_one_item(client, auth_headers)
+        item = client.get(f"/api/library/{item_id}?user_id={uid}", headers=auth_headers).json()
+        assert item["content"] == "Neutral summary of the content."
+        assert "Sample article body" not in item["content"]
+
     def test_delete_removes_item(self, client, auth_headers):
         uid, item_id = self._user_with_one_item(client, auth_headers)
         r = client.delete(f"/api/library/{item_id}?user_id={uid}", headers=auth_headers)

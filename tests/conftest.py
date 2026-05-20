@@ -67,8 +67,12 @@ def client(monkeypatch):
             "verdict": "watch",
         }
 
+    def fake_summarize_content(text):
+        return "Neutral summary of the content."
+
     monkeypatch.setattr(bot.api, "fetch_url", fake_fetch_url)
     monkeypatch.setattr(bot.api, "analyze", fake_analyze)
+    monkeypatch.setattr(bot.api, "summarize_content", fake_summarize_content)
 
     app = FastAPI()
     app.include_router(bot.api.router)
