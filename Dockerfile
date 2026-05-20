@@ -22,8 +22,12 @@ WORKDIR /app
 
 # Litestream — continuous SQLite backup to object storage. Only activated at
 # runtime when LITESTREAM_REPLICA_URL is set (see docker-entrypoint.sh).
+# TARGETARCH is auto-populated by BuildKit (amd64 on Fly, arm64 on Apple
+# Silicon) and matches Litestream's release naming; the default keeps non-
+# BuildKit builders on amd64 to mirror prod.
 ARG LITESTREAM_VERSION=0.3.13
-RUN curl -fsSL "https://github.com/benbjohnson/litestream/releases/download/v${LITESTREAM_VERSION}/litestream-v${LITESTREAM_VERSION}-linux-amd64.tar.gz" \
+ARG TARGETARCH=amd64
+RUN curl -fsSL "https://github.com/benbjohnson/litestream/releases/download/v${LITESTREAM_VERSION}/litestream-v${LITESTREAM_VERSION}-linux-${TARGETARCH}.tar.gz" \
       | tar -xz -C /usr/local/bin litestream
 
 COPY requirements.txt .
