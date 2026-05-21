@@ -161,6 +161,79 @@ def analyze(text: str, user_id: int | None = None) -> dict:
     return _normalize(raw)
 
 
+_SUMMARY_PROMPT = """You are distilling source content into a faithful, reusable \
+knowledge brief that will be STORED IN PLACE OF the original and later used both to \
+generate personalized "watch / skim / skip" verdicts AND to power retrieval / \
+"chat with your content". Fidelity matters more than brevity.
+
+Rules:
+- Preserve EVERY distinct topic, argument, claim, fact, figure, named entity, and \
+conclusion. For long, multi-topic sources (e.g. a 2-hour podcast), cover every \
+segment — do NOT collapse it to a single theme or a few bullets.
+- Remove only genuine filler: greetings, chit-chat, repetition, ad reads / \
+sponsor segments, and verbatim padding.
+- Stay neutral and faithful — no opinions, no recommendations, no added framing.
+- Organize by topic/section with clear headings and tight bullets. Quote sparingly \
+and only short phrases (under ~25 words) where exact wording matters.
+- Scale length to the source: a short article stays short; a long, dense, \
+multi-topic source should yield a long, thoroughly sectioned brief.
+
+CONTENT:
+{text}"""
+
+# Upper bound on a stored brief. Generous enough not to truncate a long
+# multi-topic distillation, but still a derived brief — not a verbatim copy of
+# the source (which keeps the data-minimisation / copyright posture).
+SUMMARY_MAX_CHARS = 32_000
+# Anthropic output-token ceiling we'll request. Scaled per source below.
+_SUMMARY_MAX_OUTPUT_TOKENS = 8_000
+
+
+def _summary_output_tokens(text: str) -> int:
+    """Scale requested output length to the source (~4 chars/token), so short
+    inputs get short briefs and long ones get room for a full sectioned brief."""
+    approx_input_tokens = len(text) // 4
+    # Target roughly a quarter of the input, floored/capped to sane bounds.
+    return max(512, min(_SUMMARY_MAX_OUTPUT_TOKENS, approx_input_tokens // 4))
+
+
+def summarize_content(text: str) -> str:
+    """Distil source content into a faithful, length-scaled structured brief.
+
+    Stored instead of the full fetched text: rich enough to re-derive verdicts
+    under a different profile and to power retrieval/chat, but a derived brief
+    rather than a verbatim copy. Falls back to a truncated slice if the model
+    call fails, so persistence never breaks on an LLM hiccup.
+    """
+    text = (text or "").strip()
+    if not text:
+        return ""
+    prompt = _SUMMARY_PROMPT.format(text=text)
+    max_tokens = _summary_output_tokens(text)
+    try:
+        client = _get_client()
+        if _PROVIDER == "anthropic":
+            resp = client.messages.create(
+                model=_MODEL,
+                max_tokens=max_tokens,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            out = "".join(
+                b.text for b in resp.content if getattr(b, "type", None) == "text"
+            ).strip()
+        else:
+            resp = client.chat.completions.create(
+                model=_MODEL,
+                max_tokens=max_tokens,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            out = (resp.choices[0].message.content or "").strip()
+        return out[:SUMMARY_MAX_CHARS] if out else text[:SUMMARY_MAX_CHARS]
+    except Exception as e:
+        logger.warning("summarize_content failed; storing truncated slice: %s", e)
+        return text[:SUMMARY_MAX_CHARS]
+
+
 def analyze_image(b64: str, caption: str = "") -> str:
     """Describe and extract key info from a base64-encoded JPEG image."""
     prompt = "Extract and describe all text and key information visible in this image."

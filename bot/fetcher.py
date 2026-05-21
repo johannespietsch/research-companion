@@ -1,6 +1,8 @@
 import asyncio
 import logging
 import re
+import urllib.robotparser
+from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -14,6 +16,46 @@ from bot.ssrf import BlockedURLError, assert_public_url
 logger = logging.getLogger(__name__)
 
 _YT_PATTERNS = re.compile(r"(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})")
+
+# Crawler token we present to robots.txt. We honour an explicit Disallow for
+# this agent (or `*`) on the generic article/blog path only — platform
+# fetchers (YouTube/X/Vimeo) use their own endpoints, not generic crawling.
+_ROBOTS_UA = "filter-fyi"
+
+
+@lru_cache(maxsize=512)
+def _robots_parser_for(scheme: str, netloc: str) -> urllib.robotparser.RobotFileParser | None:
+    """Fetch and parse a host's robots.txt. Cached per host for the process.
+
+    Returns None when robots.txt is absent/unreadable (→ treat as allowed).
+    """
+    robots_url = f"{scheme}://{netloc}/robots.txt"
+    try:
+        resp = requests.get(robots_url, timeout=10, headers={"User-Agent": _ROBOTS_UA})
+    except Exception as e:
+        logger.info("robots.txt fetch failed for %s (allowing): %s", netloc, e)
+        return None
+    if resp.status_code >= 400:
+        return None  # no robots.txt → nothing disallowed
+    rp = urllib.robotparser.RobotFileParser()
+    rp.parse(resp.text.splitlines())
+    return rp
+
+
+def _robots_allows(url: str) -> bool:
+    """True unless the site's robots.txt explicitly disallows our agent.
+
+    Fail-open: if robots.txt is missing or unreadable, allow the (single,
+    user-initiated) fetch rather than blocking the user.
+    """
+    parsed = urlparse(url)
+    rp = _robots_parser_for(parsed.scheme, parsed.netloc)
+    if rp is None:
+        return True
+    try:
+        return rp.can_fetch(_ROBOTS_UA, url)
+    except Exception:
+        return True
 
 
 def _youtube_thumbnail(video_id: str) -> str:
@@ -413,14 +455,13 @@ async def _streamyard_fetch(url: str) -> dict:
                     async for chunk in resp.aiter_bytes(chunk_size=1024 * 1024):
                         f.write(chunk)
 
-        from bot.storage import save_file_from_path
-        stored_file_path = save_file_from_path(tmp_path, ".mp4")
-
+        # The mp4 is downloaded to a temp file, transcribed, and deleted in the
+        # `finally` below — we do NOT persist third-party media to disk.
         from bot.transcriber import _transcribe_sync
         loop = asyncio.get_running_loop()
         transcript = await loop.run_in_executor(None, _transcribe_sync, tmp_path)
         text = f"{title}\n\nTranscript:\n{transcript}".strip()
-        return {"text": text[:MAX_CONTENT_CHARS], "title": title, "source_type": "video", "file_path": stored_file_path}
+        return {"text": text[:MAX_CONTENT_CHARS], "title": title, "source_type": "video"}
     except Exception as e:
         logger.warning(f"StreamYard transcription failed for {url}: {e}")
         return {"text": title, "title": title, "source_type": "video", "reason": fetch_errors.WHISPER_FAILED}
@@ -643,4 +684,10 @@ async def _fetch_url_uncached(url: str) -> dict:
     if urlparse(url).path.lower().endswith(".pdf"):
         return await _pdf_fetch(url)
 
+    # Generic article/blog fetch: honour robots.txt for this path only. (The
+    # platform fetchers above use their own endpoints, not generic crawling.)
+    loop = asyncio.get_running_loop()
+    if not await loop.run_in_executor(None, _robots_allows, url):
+        logger.info("robots.txt disallows %s", url)
+        return {"text": "", "title": url, "source_type": "article", "reason": fetch_errors.BLOCKED_BY_ROBOTS}
     return await _generic_fetch(url)

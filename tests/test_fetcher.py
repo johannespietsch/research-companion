@@ -245,3 +245,38 @@ class TestUrlCacheLayer:
         assert inner.call_count == 2
         assert "https://example.com/a" in r_a2["text"]
         assert "https://example.com/b" in r_b2["text"]
+
+
+class TestRobots:
+    """Generic article/blog fetches honour robots.txt; fail open when absent."""
+
+    def test_allows_when_no_robots(self, monkeypatch):
+        from bot import fetcher
+        monkeypatch.setattr(fetcher, "_robots_parser_for", lambda scheme, netloc: None)
+        assert fetcher._robots_allows("https://example.com/post") is True
+
+    def test_blocks_when_disallowed(self, monkeypatch):
+        from bot import fetcher
+
+        class _RP:
+            def can_fetch(self, ua, url):
+                return False
+
+        monkeypatch.setattr(fetcher, "_robots_parser_for", lambda scheme, netloc: _RP())
+        assert fetcher._robots_allows("https://example.com/post") is False
+
+    def test_generic_path_short_circuits_when_disallowed(self, monkeypatch):
+        from bot import fetcher
+
+        monkeypatch.setattr(fetcher, "assert_public_url", lambda u: None)  # skip DNS
+        monkeypatch.setattr(fetcher, "_robots_allows", lambda u: False)
+        called = {"generic": False}
+
+        async def _no_generic(u):
+            called["generic"] = True
+            return {"text": "should not happen"}
+
+        monkeypatch.setattr(fetcher, "_generic_fetch", _no_generic)
+        result = asyncio.run(fetcher._fetch_url_uncached("https://example.com/post"))
+        assert result["reason"] == fetcher.fetch_errors.BLOCKED_BY_ROBOTS
+        assert called["generic"] is False, "must not fetch a disallowed page"
