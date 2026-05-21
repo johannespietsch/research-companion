@@ -36,10 +36,15 @@ ANALYSIS_FIELDS = (
     "main_idea",
     "why_it_matters",
     "category",
-    "suggested_experiment",
+    "quick_win",
+    "bigger_play",
     "time_required",
     "verdict",
 )
+
+# Older stored items used a single `suggested_experiment`. Kept as a constant so
+# renderers can fall back to it; new analyses populate quick_win + bigger_play.
+LEGACY_EXPERIMENT_FIELD = "suggested_experiment"
 
 VERDICTS = ("watch", "skim", "skip")
 
@@ -58,9 +63,21 @@ _TOOL_SCHEMA = {
             "type": "string",
             "description": "Short topic tag (kebab-case), e.g. 'ai-engineering', 'productivity', 'crypto-trading'.",
         },
-        "suggested_experiment": {
+        "quick_win": {
             "type": "string",
-            "description": "A concrete next step the user could try in under a day.",
+            "description": (
+                "A concrete, scoped action this person can finish in 30–90 minutes "
+                "THIS WEEKEND — low activation energy, no setup marathon. Specific to "
+                "their situation, not generic advice."
+            ),
+        },
+        "bigger_play": {
+            "type": "string",
+            "description": (
+                "A more ambitious multi-session/multi-week project for when they're "
+                "ready to commit — the deeper arc that builds real capability. Make "
+                "the difference from the quick win clear."
+            ),
         },
         "time_required": {
             "type": "string",
@@ -97,7 +114,12 @@ DEFAULT_PROFILE = (
 
 _PROMPT = """You are my personal AI research analyst.
 {profile_block}
-Analyze the following content and produce a structured analysis covering the required fields. Be concrete and specific to this person.
+Analyze the following content and produce a structured analysis covering the required fields. Be concrete and specific to this person — `why_it_matters` should speak to their situation, not give generic advice.
+
+For the action, give TWO distinct tiers, both grounded in this content:
+- `quick_win`: something they can actually finish in 30–90 minutes this weekend (low activation energy).
+- `bigger_play`: the more ambitious multi-week arc for when they're ready to commit.
+Make the difference between the two obvious; don't just restate one as the other.
 
 CONTENT:
 {text}"""
@@ -129,7 +151,7 @@ def _normalize(raw: dict) -> dict:
 
 
 def analyze(text: str, user_id: int | None = None) -> dict:
-    """Returns a dict with keys: main_idea, why_it_matters, category, suggested_experiment, time_required, verdict."""
+    """Returns a dict with keys: main_idea, why_it_matters, category, quick_win, bigger_play, time_required, verdict."""
     profile = _load_profile(user_id)
     profile_block = f"\nAbout the person you are analysing for:\n{profile}\n" if profile else ""
     prompt = _PROMPT.format(profile_block=profile_block, text=text)
@@ -276,7 +298,9 @@ _LEGACY_FIELD_LABELS = {
     "main_idea": "Main idea",
     "why_it_matters": "Why it matters",
     "category": "Category",
-    "suggested_experiment": "Suggested experiment",
+    "quick_win": "Quick win (30–90 min)",
+    "bigger_play": "Bigger play (when you're ready)",
+    "suggested_experiment": "Suggested experiment",  # legacy items
     "time_required": "Time required to explore",
     "verdict": "Verdict",
 }

@@ -7,7 +7,9 @@ _SECTION_EMOJIS = {
     "main_idea": "💡",
     "why_it_matters": "🎯",
     "category": "🏷",
-    "suggested_experiment": "🧪",
+    "quick_win": "⚡",
+    "bigger_play": "🚀",
+    "suggested_experiment": "🧪",  # legacy rows
     "time_required": "⏱",
     "verdict": "🧭",
 }
@@ -16,7 +18,9 @@ _FIELD_LABELS = {
     "main_idea": "Main idea",
     "why_it_matters": "Why it matters",
     "category": "Category",
-    "suggested_experiment": "Suggested experiment",
+    "quick_win": "Quick win (30–90 min)",
+    "bigger_play": "Bigger play (when you're ready)",
+    "suggested_experiment": "Suggested experiment",  # legacy rows
     "time_required": "Time required to explore",
     "verdict": "Verdict",
 }
@@ -57,6 +61,8 @@ _LEGACY_LABEL_LOOKUP = {
     "main idea": "main_idea",
     "why it matters": "why_it_matters",
     "category": "category",
+    "quick win": "quick_win",
+    "bigger play": "bigger_play",
     "suggested experiment": "suggested_experiment",
     "time required to explore": "time_required",
     "verdict": "verdict",

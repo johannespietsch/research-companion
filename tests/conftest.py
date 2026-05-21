@@ -62,7 +62,8 @@ def client(monkeypatch):
             "main_idea": "RAG = retrieval-augmented generation.",
             "why_it_matters": "Practical AI pattern.",
             "category": "ai-engineering",
-            "suggested_experiment": "Try a small RAG demo.",
+            "quick_win": "Wire up a 20-doc RAG demo this afternoon.",
+            "bigger_play": "Build an evaluated RAG pipeline over your own corpus.",
             "time_required": "10 min read",
             "verdict": "watch",
         }

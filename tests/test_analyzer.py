@@ -31,3 +31,26 @@ class TestSummarizeContent:
         assert small == 512                                     # floor
         assert large == analyzer._SUMMARY_MAX_OUTPUT_TOKENS     # cap
         assert small < large
+
+
+class TestNormalizeTwoModeExperiment:
+    def test_keeps_quick_win_and_bigger_play(self):
+        from bot import analyzer
+
+        out = analyzer._normalize({
+            "main_idea": "x", "why_it_matters": "y", "category": "c",
+            "quick_win": "do this in an hour", "bigger_play": "the multi-week arc",
+            "time_required": "10 min", "verdict": "watch",
+        })
+        assert out["quick_win"] == "do this in an hour"
+        assert out["bigger_play"] == "the multi-week arc"
+        assert "suggested_experiment" not in out  # old field dropped from new schema
+        assert set(out.keys()) == set(analyzer.ANALYSIS_FIELDS)
+
+    def test_missing_fields_default_to_empty(self):
+        from bot import analyzer
+
+        out = analyzer._normalize({"verdict": "skip"})
+        assert out["quick_win"] == ""
+        assert out["bigger_play"] == ""
+        assert out["verdict"] == "skip"
