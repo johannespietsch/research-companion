@@ -18,6 +18,7 @@ from bot.auth import require_token
 from bot.config import MAX_CONTENT_CHARS
 from bot.fetch_errors import user_message as fetch_error_message
 from bot.db import (
+    FEEDBACK_SIGNALS,
     LINK_CODE_TTL_SECONDS,
     create_link_code,
     delete_item,
@@ -26,6 +27,7 @@ from bot.db import (
     get_item,
     get_user,
     get_user_profile,
+    record_feedback,
     save_item,
     search_items,
     set_user_profile,
@@ -368,6 +370,50 @@ async def user_delete(user_id: int, _: None = Depends(_require_try_secret)):
         "erasure: user=%s items_deleted=%s files=%s",
         user_id, result["items_deleted"], len(result["file_paths"]),
     )
+
+
+# Cap on profile length — it's fed into every analysis prompt, so keep it bounded.
+PROFILE_MAX_CHARS = 4_000
+
+
+class _ProfileUpdateRequest(BaseModel):
+    profile: str
+
+
+@router.put("/users/{user_id}/profile", status_code=200)
+async def user_set_profile(
+    user_id: int, req: _ProfileUpdateRequest, _: None = Depends(_require_try_secret)
+):
+    """Set a user's personalization profile (the lens fed to the analyser).
+
+    Worker-gated; the Worker resolves the session to user_id. 404 for an unknown
+    user so we don't silently create profiles for ids that don't exist.
+    """
+    if not get_user(user_id):
+        raise HTTPException(status_code=404, detail={"error": "not-found"})
+    profile = (req.profile or "").strip()[:PROFILE_MAX_CHARS]
+    set_user_profile(user_id, profile)
+    return {"profile": profile}
+
+
+class _FeedbackRequest(BaseModel):
+    user_id: int
+    item_id: int
+    signal: str
+
+
+@router.post("/feedback", status_code=201)
+async def feedback(req: _FeedbackRequest, _: None = Depends(_require_try_secret)):
+    """Record one feedback/signal event for a user's item (personalization loop).
+
+    Validates the signal against the allowlist and that the item belongs to the
+    user (so feedback can't be written against someone else's item).
+    """
+    if req.signal not in FEEDBACK_SIGNALS:
+        raise HTTPException(status_code=400, detail={"error": "invalid-signal"})
+    if not get_item(req.item_id, req.user_id):
+        raise HTTPException(status_code=404, detail={"error": "not-found"})
+    record_feedback(req.user_id, req.item_id, req.signal)
 
 
 class _LibraryAddRequest(BaseModel):

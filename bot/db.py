@@ -79,13 +79,40 @@ CREATE TABLE IF NOT EXISTS error_log (
     fingerprint TEXT NOT NULL DEFAULT ''
 )"""
 
+# Append-only signal log: how users react to verdicts/experiments. Powers the
+# personalization loop (and the highest-signal "tried it / didn't" feedback).
+# One row per event — multiple events per item are expected and wanted (we keep
+# the timestamps to learn how quickly people act).
+_CREATE_FEEDBACK_SQL = """\
+CREATE TABLE IF NOT EXISTS feedback (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER NOT NULL,
+    item_id    INTEGER NOT NULL,
+    signal     TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S', 'now')),
+    FOREIGN KEY (user_id) REFERENCES users(id),
+    FOREIGN KEY (item_id) REFERENCES items(id)
+)"""
+
 _CREATE_INDEXES_SQL = [
     "CREATE INDEX IF NOT EXISTS idx_items_user ON items(user_id, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_link_codes_expires ON link_codes(expires_at)",
     "CREATE INDEX IF NOT EXISTS idx_url_cache_fetched_at ON url_cache(fetched_at)",
     "CREATE INDEX IF NOT EXISTS idx_error_log_ts ON error_log(ts DESC)",
     "CREATE INDEX IF NOT EXISTS idx_error_log_fingerprint ON error_log(fingerprint)",
+    "CREATE INDEX IF NOT EXISTS idx_feedback_user ON feedback(user_id, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_feedback_item ON feedback(item_id)",
 ]
+
+# Allowed feedback signals. Explicit taps + cheap implicit proxies. Kept as an
+# allowlist so the data stays clean enough to learn from.
+FEEDBACK_SIGNALS = frozenset({
+    "tried",        # explicit: acted on the suggestion
+    "not_for_me",   # explicit: not relevant / won't do it
+    "done",         # explicit: completed it
+    "opened",       # implicit: clicked through to the source
+    "revisited",    # implicit: came back to the item later
+})
 
 LINK_CODE_TTL_SECONDS = 600
 URL_CACHE_TTL_SECONDS = 30 * 24 * 3600
@@ -168,6 +195,7 @@ def _init() -> None:
         conn.execute(_CREATE_LINK_CODES_SQL)
         conn.execute(_CREATE_URL_CACHE_SQL)
         conn.execute(_CREATE_ERROR_LOG_SQL)
+        conn.execute(_CREATE_FEEDBACK_SQL)
         for stmt in _CREATE_INDEXES_SQL:
             conn.execute(stmt)
 
@@ -272,6 +300,7 @@ def delete_user(user_id: int) -> dict:
             "DELETE FROM items WHERE user_id = ?", (user_id,)
         ).rowcount
         conn.execute("DELETE FROM link_codes WHERE user_id = ?", (user_id,))
+        conn.execute("DELETE FROM feedback WHERE user_id = ?", (user_id,))
         user_deleted = conn.execute(
             "DELETE FROM users WHERE id = ?", (user_id,)
         ).rowcount
@@ -360,6 +389,17 @@ def delete_item(item_id: int, user_id: int | None = None) -> None:
             )
         else:
             conn.execute("DELETE FROM items WHERE id = ?", (item_id,))
+        # Drop any feedback that referenced this item (no orphans).
+        conn.execute("DELETE FROM feedback WHERE item_id = ?", (item_id,))
+
+
+def record_feedback(user_id: int, item_id: int, signal: str) -> None:
+    """Append one feedback/signal event for a user's item."""
+    with _get_conn() as conn:
+        conn.execute(
+            "INSERT INTO feedback (user_id, item_id, signal) VALUES (?, ?, ?)",
+            (user_id, item_id, signal),
+        )
 
 
 # ---------------------------------------------------------------------------
