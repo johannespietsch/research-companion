@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import io
 import json
@@ -5,6 +6,7 @@ import logging
 import os
 import secrets
 import tempfile
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
@@ -20,16 +22,20 @@ from bot.fetch_errors import user_message as fetch_error_message
 from bot.db import (
     FEEDBACK_SIGNALS,
     LINK_CODE_TTL_SECONDS,
+    create_job,
     create_link_code,
     delete_item,
     delete_user,
     get_all_items,
     get_item,
+    get_job_record,
     get_user,
     get_user_profile,
     record_feedback,
     save_item,
     search_items,
+    set_job_done,
+    set_job_error,
     set_user_profile,
     upsert_user_by_email,
 )
@@ -40,6 +46,10 @@ from bot.transcriber import transcribe
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api")
+
+# Keeps references to running background tasks alive until they complete.
+# Without this, Python's GC may collect the task before it finishes.
+_background_tasks: set[asyncio.Task] = set()
 
 # Preview length sent to the Worker — keeps the payload compact while still
 # giving the UI something to render. The full extracted text only ever exists
@@ -553,6 +563,120 @@ async def library_delete(item_id: int, user_id: int, _: None = Depends(_require_
     if not get_item(item_id, user_id):
         raise HTTPException(status_code=404, detail={"error": "not-found"})
     delete_item(item_id, user_id)
+
+
+class _JobRequest(BaseModel):
+    url: str
+    user_id: int | None = None
+    user_note: str = ""
+
+
+@router.post("/job", status_code=202)
+async def start_job(req: _JobRequest, _: None = Depends(_require_try_secret)):
+    """Start an async analysis job and return a job_id immediately.
+
+    The Worker calls this instead of /api/try or /api/library/add. The browser
+    polls GET /api/job/:id until status → 'done' or 'error'. The background
+    task runs fetch → summarize → analyze(summary) in sequence; for signed-in
+    users it also saves the item to the backend DB.
+    """
+    url = (req.url or "").strip()
+    if not _is_http_url(url):
+        raise HTTPException(status_code=400, detail={"error": "invalid-url"})
+
+    job_id = str(uuid.uuid4())
+    create_job(job_id)
+
+    task = asyncio.create_task(_run_job(job_id, url, req.user_id, req.user_note))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+    return {"job_id": job_id}
+
+
+async def _run_job(job_id: str, url: str, user_id: int | None, user_note: str) -> None:
+    """Background task: fetch → summarize → analyze(summary) → optionally save."""
+    try:
+        try:
+            fetched = await fetch_url(url)
+        except Exception:
+            logger.exception("job %s: fetch_url crashed for %s", job_id, url)
+            set_job_error(job_id, "fetch-failed")
+            return
+
+        text = (fetched.get("text") or "").strip()
+        source_type = fetched.get("source_type") or "article"
+
+        if not text:
+            reason = fetched.get("reason")
+            if source_type in _VIDEO_SOURCE_TYPES:
+                set_job_error(job_id, "no-transcript")
+            else:
+                set_job_error(job_id, "extraction-failed")
+            return
+
+        loop = asyncio.get_running_loop()
+
+        # Summarise first — the summary is the canonical stored representation
+        # and the basis for the analysis verdict.
+        try:
+            summary = await loop.run_in_executor(None, lambda: summarize_content(text))
+        except Exception:
+            logger.exception("job %s: summarize_content crashed", job_id)
+            summary = text[:TRY_PREVIEW_CHARS]
+
+        try:
+            analysis = await loop.run_in_executor(None, lambda: analyze(summary, user_id))
+        except Exception:
+            logger.exception("job %s: analyze crashed", job_id)
+            set_job_error(job_id, "analyze-failed")
+            return
+
+        saved_id: int | None = None
+        if user_id is not None:
+            saved_id = save_item(
+                user_id=user_id,
+                source_type=source_type,
+                source=url,
+                content=summary,
+                analysis=to_json_str(analysis),
+                user_note=user_note,
+            )
+
+        verdict = analysis.pop("verdict", "skim")
+        result: dict = {
+            "url": url,
+            "title": fetched.get("title") or url,
+            "source_type": source_type,
+            "image_urls": fetched.get("image_urls") or [],
+            "content_preview": summary[:TRY_PREVIEW_CHARS],
+            "verdict": verdict,
+            "analysis": analysis,
+        }
+        if saved_id is not None:
+            result["id"] = saved_id
+
+        set_job_done(job_id, result)
+    except Exception:
+        logger.exception("job %s: unexpected failure", job_id)
+        set_job_error(job_id, "internal-error")
+
+
+@router.get("/job/{job_id}")
+async def get_job_status(job_id: str, _: None = Depends(_require_try_secret)):
+    """Poll for an async job's result."""
+    job = get_job_record(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail={"error": "not-found"})
+    if job["status"] == "done":
+        try:
+            result = json.loads(job["result"])
+        except Exception:
+            result = None
+        return {"status": "done", "result": result}
+    if job["status"] == "error":
+        return {"status": "error", "error": job["error"]}
+    return {"status": "pending"}
 
 
 class _ClaimRow(BaseModel):

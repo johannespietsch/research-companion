@@ -337,17 +337,32 @@ class TestPruneMaintenance:
                 "INSERT INTO link_codes (code, user_id, expires_at) VALUES ('NEW', ?, ?)",
                 (uid, NEW),
             )
+            # Old terminal job → pruned. Old pending job → kept (task may still
+            # be running). New terminal job → kept (within retention window).
+            conn.execute(
+                "INSERT INTO jobs (id, status, updated_at) VALUES ('old-done', 'done', ?)",
+                (OLD,),
+            )
+            conn.execute(
+                "INSERT INTO jobs (id, status, updated_at) VALUES ('old-pending', 'pending', ?)",
+                (OLD,),
+            )
+            conn.execute(
+                "INSERT INTO jobs (id, status, updated_at) VALUES ('new-done', 'done', ?)",
+                (NEW,),
+            )
 
         counts = db.prune_maintenance(now=datetime(2026, 5, 20, tzinfo=timezone.utc))
-        assert counts == {"error_log": 1, "url_cache": 1, "link_codes": 1}
+        assert counts == {"error_log": 1, "url_cache": 1, "link_codes": 1, "jobs": 1}
 
         with db._get_conn() as conn:
             assert [r["message"] for r in conn.execute("SELECT message FROM error_log")] == ["new"]
             assert [r["url"] for r in conn.execute("SELECT url FROM url_cache")] == ["https://new"]
             assert [r["code"] for r in conn.execute("SELECT code FROM link_codes")] == ["NEW"]
+            assert {r["id"] for r in conn.execute("SELECT id FROM jobs")} == {"old-pending", "new-done"}
 
     def test_idempotent_on_empty(self, db):
         from datetime import datetime, timezone
 
         counts = db.prune_maintenance(now=datetime(2026, 5, 20, tzinfo=timezone.utc))
-        assert counts == {"error_log": 0, "url_cache": 0, "link_codes": 0}
+        assert counts == {"error_log": 0, "url_cache": 0, "link_codes": 0, "jobs": 0}

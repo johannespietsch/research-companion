@@ -102,7 +102,25 @@ _CREATE_INDEXES_SQL = [
     "CREATE INDEX IF NOT EXISTS idx_error_log_fingerprint ON error_log(fingerprint)",
     "CREATE INDEX IF NOT EXISTS idx_feedback_user ON feedback(user_id, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_feedback_item ON feedback(item_id)",
+    "CREATE INDEX IF NOT EXISTS idx_jobs_updated_at ON jobs(updated_at DESC)",
 ]
+
+# Short-lived job records for the async analysis flow. The Worker starts a job
+# and returns immediately; the browser polls until status → 'done' or 'error'.
+_CREATE_JOBS_SQL = """\
+CREATE TABLE IF NOT EXISTS jobs (
+    id         TEXT PRIMARY KEY,
+    status     TEXT NOT NULL DEFAULT 'pending',
+    result     TEXT NOT NULL DEFAULT '',
+    error      TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S', 'now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S', 'now'))
+)"""
+
+# Retain terminal jobs for 1 hour — long enough for any in-flight poll to
+# retrieve its result. Pending jobs stay until they resolve or the server
+# restarts (the frontend times out its own polling after ~2 min).
+JOB_RETENTION_SECONDS = 3_600
 
 # Allowed feedback signals. Explicit taps + cheap implicit proxies. Kept as an
 # allowlist so the data stays clean enough to learn from.
@@ -196,6 +214,7 @@ def _init() -> None:
         conn.execute(_CREATE_URL_CACHE_SQL)
         conn.execute(_CREATE_ERROR_LOG_SQL)
         conn.execute(_CREATE_FEEDBACK_SQL)
+        conn.execute(_CREATE_JOBS_SQL)
         for stmt in _CREATE_INDEXES_SQL:
             conn.execute(stmt)
 
@@ -324,13 +343,14 @@ def save_item(
     user_note: str = "",
     *,
     file_path: str = "",
-) -> None:
+) -> int:
     with _get_conn() as conn:
-        conn.execute(
+        cur = conn.execute(
             "INSERT INTO items (user_id, source_type, source, content, "
             "analysis, user_note, file_path) VALUES (?, ?, ?, ?, ?, ?, ?)",
             (user_id, source_type, source, content, analysis, user_note, file_path),
         )
+        return cur.lastrowid
 
 
 _ITEM_COLS = (
@@ -539,6 +559,7 @@ def prune_maintenance(now=None) -> dict:
     err_cutoff = _ts(now - timedelta(days=ERROR_LOG_RETENTION_DAYS))
     cache_cutoff = _ts(now - timedelta(seconds=URL_CACHE_TTL_SECONDS))
     now_str = _ts(now)
+    jobs_cutoff = _ts(now - timedelta(seconds=JOB_RETENTION_SECONDS))
     with _get_conn() as conn:
         errors = conn.execute("DELETE FROM error_log WHERE ts < ?", (err_cutoff,)).rowcount or 0
         cache = conn.execute(
@@ -547,8 +568,51 @@ def prune_maintenance(now=None) -> dict:
         codes = conn.execute(
             "DELETE FROM link_codes WHERE expires_at < ?", (now_str,)
         ).rowcount or 0
-    return {"error_log": errors, "url_cache": cache, "link_codes": codes}
+        # Only prune terminal states — pending jobs may still have a running task.
+        jobs = conn.execute(
+            "DELETE FROM jobs WHERE status != 'pending' AND updated_at < ?",
+            (jobs_cutoff,),
+        ).rowcount or 0
+    return {"error_log": errors, "url_cache": cache, "link_codes": codes, "jobs": jobs}
 
+
+# ---------------------------------------------------------------------------
+# Async jobs
+# ---------------------------------------------------------------------------
+
+def create_job(job_id: str) -> None:
+    with _get_conn() as conn:
+        conn.execute("INSERT INTO jobs (id) VALUES (?)", (job_id,))
+
+
+def set_job_done(job_id: str, result: dict) -> None:
+    body = json.dumps(result, ensure_ascii=False)
+    with _get_conn() as conn:
+        conn.execute(
+            "UPDATE jobs SET status = 'done', result = ?, updated_at = ? WHERE id = ?",
+            (body, _utcnow_iso(), job_id),
+        )
+
+
+def set_job_error(job_id: str, error: str) -> None:
+    with _get_conn() as conn:
+        conn.execute(
+            "UPDATE jobs SET status = 'error', error = ?, updated_at = ? WHERE id = ?",
+            (error, _utcnow_iso(), job_id),
+        )
+
+
+def get_job_record(job_id: str) -> sqlite3.Row | None:
+    with _get_conn() as conn:
+        return conn.execute(
+            "SELECT id, status, result, error FROM jobs WHERE id = ?",
+            (job_id,),
+        ).fetchone()
+
+
+# ---------------------------------------------------------------------------
+# Account linking (web ↔ Telegram)
+# ---------------------------------------------------------------------------
 
 def link_telegram_to_user(web_user_id: int, telegram_chat_id: int) -> None:
     """Stitch a Telegram chat onto the given web user. Idempotent.

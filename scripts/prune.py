@@ -20,7 +20,8 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     counts = prune_maintenance()
     logger.info(
-        "prune: error_log=%(error_log)s url_cache=%(url_cache)s link_codes=%(link_codes)s",
+        "prune: error_log=%(error_log)s url_cache=%(url_cache)s "
+        "link_codes=%(link_codes)s jobs=%(jobs)s",
         counts,
     )
 

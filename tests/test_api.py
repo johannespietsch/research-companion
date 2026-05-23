@@ -333,3 +333,112 @@ class TestLinkStart:
         assert len(body["code"]) == 6
         assert body["code"].isdigit()
         assert body["expires_in_seconds"] == 600
+
+
+# ---------------------------------------------------------------------------
+# POST /api/job + GET /api/job/{id}  (async analysis flow)
+# ---------------------------------------------------------------------------
+
+class TestJobFlow:
+    def test_start_job_returns_job_id(self, client, auth_headers):
+        r = client.post("/api/job", json={"url": "https://example.com/x"}, headers=auth_headers)
+        assert r.status_code == 202
+        assert isinstance(r.json().get("job_id"), str)
+
+    def test_start_job_rejects_invalid_url(self, client, auth_headers):
+        r = client.post("/api/job", json={"url": "not-a-url"}, headers=auth_headers)
+        assert r.status_code == 400
+
+    def test_start_job_requires_secret(self, client):
+        r = client.post("/api/job", json={"url": "https://example.com/x"})
+        assert r.status_code == 401
+
+    def test_get_job_404_for_unknown(self, client, auth_headers):
+        r = client.get("/api/job/unknown-id", headers=auth_headers)
+        assert r.status_code == 404
+
+    def test_run_job_signed_in_saves_item_and_completes(self, client, db, auth_headers):
+        import asyncio
+        import json
+        import bot.api
+
+        uid = client.post(
+            "/api/users/upsert", json={"email": "j@b.com"}, headers=auth_headers
+        ).json()["user_id"]
+        db.create_job("job-1")
+        asyncio.run(bot.api._run_job("job-1", "https://example.com/x", uid, "my note"))
+
+        rec = db.get_job_record("job-1")
+        assert rec["status"] == "done"
+        result = json.loads(rec["result"])
+        assert result["verdict"] == "watch"
+        assert result["id"] is not None
+        # Verdict is hoisted to the top level, not left inside analysis.
+        assert "verdict" not in result["analysis"]
+        # Item persisted for the signed-in user, storing the summary not raw text.
+        items = db.get_all_items(uid)
+        assert len(items) == 1
+        assert items[0]["content"] == "Neutral summary of the content."
+
+    def test_run_job_anonymous_does_not_save(self, client, db):
+        import asyncio
+        import json
+        import bot.api
+
+        db.create_job("job-2")
+        asyncio.run(bot.api._run_job("job-2", "https://example.com/x", None, ""))
+
+        rec = db.get_job_record("job-2")
+        assert rec["status"] == "done"
+        result = json.loads(rec["result"])
+        assert "id" not in result
+        assert db.get_all_items() == []
+
+    def test_run_job_analyzes_the_summary_not_raw_text(self, client, db, monkeypatch):
+        # The verdict must be derived from the stored summary, not the raw
+        # fetched text (the canonical-representation contract).
+        import asyncio
+        import bot.api
+
+        captured = {}
+
+        def capture_analyze(text, user_id=None):
+            captured["text"] = text
+            return {
+                "main_idea": "x", "why_it_matters": "y", "category": "c",
+                "quick_win": "q", "bigger_play": "b", "time_required": "t",
+                "verdict": "skim",
+            }
+
+        monkeypatch.setattr(bot.api, "analyze", capture_analyze)
+        db.create_job("job-3")
+        asyncio.run(bot.api._run_job("job-3", "https://example.com/x", None, ""))
+        assert captured["text"] == "Neutral summary of the content."
+
+    def test_run_job_no_text_sets_extraction_error(self, client, db, monkeypatch):
+        import asyncio
+        import bot.api
+
+        async def empty_fetch(url):
+            return {"text": "", "title": url, "source_type": "article", "reason": "no_text"}
+
+        monkeypatch.setattr(bot.api, "fetch_url", empty_fetch)
+        db.create_job("job-4")
+        asyncio.run(bot.api._run_job("job-4", "https://example.com/x", None, ""))
+        rec = db.get_job_record("job-4")
+        assert rec["status"] == "error"
+        assert rec["error"] == "extraction-failed"
+
+    def test_run_job_video_no_text_sets_no_transcript(self, client, db, monkeypatch):
+        import asyncio
+        import bot.api
+
+        async def empty_video_fetch(url):
+            return {"text": "", "title": url, "source_type": "youtube", "reason": "no_transcript"}
+
+        monkeypatch.setattr(bot.api, "fetch_url", empty_video_fetch)
+        db.create_job("job-5")
+        asyncio.run(bot.api._run_job("job-5", "https://example.com/x", None, ""))
+        rec = db.get_job_record("job-5")
+        assert rec["status"] == "error"
+        assert rec["error"] == "no-transcript"
