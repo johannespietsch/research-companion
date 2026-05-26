@@ -51,6 +51,11 @@ router = APIRouter(prefix="/api")
 # Without this, Python's GC may collect the task before it finishes.
 _background_tasks: set[asyncio.Task] = set()
 
+# Tracks the current processing step for in-flight jobs so the poll endpoint
+# can tell the browser what stage it's at. Keyed by job_id; cleaned up in the
+# finally block of _run_job. Safe for the single-process Fly deployment.
+_job_steps: dict[str, str] = {}
+
 # Preview length sent to the Worker — keeps the payload compact while still
 # giving the UI something to render. The full extracted text only ever exists
 # in-memory on this request.
@@ -597,6 +602,7 @@ async def start_job(req: _JobRequest, _: None = Depends(_require_try_secret)):
 async def _run_job(job_id: str, url: str, user_id: int | None, user_note: str) -> None:
     """Background task: fetch → summarize → analyze(summary) → optionally save."""
     try:
+        _job_steps[job_id] = "fetching"
         try:
             fetched = await fetch_url(url)
         except Exception:
@@ -608,7 +614,6 @@ async def _run_job(job_id: str, url: str, user_id: int | None, user_note: str) -
         source_type = fetched.get("source_type") or "article"
 
         if not text:
-            reason = fetched.get("reason")
             if source_type in _VIDEO_SOURCE_TYPES:
                 set_job_error(job_id, "no-transcript")
             else:
@@ -619,12 +624,14 @@ async def _run_job(job_id: str, url: str, user_id: int | None, user_note: str) -
 
         # Summarise first — the summary is the canonical stored representation
         # and the basis for the analysis verdict.
+        _job_steps[job_id] = "summarizing"
         try:
             summary = await loop.run_in_executor(None, lambda: summarize_content(text))
         except Exception:
             logger.exception("job %s: summarize_content crashed", job_id)
             summary = text[:TRY_PREVIEW_CHARS]
 
+        _job_steps[job_id] = "analyzing"
         try:
             analysis = await loop.run_in_executor(None, lambda: analyze(summary, user_id))
         except Exception:
@@ -660,6 +667,8 @@ async def _run_job(job_id: str, url: str, user_id: int | None, user_note: str) -
     except Exception:
         logger.exception("job %s: unexpected failure", job_id)
         set_job_error(job_id, "internal-error")
+    finally:
+        _job_steps.pop(job_id, None)
 
 
 @router.get("/job/{job_id}")
@@ -676,7 +685,7 @@ async def get_job_status(job_id: str, _: None = Depends(_require_try_secret)):
         return {"status": "done", "result": result}
     if job["status"] == "error":
         return {"status": "error", "error": job["error"]}
-    return {"status": "pending"}
+    return {"status": "pending", "step": _job_steps.get(job_id, "fetching")}
 
 
 class _ClaimRow(BaseModel):
