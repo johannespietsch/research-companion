@@ -175,9 +175,49 @@ Key endpoints (all under `/api`):
 | `POST /api/ingest/url` | Ingest a URL |
 | `POST /api/ingest/file` | Upload and ingest a file |
 
-### Public `/api/try` (anonymous)
+### Public API (anonymous)
 
-Used by the [filter.fyi](https://filter.fyi) landing page so anonymous visitors can submit a URL and get a verdict without signing up. Authenticated via a shared secret rather than a user token:
+Used by the [filter.fyi](https://filter.fyi) landing page so anonymous visitors can submit a URL and get a verdict without signing up. All endpoints authenticated via a shared secret (`x-filter-fyi-secret`) rather than a user token.
+
+#### Async job API (current)
+
+The Worker uses a two-step async flow to avoid Cloudflare's 25s upstream timeout:
+
+**Step 1 — start a job**
+
+```
+POST /api/job
+content-type: application/json
+x-filter-fyi-secret: <FILTER_FYI_TRY_SECRET>
+
+{ "url": "https://example.com/post" }
+```
+
+Response (202):
+
+```json
+{ "job_id": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" }
+```
+
+The backend creates a DB row and immediately returns; the actual fetch → summarise → analyse pipeline runs as a background task.
+
+**Step 2 — poll for result**
+
+```
+GET /api/job/<job_id>
+x-filter-fyi-secret: <FILTER_FYI_TRY_SECRET>
+```
+
+| Response | Meaning |
+|----------|---------|
+| `{"status":"pending"}` | Still running |
+| `{"status":"done","result":"<JSON string>"}` | Complete — `result` is the same shape as the `/api/try` response below |
+| `{"status":"error","error":"<code>"}` | Failed — same error codes as `/api/try` |
+| 404 | Unknown or expired job (TTL: 1 hour) |
+
+#### Legacy sync endpoint
+
+`POST /api/try` is still active for backward compatibility but is no longer used by the Worker. It executes fetch + summarise + analyse synchronously, which can exceed the Worker timeout for slow pages.
 
 ```
 POST /api/try
@@ -187,7 +227,7 @@ x-filter-fyi-secret: <FILTER_FYI_TRY_SECRET>
 { "url": "https://example.com/post" }
 ```
 
-Response shape (the contract the Cloudflare Worker consumes):
+Response shape:
 
 ```jsonc
 {
@@ -218,7 +258,7 @@ Error responses (Worker maps these to user-friendly notices):
 | 502    | `{"error":"fetch-failed"}`      | Upstream fetch crashed                      |
 | 502    | `{"error":"analyze-failed"}`    | LLM call crashed                            |
 
-The endpoint is **stateless**: nothing is persisted to the bot's SQLite. The Worker is the system of record for anonymous tries (D1 `summaries` table, keyed by `anon_id` for later claim-on-signup).
+Both endpoints are **stateless**: nothing is persisted to the bot's SQLite. The Worker is the system of record for anonymous tries (D1 `anon_summaries` table, keyed by `anon_id` for later claim-on-signup).
 
 ## Deployment (Fly.io)
 
