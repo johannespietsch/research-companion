@@ -63,6 +63,25 @@ def _record_usage(
     )
 
 
+def _capture_trace(*, text: str, profile: str, output: dict, ctx: UsageContext | None) -> None:
+    """Best-effort write of one row to analyze_traces. Gated by env flag inside
+    `record_analyze_trace`; never raises into the caller."""
+    from bot.db import record_analyze_trace
+
+    c = ctx or UsageContext()
+    record_analyze_trace(
+        provider=_PROVIDER,
+        model=_MODEL,
+        source_type=c.source_type,
+        input_text=text,
+        profile_text=profile,
+        output=output,
+        user_id=c.user_id,
+        anon_id=c.anon_id,
+        job_id=c.job_id,
+    )
+
+
 def _anthropic_tokens(resp) -> tuple[int, int]:
     """Pull (input_tokens, output_tokens) off an Anthropic Messages response.
     Missing usage is treated as (0, 0) rather than raising — we'd rather log a
@@ -252,7 +271,9 @@ def analyze(text: str, user_id: int | None = None, *, ctx: UsageContext | None =
                           started_at=started, ctx=ctx)
             for block in resp.content:
                 if getattr(block, "type", None) == "tool_use" and block.name == "record_analysis":
-                    return _normalize(block.input)
+                    result = _normalize(block.input)
+                    _capture_trace(text=text, profile=profile, output=result, ctx=ctx)
+                    return result
             raise RuntimeError("Anthropic did not return a record_analysis tool_use block")
 
         resp = client.chat.completions.create(
@@ -268,7 +289,9 @@ def analyze(text: str, user_id: int | None = None, *, ctx: UsageContext | None =
             raw = json.loads(content)
         except json.JSONDecodeError as e:
             raise RuntimeError(f"OpenAI returned non-JSON content: {e}: {content[:200]}")
-        return _normalize(raw)
+        result = _normalize(raw)
+        _capture_trace(text=text, profile=profile, output=result, ctx=ctx)
+        return result
     except Exception as e:
         # Log the failed attempt so failure rate shows up next to spend.
         _record_usage(purpose="analyze", input_tokens=0, output_tokens=0,
