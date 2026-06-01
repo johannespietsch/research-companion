@@ -128,8 +128,10 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 from bot.api import router as api_router  # noqa: E402
+from bot.admin import router as admin_router  # noqa: E402
 
 app.include_router(api_router)
+app.include_router(admin_router)
 
 _STATIC_DIR = Path(__file__).parent / "bot" / "static"
 
