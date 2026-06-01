@@ -106,6 +106,8 @@ _CREATE_INDEXES_SQL = [
     "CREATE INDEX IF NOT EXISTS idx_llm_calls_ts ON llm_calls(ts DESC)",
     "CREATE INDEX IF NOT EXISTS idx_llm_calls_user ON llm_calls(user_id, ts DESC)",
     "CREATE INDEX IF NOT EXISTS idx_llm_calls_anon ON llm_calls(anon_id, ts DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_analyze_traces_ts ON analyze_traces(ts DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_analyze_traces_retention ON analyze_traces(retention_until)",
 ]
 
 # Per-call LLM usage log. One row per upstream API call (analyze, summary,
@@ -150,6 +152,34 @@ CREATE TABLE IF NOT EXISTS jobs (
 # retrieve its result. Pending jobs stay until they resolve or the server
 # restarts (the frontend times out its own polling after ~2 min).
 JOB_RETENTION_SECONDS = 3_600
+
+# Captured I/O for `purpose='analyze'` calls. Kept separate from `llm_calls`
+# so the retention policy and access controls for raw content are explicit
+# (llm_calls is metadata-only and can be kept forever; this table holds the
+# actual user input and structured model output and is purged on a fixed TTL).
+# Population is gated by ANALYZE_TRACE_CAPTURE=1 — off by default so prod
+# doesn't start retaining content without an explicit operator decision.
+# `retention_until` is set per row so changing the TTL doesn't retroactively
+# extend rows already written; the purge helper reads the column directly.
+_CREATE_ANALYZE_TRACES_SQL = """\
+CREATE TABLE IF NOT EXISTS analyze_traces (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts              TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S', 'now')),
+    user_id         INTEGER,
+    anon_id         TEXT,
+    job_id          TEXT,
+    provider        TEXT    NOT NULL DEFAULT '',
+    model           TEXT    NOT NULL DEFAULT '',
+    source_type     TEXT    NOT NULL DEFAULT '',
+    input_text      TEXT    NOT NULL DEFAULT '',
+    profile_text    TEXT    NOT NULL DEFAULT '',
+    output_json     TEXT    NOT NULL DEFAULT '',
+    retention_until TEXT    NOT NULL
+)"""
+
+ANALYZE_TRACE_RETENTION_SECONDS = int(
+    os.getenv("ANALYZE_TRACE_RETENTION_SECONDS") or 30 * 24 * 3_600
+)
 
 # Allowed feedback signals. Explicit taps + cheap implicit proxies. Kept as an
 # allowlist so the data stays clean enough to learn from.
@@ -245,6 +275,7 @@ def _init() -> None:
         conn.execute(_CREATE_FEEDBACK_SQL)
         conn.execute(_CREATE_JOBS_SQL)
         conn.execute(_CREATE_LLM_CALLS_SQL)
+        conn.execute(_CREATE_ANALYZE_TRACES_SQL)
         for stmt in _CREATE_INDEXES_SQL:
             conn.execute(stmt)
 
@@ -679,6 +710,68 @@ def insert_llm_call(
         # Surface in logs but never propagate — see docstring.
         import logging as _logging
         _logging.getLogger(__name__).exception("insert_llm_call failed")
+
+
+# ---------------------------------------------------------------------------
+# Analyze trace capture (eval dataset source)
+# ---------------------------------------------------------------------------
+
+def analyze_trace_capture_enabled() -> bool:
+    """Read the env flag at call time so tests (and ops) can toggle without
+    reimporting the module. Truthy = "1", "true", "yes" (case-insensitive)."""
+    return (os.getenv("ANALYZE_TRACE_CAPTURE") or "").strip().lower() in {"1", "true", "yes"}
+
+
+def record_analyze_trace(
+    *,
+    provider: str,
+    model: str,
+    source_type: str,
+    input_text: str,
+    profile_text: str,
+    output: dict,
+    user_id: int | None = None,
+    anon_id: str | None = None,
+    job_id: str | None = None,
+) -> None:
+    """Persist one `analyze` call's input and structured output for offline eval.
+
+    No-op when ANALYZE_TRACE_CAPTURE is unset. Never raises into the caller —
+    trace capture is best-effort and must not break the analysis path.
+    """
+    if not analyze_trace_capture_enabled():
+        return
+    try:
+        retention_until = (
+            datetime.now(timezone.utc) + timedelta(seconds=ANALYZE_TRACE_RETENTION_SECONDS)
+        ).strftime("%Y-%m-%dT%H:%M:%S")
+        with _get_conn() as conn:
+            conn.execute(
+                "INSERT INTO analyze_traces (user_id, anon_id, job_id, provider, "
+                "model, source_type, input_text, profile_text, output_json, "
+                "retention_until) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    user_id, anon_id, job_id, provider, model, source_type,
+                    input_text or "", profile_text or "",
+                    json.dumps(output, ensure_ascii=False), retention_until,
+                ),
+            )
+    except Exception:
+        import logging as _logging
+        _logging.getLogger(__name__).exception("record_analyze_trace failed")
+
+
+def purge_expired_analyze_traces() -> int:
+    """Delete trace rows whose retention_until is in the past. Returns rowcount.
+
+    Meant to be called from a periodic task (same cadence as other cleanup).
+    """
+    now = _utcnow_iso()
+    with _get_conn() as conn:
+        cur = conn.execute(
+            "DELETE FROM analyze_traces WHERE retention_until <= ?", (now,)
+        )
+        return cur.rowcount
 
 
 # ---------------------------------------------------------------------------
