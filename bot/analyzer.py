@@ -1,11 +1,84 @@
 import json
 import logging
 import os
+import time
+from dataclasses import dataclass
 from dotenv import load_dotenv
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class UsageContext:
+    """Caller-supplied context for attributing one LLM call in `llm_calls`.
+
+    All fields are optional: legacy callers that don't pass a context still get
+    a row written, just with NULL user/anon/job and an empty source_type. The
+    analyzer functions accept this as a keyword-only `ctx` arg so adding new
+    attribution dimensions later is a non-breaking change.
+    """
+    user_id: int | None = None
+    anon_id: str | None = None
+    job_id: str | None = None
+    source_type: str = ""
+
+
+def _record_usage(
+    *,
+    purpose: str,
+    input_tokens: int,
+    output_tokens: int,
+    started_at: float,
+    ctx: UsageContext | None,
+    status: str = "ok",
+    error: str = "",
+) -> None:
+    """Best-effort write of one row to llm_calls. Never raises.
+
+    Pricing is stamped at write time from `bot.pricing` so historical rows keep
+    the cost they had at the time of the call even if we later bump prices.
+    """
+    from bot import pricing
+    from bot.db import insert_llm_call
+
+    latency_ms = int((time.monotonic() - started_at) * 1000)
+    cost = pricing.cost_usd(_MODEL, input_tokens, output_tokens)
+    c = ctx or UsageContext()
+    insert_llm_call(
+        provider=_PROVIDER,
+        model=_MODEL,
+        purpose=purpose,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cost_usd=cost,
+        latency_ms=latency_ms,
+        status=status,
+        error=error,
+        user_id=c.user_id,
+        anon_id=c.anon_id,
+        job_id=c.job_id,
+        source_type=c.source_type,
+    )
+
+
+def _anthropic_tokens(resp) -> tuple[int, int]:
+    """Pull (input_tokens, output_tokens) off an Anthropic Messages response.
+    Missing usage is treated as (0, 0) rather than raising — we'd rather log a
+    zero-token row than drop the call entirely."""
+    usage = getattr(resp, "usage", None)
+    if usage is None:
+        return 0, 0
+    return int(getattr(usage, "input_tokens", 0) or 0), int(getattr(usage, "output_tokens", 0) or 0)
+
+
+def _openai_tokens(resp) -> tuple[int, int]:
+    """Pull (prompt_tokens, completion_tokens) off an OpenAI Chat response."""
+    usage = getattr(resp, "usage", None)
+    if usage is None:
+        return 0, 0
+    return int(getattr(usage, "prompt_tokens", 0) or 0), int(getattr(usage, "completion_tokens", 0) or 0)
 
 _ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY")
 _OPENAI_KEY = os.getenv("OPENAI_API_KEY")
@@ -150,37 +223,57 @@ def _normalize(raw: dict) -> dict:
     return out
 
 
-def analyze(text: str, user_id: int | None = None) -> dict:
+def analyze(text: str, user_id: int | None = None, *, ctx: UsageContext | None = None) -> dict:
     """Returns a dict with keys: main_idea, why_it_matters, category, quick_win, bigger_play, time_required, verdict."""
-    profile = _load_profile(user_id)
+    # Back-compat: callers that still pass `user_id` positionally get it merged
+    # into the context so usage rows still attribute to a user.
+    if ctx is None:
+        ctx = UsageContext(user_id=user_id)
+    elif ctx.user_id is None and user_id is not None:
+        ctx = UsageContext(user_id=user_id, anon_id=ctx.anon_id, job_id=ctx.job_id, source_type=ctx.source_type)
+
+    profile = _load_profile(ctx.user_id)
     profile_block = f"\nAbout the person you are analysing for:\n{profile}\n" if profile else ""
     prompt = _PROMPT.format(profile_block=profile_block, text=text)
 
     client = _get_client()
-    if _PROVIDER == "anthropic":
-        resp = client.messages.create(
-            model=_MODEL,
-            max_tokens=1024,
-            tools=[_ANTHROPIC_TOOL],
-            tool_choice={"type": "tool", "name": "record_analysis"},
-            messages=[{"role": "user", "content": prompt}],
-        )
-        for block in resp.content:
-            if getattr(block, "type", None) == "tool_use" and block.name == "record_analysis":
-                return _normalize(block.input)
-        raise RuntimeError("Anthropic did not return a record_analysis tool_use block")
-
-    resp = client.chat.completions.create(
-        model=_MODEL,
-        response_format={"type": "json_object"},
-        messages=[{"role": "user", "content": prompt + _OPENAI_JSON_SUFFIX}],
-    )
-    content = resp.choices[0].message.content or "{}"
+    started = time.monotonic()
     try:
-        raw = json.loads(content)
-    except json.JSONDecodeError as e:
-        raise RuntimeError(f"OpenAI returned non-JSON content: {e}: {content[:200]}")
-    return _normalize(raw)
+        if _PROVIDER == "anthropic":
+            resp = client.messages.create(
+                model=_MODEL,
+                max_tokens=1024,
+                tools=[_ANTHROPIC_TOOL],
+                tool_choice={"type": "tool", "name": "record_analysis"},
+                messages=[{"role": "user", "content": prompt}],
+            )
+            in_tok, out_tok = _anthropic_tokens(resp)
+            _record_usage(purpose="analyze", input_tokens=in_tok, output_tokens=out_tok,
+                          started_at=started, ctx=ctx)
+            for block in resp.content:
+                if getattr(block, "type", None) == "tool_use" and block.name == "record_analysis":
+                    return _normalize(block.input)
+            raise RuntimeError("Anthropic did not return a record_analysis tool_use block")
+
+        resp = client.chat.completions.create(
+            model=_MODEL,
+            response_format={"type": "json_object"},
+            messages=[{"role": "user", "content": prompt + _OPENAI_JSON_SUFFIX}],
+        )
+        in_tok, out_tok = _openai_tokens(resp)
+        _record_usage(purpose="analyze", input_tokens=in_tok, output_tokens=out_tok,
+                      started_at=started, ctx=ctx)
+        content = resp.choices[0].message.content or "{}"
+        try:
+            raw = json.loads(content)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"OpenAI returned non-JSON content: {e}: {content[:200]}")
+        return _normalize(raw)
+    except Exception as e:
+        # Log the failed attempt so failure rate shows up next to spend.
+        _record_usage(purpose="analyze", input_tokens=0, output_tokens=0,
+                      started_at=started, ctx=ctx, status="error", error=str(e)[:200])
+        raise
 
 
 _SUMMARY_PROMPT = """You are distilling source content into a faithful, reusable \
@@ -219,7 +312,7 @@ def _summary_output_tokens(text: str) -> int:
     return max(512, min(_SUMMARY_MAX_OUTPUT_TOKENS, approx_input_tokens // 4))
 
 
-def summarize_content(text: str) -> str:
+def summarize_content(text: str, *, ctx: UsageContext | None = None) -> str:
     """Distil source content into a faithful, length-scaled structured brief.
 
     Stored instead of the full fetched text: rich enough to re-derive verdicts
@@ -232,6 +325,7 @@ def summarize_content(text: str) -> str:
         return ""
     prompt = _SUMMARY_PROMPT.format(text=text)
     max_tokens = _summary_output_tokens(text)
+    started = time.monotonic()
     try:
         client = _get_client()
         if _PROVIDER == "anthropic":
@@ -240,6 +334,7 @@ def summarize_content(text: str) -> str:
                 max_tokens=max_tokens,
                 messages=[{"role": "user", "content": prompt}],
             )
+            in_tok, out_tok = _anthropic_tokens(resp)
             out = "".join(
                 b.text for b in resp.content if getattr(b, "type", None) == "text"
             ).strip()
@@ -249,45 +344,62 @@ def summarize_content(text: str) -> str:
                 max_tokens=max_tokens,
                 messages=[{"role": "user", "content": prompt}],
             )
+            in_tok, out_tok = _openai_tokens(resp)
             out = (resp.choices[0].message.content or "").strip()
+        _record_usage(purpose="summary", input_tokens=in_tok, output_tokens=out_tok,
+                      started_at=started, ctx=ctx)
         return out[:SUMMARY_MAX_CHARS] if out else text[:SUMMARY_MAX_CHARS]
     except Exception as e:
+        _record_usage(purpose="summary", input_tokens=0, output_tokens=0,
+                      started_at=started, ctx=ctx, status="error", error=str(e)[:200])
         logger.warning("summarize_content failed; storing truncated slice: %s", e)
         return text[:SUMMARY_MAX_CHARS]
 
 
-def analyze_image(b64: str, caption: str = "") -> str:
+def analyze_image(b64: str, caption: str = "", *, ctx: UsageContext | None = None) -> str:
     """Describe and extract key info from a base64-encoded JPEG image."""
     prompt = "Extract and describe all text and key information visible in this image."
     if caption:
         prompt += f" Context provided: {caption}"
 
     client = _get_client()
-    if _PROVIDER == "anthropic":
-        resp = client.messages.create(
+    started = time.monotonic()
+    try:
+        if _PROVIDER == "anthropic":
+            resp = client.messages.create(
+                model=_MODEL,
+                max_tokens=1024,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
+                        {"type": "text", "text": prompt},
+                    ],
+                }],
+            )
+            in_tok, out_tok = _anthropic_tokens(resp)
+            _record_usage(purpose="image", input_tokens=in_tok, output_tokens=out_tok,
+                          started_at=started, ctx=ctx)
+            return resp.content[0].text
+
+        resp = client.chat.completions.create(
             model=_MODEL,
-            max_tokens=1024,
             messages=[{
                 "role": "user",
                 "content": [
-                    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
                     {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
                 ],
             }],
         )
-        return resp.content[0].text
-
-    resp = client.chat.completions.create(
-        model=_MODEL,
-        messages=[{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
-            ],
-        }],
-    )
-    return resp.choices[0].message.content
+        in_tok, out_tok = _openai_tokens(resp)
+        _record_usage(purpose="image", input_tokens=in_tok, output_tokens=out_tok,
+                      started_at=started, ctx=ctx)
+        return resp.choices[0].message.content
+    except Exception as e:
+        _record_usage(purpose="image", input_tokens=0, output_tokens=0,
+                      started_at=started, ctx=ctx, status="error", error=str(e)[:200])
+        raise
 
 
 # ---------------------------------------------------------------------------

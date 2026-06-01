@@ -103,7 +103,36 @@ _CREATE_INDEXES_SQL = [
     "CREATE INDEX IF NOT EXISTS idx_feedback_user ON feedback(user_id, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_feedback_item ON feedback(item_id)",
     "CREATE INDEX IF NOT EXISTS idx_jobs_updated_at ON jobs(updated_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_llm_calls_ts ON llm_calls(ts DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_llm_calls_user ON llm_calls(user_id, ts DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_llm_calls_anon ON llm_calls(anon_id, ts DESC)",
 ]
+
+# Per-call LLM usage log. One row per upstream API call (analyze, summary,
+# image). `user_id` is NULL for anonymous /api/try; `anon_id` carries the
+# Worker's anon UUID so anon spend can be grouped per visitor and joined back
+# to D1's `anon_summaries` if needed. `source_type` is denormalised so a
+# "tokens by source_type" tile is one query without joining items. `status`
+# distinguishes successful calls from failed ones so failure rate and spend
+# share the same table.
+_CREATE_LLM_CALLS_SQL = """\
+CREATE TABLE IF NOT EXISTS llm_calls (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts            TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S', 'now')),
+    user_id       INTEGER,
+    anon_id       TEXT,
+    job_id        TEXT,
+    provider      TEXT    NOT NULL DEFAULT '',
+    model         TEXT    NOT NULL DEFAULT '',
+    purpose       TEXT    NOT NULL DEFAULT '',
+    source_type   TEXT    NOT NULL DEFAULT '',
+    input_tokens  INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    cost_usd      REAL    NOT NULL DEFAULT 0,
+    latency_ms    INTEGER NOT NULL DEFAULT 0,
+    status        TEXT    NOT NULL DEFAULT 'ok',
+    error         TEXT    NOT NULL DEFAULT ''
+)"""
 
 # Short-lived job records for the async analysis flow. The Worker starts a job
 # and returns immediately; the browser polls until status → 'done' or 'error'.
@@ -215,6 +244,7 @@ def _init() -> None:
         conn.execute(_CREATE_ERROR_LOG_SQL)
         conn.execute(_CREATE_FEEDBACK_SQL)
         conn.execute(_CREATE_JOBS_SQL)
+        conn.execute(_CREATE_LLM_CALLS_SQL)
         for stmt in _CREATE_INDEXES_SQL:
             conn.execute(stmt)
 
@@ -608,6 +638,47 @@ def get_job_record(job_id: str) -> sqlite3.Row | None:
             "SELECT id, status, result, error FROM jobs WHERE id = ?",
             (job_id,),
         ).fetchone()
+
+
+# ---------------------------------------------------------------------------
+# LLM usage log
+# ---------------------------------------------------------------------------
+
+def insert_llm_call(
+    *,
+    provider: str,
+    model: str,
+    purpose: str,
+    input_tokens: int,
+    output_tokens: int,
+    cost_usd: float,
+    latency_ms: int,
+    status: str = "ok",
+    error: str = "",
+    user_id: int | None = None,
+    anon_id: str | None = None,
+    job_id: str | None = None,
+    source_type: str = "",
+) -> None:
+    """Record one upstream LLM call. Never raises into the caller — usage
+    logging is best-effort; failing to log must not break the analysis path."""
+    try:
+        with _get_conn() as conn:
+            conn.execute(
+                "INSERT INTO llm_calls (user_id, anon_id, job_id, provider, "
+                "model, purpose, source_type, input_tokens, output_tokens, "
+                "cost_usd, latency_ms, status, error) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    user_id, anon_id, job_id, provider, model, purpose,
+                    source_type, int(input_tokens), int(output_tokens),
+                    float(cost_usd), int(latency_ms), status, error,
+                ),
+            )
+    except Exception:
+        # Surface in logs but never propagate — see docstring.
+        import logging as _logging
+        _logging.getLogger(__name__).exception("insert_llm_call failed")
 
 
 # ---------------------------------------------------------------------------
