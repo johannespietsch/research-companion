@@ -671,11 +671,15 @@ async def _run_job(
             )
 
         verdict = analysis.pop("verdict", "skim")
+        # `content` is the full stored brief, exposed so the result page can
+        # show the basis for the verdict. `content_preview` is kept for the
+        # Worker's D1 claim path, which stays on a 2k slice to bound row size.
         result: dict = {
             "url": url,
             "title": fetched.get("title") or url,
             "source_type": source_type,
             "image_urls": fetched.get("image_urls") or [],
+            "content": summary,
             "content_preview": summary[:TRY_PREVIEW_CHARS],
             "verdict": verdict,
             "analysis": analysis,

@@ -394,6 +394,21 @@ class TestJobFlow:
         assert "id" not in result
         assert db.get_all_items() == []
 
+    def test_run_job_done_payload_exposes_full_summary(self, client, db):
+        # The result page renders the full stored brief in a "what we read"
+        # disclosure, so the done payload must carry `content` alongside the
+        # short `content_preview` used by the Worker's D1 claim path.
+        import asyncio
+        import json
+        import bot.api
+
+        db.create_job("job-content")
+        asyncio.run(bot.api._run_job("job-content", "https://example.com/x", None, ""))
+
+        result = json.loads(db.get_job_record("job-content")["result"])
+        assert result["content"] == "Neutral summary of the content."
+        assert result["content_preview"] == "Neutral summary of the content."
+
     def test_run_job_analyzes_the_summary_not_raw_text(self, client, db, monkeypatch):
         # The verdict must be derived from the stored summary, not the raw
         # fetched text (the canonical-representation contract).
