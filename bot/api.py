@@ -15,7 +15,7 @@ from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Uploa
 from fastapi.responses import FileResponse as FastAPIFileResponse
 from pydantic import BaseModel
 
-from bot.analyzer import analyze, analyze_image, summarize_content, to_json_str, to_plain_text
+from bot.analyzer import UsageContext, analyze, analyze_image, summarize_content, to_json_str, to_plain_text
 from bot.auth import require_token
 from bot.config import MAX_CONTENT_CHARS
 from bot.fetch_errors import user_message as fetch_error_message
@@ -113,7 +113,7 @@ async def submit_text(
     user_note: str = Form(""),
     user_id: int = Depends(require_token),
 ):
-    analysis = analyze(text, user_id)
+    analysis = analyze(text, ctx=UsageContext(user_id=user_id, source_type="note"))
     save_item(user_id, "note", "", text, to_json_str(analysis), user_note)
     return {"analysis": to_plain_text(analysis), "analysis_data": analysis}
 
@@ -130,9 +130,11 @@ async def submit_url(
             status_code=422,
             detail=fetch_error_message(fetched.get("reason"), url),
         )
-    analysis = analyze(fetched["text"], user_id)
+    source_type = fetched.get("source_type") or "article"
+    ctx = UsageContext(user_id=user_id, source_type=source_type)
+    analysis = analyze(fetched["text"], ctx=ctx)
     # Store a condensed summary, not a full copy of the fetched content.
-    save_item(user_id, "url", url, summarize_content(fetched["text"]), to_json_str(analysis), user_note)
+    save_item(user_id, "url", url, summarize_content(fetched["text"], ctx=ctx), to_json_str(analysis), user_note)
     return {"analysis": to_plain_text(analysis), "analysis_data": analysis}
 
 
@@ -161,7 +163,7 @@ async def submit_file(
     elif mime.startswith("image/"):
         stored_file_path = save_file(data, suffix)
         b64 = base64.b64encode(data).decode()
-        text = analyze_image(b64, user_note)
+        text = analyze_image(b64, user_note, ctx=UsageContext(user_id=user_id, source_type="photo"))
         source_type = "photo"
     elif mime.startswith("audio/") or suffix in (".ogg", ".mp3", ".m4a", ".wav", ".flac"):
         stored_file_path = save_file(data, suffix)
@@ -179,7 +181,7 @@ async def submit_file(
     if not text or not text.strip():
         raise HTTPException(status_code=422, detail="Could not extract text from file")
 
-    analysis = analyze(text, user_id)
+    analysis = analyze(text, ctx=UsageContext(user_id=user_id, source_type=source_type))
     save_item(user_id, source_type, name, text, to_json_str(analysis), user_note, file_path=stored_file_path)
     return {"analysis": to_plain_text(analysis), "analysis_data": analysis}
 
@@ -208,6 +210,10 @@ async def set_profile_endpoint(
 
 class TryRequest(BaseModel):
     url: str
+    # Optional: the Worker's anon UUID, used purely for usage attribution so we
+    # can group anon LLM spend per visitor in the admin dashboard. Server keeps
+    # accepting requests without it during the rollout.
+    anon_id: str | None = None
 
 
 def _require_try_secret(x_filter_fyi_secret: str | None = Header(default=None)) -> None:
@@ -271,8 +277,9 @@ async def try_url(req: TryRequest, _: None = Depends(_require_try_secret)):
             },
         )
 
+    ctx = UsageContext(anon_id=req.anon_id, source_type=source_type)
     try:
-        analysis = analyze(text, user_id=None)
+        analysis = analyze(text, ctx=ctx)
     except Exception as e:
         logger.exception("analyze crashed for %s: %s", url, e)
         raise HTTPException(status_code=502, detail={"error": "analyze-failed"})
@@ -283,7 +290,7 @@ async def try_url(req: TryRequest, _: None = Depends(_require_try_secret)):
 
     # The Worker stores content_preview in D1 (for claim-on-signup), so send the
     # condensed summary rather than a verbatim slice of the source.
-    summary = summarize_content(text)
+    summary = summarize_content(text, ctx=ctx)
 
     return {
         "url": url,
@@ -478,8 +485,9 @@ async def library_add(req: _LibraryAddRequest, _: None = Depends(_require_try_se
             },
         )
 
+    ctx = UsageContext(user_id=req.user_id, source_type=source_type)
     try:
-        analysis = analyze(text, user_id=req.user_id)
+        analysis = analyze(text, ctx=ctx)
     except Exception as e:
         logger.exception("analyze crashed for %s: %s", url, e)
         raise HTTPException(status_code=502, detail={"error": "analyze-failed"})
@@ -488,7 +496,7 @@ async def library_add(req: _LibraryAddRequest, _: None = Depends(_require_try_se
     # a full copy of the fetched third-party content. The full text stays in
     # memory only for this request; the summary is enough to re-derive verdicts
     # later under a different profile.
-    summary = summarize_content(text)
+    summary = summarize_content(text, ctx=ctx)
 
     save_item(
         user_id=req.user_id,
@@ -574,6 +582,9 @@ class _JobRequest(BaseModel):
     url: str
     user_id: int | None = None
     user_note: str = ""
+    # Optional anon UUID from the Worker (anon /api/job traffic). Same purpose
+    # as TryRequest.anon_id: per-visitor usage attribution only.
+    anon_id: str | None = None
 
 
 @router.post("/job", status_code=202)
@@ -592,14 +603,20 @@ async def start_job(req: _JobRequest, _: None = Depends(_require_try_secret)):
     job_id = str(uuid.uuid4())
     create_job(job_id)
 
-    task = asyncio.create_task(_run_job(job_id, url, req.user_id, req.user_note))
+    task = asyncio.create_task(_run_job(job_id, url, req.user_id, req.user_note, req.anon_id))
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
 
     return {"job_id": job_id}
 
 
-async def _run_job(job_id: str, url: str, user_id: int | None, user_note: str) -> None:
+async def _run_job(
+    job_id: str,
+    url: str,
+    user_id: int | None,
+    user_note: str,
+    anon_id: str | None = None,
+) -> None:
     """Background task: fetch → summarize → analyze(summary) → optionally save."""
     try:
         _job_steps[job_id] = "fetching"
@@ -621,19 +638,22 @@ async def _run_job(job_id: str, url: str, user_id: int | None, user_note: str) -
             return
 
         loop = asyncio.get_running_loop()
+        ctx = UsageContext(
+            user_id=user_id, anon_id=anon_id, job_id=job_id, source_type=source_type
+        )
 
         # Summarise first — the summary is the canonical stored representation
         # and the basis for the analysis verdict.
         _job_steps[job_id] = "summarizing"
         try:
-            summary = await loop.run_in_executor(None, lambda: summarize_content(text))
+            summary = await loop.run_in_executor(None, lambda: summarize_content(text, ctx=ctx))
         except Exception:
             logger.exception("job %s: summarize_content crashed", job_id)
             summary = text[:TRY_PREVIEW_CHARS]
 
         _job_steps[job_id] = "analyzing"
         try:
-            analysis = await loop.run_in_executor(None, lambda: analyze(summary, user_id))
+            analysis = await loop.run_in_executor(None, lambda: analyze(summary, ctx=ctx))
         except Exception:
             logger.exception("job %s: analyze crashed", job_id)
             set_job_error(job_id, "analyze-failed")

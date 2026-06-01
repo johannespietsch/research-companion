@@ -57,7 +57,7 @@ def client(monkeypatch):
             "image_urls": [],
         }
 
-    def fake_analyze(text, user_id=None):
+    def fake_analyze(text, user_id=None, **_kwargs):
         return {
             "main_idea": "RAG = retrieval-augmented generation.",
             "why_it_matters": "Practical AI pattern.",
@@ -68,7 +68,7 @@ def client(monkeypatch):
             "verdict": "watch",
         }
 
-    def fake_summarize_content(text):
+    def fake_summarize_content(text, **_kwargs):
         return "Neutral summary of the content."
 
     monkeypatch.setattr(bot.api, "fetch_url", fake_fetch_url)

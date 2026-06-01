@@ -402,7 +402,7 @@ class TestJobFlow:
 
         captured = {}
 
-        def capture_analyze(text, user_id=None):
+        def capture_analyze(text, user_id=None, **_kwargs):
             captured["text"] = text
             return {
                 "main_idea": "x", "why_it_matters": "y", "category": "c",
