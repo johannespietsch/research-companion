@@ -301,6 +301,25 @@ def _try_cache_set(cache_key: str, purpose: str, payload: str) -> None:
         logger.exception("llm_cache write failed; result not cached")
 
 
+def _record_cache_hit(*, purpose: str, ctx: UsageContext | None) -> None:
+    """Log one cache hit to `llm_cache_hits` with an estimated cost-saved
+    figure pulled from recent successful upstream calls of the same purpose.
+    Best-effort: a failure here must never break the analyse path."""
+    try:
+        from bot.db import estimate_avg_cost_per_call, record_cache_hit
+        c = ctx or UsageContext()
+        avg = estimate_avg_cost_per_call(purpose)
+        record_cache_hit(
+            purpose=purpose,
+            user_id=c.user_id,
+            anon_id=c.anon_id,
+            source_type=c.source_type,
+            cost_saved_usd=avg,
+        )
+    except Exception:
+        logger.exception("record_cache_hit failed; hit not logged")
+
+
 def analyze(text: str, user_id: int | None = None, *, ctx: UsageContext | None = None) -> dict:
     """Returns a dict with keys: main_idea, why_it_matters, category, quick_win, bigger_play, time_required, verdict."""
     # Back-compat: callers that still pass `user_id` positionally get it merged
@@ -323,6 +342,7 @@ def analyze(text: str, user_id: int | None = None, *, ctx: UsageContext | None =
             result = json.loads(cached)
             if isinstance(result, dict) and all(k in result for k in ANALYSIS_FIELDS):
                 logger.info("analyze cache hit (key=%s...)", cache_key[:12])
+                _record_cache_hit(purpose="analyze", ctx=ctx)
                 return result
         except json.JSONDecodeError:
             # Cache row was corrupt — fall through and overwrite below.
@@ -433,6 +453,7 @@ def summarize_content(text: str, *, ctx: UsageContext | None = None) -> str:
     cached = _try_cache_get(cache_key)
     if cached is not None:
         logger.info("summary cache hit (key=%s...)", cache_key[:12])
+        _record_cache_hit(purpose="summary", ctx=ctx)
         return cached[:SUMMARY_MAX_CHARS]
 
     prompt = _SUMMARY_PROMPT.format(text=text)

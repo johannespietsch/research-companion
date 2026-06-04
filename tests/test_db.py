@@ -354,6 +354,7 @@ class TestPruneMaintenance:
 
         # Old + new processed_updates rows — old should prune (past 24h).
         # Old + new llm_cache rows — old should prune (past 30d TTL).
+        # Old + new llm_cache_hits rows — old should prune (past 30d TTL).
         with db._get_conn() as conn:
             conn.execute("INSERT INTO processed_updates (update_id, ts) VALUES (1, ?)", (OLD,))
             conn.execute("INSERT INTO processed_updates (update_id, ts) VALUES (2, ?)", (NEW,))
@@ -365,11 +366,17 @@ class TestPruneMaintenance:
                 "INSERT INTO llm_cache (cache_key, purpose, payload, created_at) VALUES ('k_new', 'analyze', '{}', ?)",
                 (NEW,),
             )
+            conn.execute(
+                "INSERT INTO llm_cache_hits (ts, purpose) VALUES (?, 'analyze')", (OLD,),
+            )
+            conn.execute(
+                "INSERT INTO llm_cache_hits (ts, purpose) VALUES (?, 'analyze')", (NEW,),
+            )
 
         counts = db.prune_maintenance(now=datetime(2026, 5, 20, tzinfo=timezone.utc))
         assert counts == {
             "error_log": 1, "url_cache": 1, "link_codes": 1, "jobs": 1,
-            "processed_updates": 1, "llm_cache": 1,
+            "processed_updates": 1, "llm_cache": 1, "llm_cache_hits": 1,
         }
 
         with db._get_conn() as conn:
@@ -379,6 +386,7 @@ class TestPruneMaintenance:
             assert {r["id"] for r in conn.execute("SELECT id FROM jobs")} == {"old-pending", "new-done"}
             assert [r["update_id"] for r in conn.execute("SELECT update_id FROM processed_updates")] == [2]
             assert [r["cache_key"] for r in conn.execute("SELECT cache_key FROM llm_cache")] == ["k_new"]
+            assert conn.execute("SELECT COUNT(*) AS n FROM llm_cache_hits").fetchone()["n"] == 1
 
     def test_idempotent_on_empty(self, db):
         from datetime import datetime, timezone
@@ -386,7 +394,7 @@ class TestPruneMaintenance:
         counts = db.prune_maintenance(now=datetime(2026, 5, 20, tzinfo=timezone.utc))
         assert counts == {
             "error_log": 0, "url_cache": 0, "link_codes": 0, "jobs": 0,
-            "processed_updates": 0, "llm_cache": 0,
+            "processed_updates": 0, "llm_cache": 0, "llm_cache_hits": 0,
         }
 
 
@@ -437,3 +445,56 @@ class TestLlmCache:
         db.set_cached_llm_result("k", "analyze", "v1")
         db.set_cached_llm_result("k", "analyze", "v2")
         assert db.get_cached_llm_result("k") == "v2"
+
+
+class TestCacheHitTracking:
+    """`record_cache_hit` and `estimate_avg_cost_per_call` back the dashboard's
+    "calls saved / cost avoided" tile."""
+
+    def test_record_cache_hit_writes_row(self, db):
+        db.record_cache_hit(
+            purpose="analyze", user_id=7, source_type="article",
+            cost_saved_usd=0.0006,
+        )
+        with db._get_conn() as conn:
+            rows = conn.execute("SELECT * FROM llm_cache_hits ORDER BY id").fetchall()
+        assert len(rows) == 1
+        r = rows[0]
+        assert r["purpose"] == "analyze"
+        assert r["user_id"] == 7
+        assert r["anon_id"] is None
+        assert r["source_type"] == "article"
+        assert abs(r["cost_saved_usd"] - 0.0006) < 1e-9
+        assert r["ts"]  # default-stamped
+
+    def test_record_cache_hit_failure_does_not_raise(self, db, monkeypatch):
+        # A DB blip on the hit-log path must NOT break the analyse path.
+        def boom(*_a, **_kw):
+            raise RuntimeError("disk gone")
+        monkeypatch.setattr(db, "_get_conn", boom)
+        db.record_cache_hit(purpose="analyze")  # should NOT raise
+
+    def test_estimate_avg_cost_uses_successful_calls_only(self, db):
+        # Two successful calls + one error row. The error has 0 cost and would
+        # drag the average down if we didn't filter it out.
+        db.insert_llm_call(
+            provider="anthropic", model="claude-haiku-4-5-20251001",
+            purpose="analyze", input_tokens=100, output_tokens=50,
+            cost_usd=0.001, latency_ms=400,
+        )
+        db.insert_llm_call(
+            provider="anthropic", model="claude-haiku-4-5-20251001",
+            purpose="analyze", input_tokens=100, output_tokens=50,
+            cost_usd=0.003, latency_ms=400,
+        )
+        db.insert_llm_call(
+            provider="anthropic", model="claude-haiku-4-5-20251001",
+            purpose="analyze", input_tokens=0, output_tokens=0,
+            cost_usd=0.0, latency_ms=10, status="error",
+        )
+        avg = db.estimate_avg_cost_per_call("analyze")
+        # (0.001 + 0.003) / 2 = 0.002 — error row excluded.
+        assert abs(avg - 0.002) < 1e-9
+
+    def test_estimate_avg_cost_falls_back_to_zero_with_no_data(self, db):
+        assert db.estimate_avg_cost_per_call("analyze") == 0.0

@@ -73,9 +73,122 @@ fly volumes list           # check % used
 | Var | Purpose |
 | --- | --- |
 | `FILTER_FYI_TRY_SECRET` | Shared secret with the Cloudflare Worker (must match) |
+| `FILTER_FYI_ADMIN_SECRET` | Shared secret for `/api/admin/*` — must match the Worker's `BOT_ADMIN_KEY`. Separate from `FILTER_FYI_TRY_SECRET` so the two can rotate independently |
 | `TELEGRAM_TOKEN` | Telegram bot token (omit to run web-only) |
 | `WEBHOOK_URL` | Public base URL for Telegram webhook mode |
 | `TELEGRAM_WEBHOOK_SECRET` | Required in webhook mode — verifies inbound updates |
 | `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` | LLM provider (Anthropic preferred) |
 | `LITESTREAM_REPLICA_URL` (+ keys) | Enables continuous backup (optional but recommended) |
 | `SCAN_ERRORS_ENABLED`, `GH_APP_*` | Daily error-log → GitHub-issue scanner |
+
+## Runbook — Fly is wedged / dashboard unreachable
+
+**Symptoms**
+
+- `admin.filter.fyi/cost` shows `upstream unreachable`.
+- `curl -i https://filter-fyi-backend.fly.dev/health` returns `503` from `server: Fly/...` (Fly's edge proxy) after a long delay (~30s).
+- `fly status -a filter-fyi-backend` says machines are `started`, but the dashboard is dark.
+
+The "machine started but app unresponsive" signature usually means the
+uvicorn worker slots are blocked — the configured `hard_limit` of 40
+concurrent requests in `fly.toml` is being soaked by long-running handlers,
+including `/health`.
+
+**Most common cause:** a Telegram retry storm. A handler chain (typically
+video transcribe → summarise → analyse) takes longer than Telegram's ~60s
+webhook timeout. Without the dedup + fire-and-forget in #34/#35, the same
+update gets retried in parallel, each retry spawning another handler
+chain, until every worker slot is held by a copy of the same work. After
+those PRs landed this should not recur, but it remains the diagnostic to
+rule out first.
+
+**1. Diagnose**
+
+```sh
+fly logs -a filter-fyi-backend | tail -50         # what is the app doing?
+fly checks list -a filter-fyi-backend             # consecutive /health failures?
+fly machine status <id> -a filter-fyi-backend     # OOM kills? restarts?
+
+# Has Telegram been retrying?
+TOKEN=$(fly ssh console -a filter-fyi-backend -C "printenv TELEGRAM_TOKEN")
+curl -sS "https://api.telegram.org/bot$TOKEN/getWebhookInfo" | jq '.result | {pending_update_count, last_error_message, last_error_date}'
+```
+
+A non-zero `pending_update_count` + a recent `last_error_date` is the
+smoking gun for the retry storm pattern.
+
+**2. Stop the bleed** (only needed if retries are still firing — i.e.
+`pending_update_count > 0`)
+
+```sh
+# Drops queued Telegram updates so they don't all replay against the new
+# code on restart.
+curl -sS "https://api.telegram.org/bot$TOKEN/deleteWebhook?drop_pending_updates=true"
+```
+
+**3. Restart the machine**
+
+Even after stopping new traffic, any handlers already mid-flight keep
+running until they finish. Restarting cleanly kills them.
+
+```sh
+fly machine list -a filter-fyi-backend
+fly machine restart <id> -a filter-fyi-backend
+sleep 30
+time curl -i https://filter-fyi-backend.fly.dev/health
+# Expect 200 in <200ms.
+```
+
+**4. Re-enable the Telegram webhook**
+
+If you ran step 2, the bot is offline until you re-register the webhook:
+
+```sh
+SECRET=$(fly ssh console -a filter-fyi-backend -C "printenv TELEGRAM_WEBHOOK_SECRET")
+curl -sS -X POST "https://api.telegram.org/bot$TOKEN/setWebhook" \
+  -d "url=https://filter-fyi-backend.fly.dev/webhook" \
+  -d "secret_token=$SECRET"
+curl -sS "https://api.telegram.org/bot$TOKEN/getWebhookInfo" | jq
+```
+
+**5. Quantify the damage**
+
+The runaway spent real tokens. The admin dashboard's Cost tile shows
+the day-level spike clearly; for an exact number:
+
+```sh
+fly ssh console -a filter-fyi-backend -C "sqlite3 /data/research.db \"\
+  SELECT date(ts) day, COUNT(*) calls, printf('\$%.4f', SUM(cost_usd)) spent \
+  FROM llm_calls \
+  WHERE ts >= datetime('now', '-2 days') \
+  GROUP BY day ORDER BY day\""
+```
+
+**6. Post-mortem checklist**
+
+- Was there a recently merged change touching webhook routing, the handler
+  chain, or `process_update`?
+- Did a specific input (a long video, a YouTube livestream) trigger it?
+- If yes, the input is probably worth adding to a fixture / fixture-like
+  manual test next time the relevant code changes.
+
+## Duplicate work — three layers of defense
+
+If you see "the same content was processed N times" — for any reason —
+walk these three caches/dedup layers in order. Each lives at a different
+level, so the right diagnosis depends on *which* dimension is duplicated:
+
+| Symptom | Layer | Where to look |
+| --- | --- | --- |
+| Same Telegram `update_id` arriving twice | `processed_updates` | `getWebhookInfo.pending_update_count`; Fly logs for `dropping duplicate webhook` |
+| Same `(model, prompt, profile, content)` analysed twice | `llm_cache` | `SELECT COUNT(*) FROM llm_cache`; Fly logs for `cache hit (key=…)` |
+| Same URL being re-fetched | `url_cache` | `SELECT url, fetched_at FROM url_cache WHERE url = ?` |
+
+Cache hits and dedup drops are best-effort: a DB blip on the cache path
+falls through to real work. None of them are correctness-critical — they
+exist to make the same input cheap, not to prevent it.
+
+The admin dashboard's Cost tile surfaces cache hit count, estimated cost
+saved, and hit rate, so a quick check at `admin.filter.fyi/cost` is
+usually the fastest way to spot a missing-cache regression after a
+prompt/model change.

@@ -94,7 +94,13 @@ def cost_overview(days: int) -> dict:
               {"kind": "signed_in", "calls", "cost_usd", "unique_actors"},
               {"kind": "anon",      "calls", "cost_usd", "unique_actors"}
           ],
-          "top_users": [{user_id, calls, cost_usd}, ...]
+          "top_users": [{user_id, calls, cost_usd}, ...],
+          "cache": {
+            "hits": int,
+            "cost_saved_usd": float,   # sum of estimated savings on hits
+            "hit_rate": float,         # 0..1 over (hits + cacheable upstream)
+            "by_purpose": [{purpose, hits, cost_saved_usd}, ...]
+          }
         }
     """
     since = _since_iso(days)
@@ -226,9 +232,50 @@ def cost_overview(days: int) -> dict:
             (since, _TOP_USERS_LIMIT),
         ).fetchall()
 
+        # Cache hits: total + per-purpose breakdown + estimated savings.
+        # "Saved" is the sum of cost_saved_usd stamped at hit time (which
+        # itself was the trailing 7-day average cost-per-call of that
+        # purpose). Honest if pricing/usage have been stable; conservative
+        # if the recent average was below the actual cost of THIS specific
+        # input. Either way it's the right order of magnitude.
+        cache_row = conn.execute(
+            """
+            SELECT
+                COUNT(*)                              AS hits,
+                COALESCE(SUM(cost_saved_usd), 0)      AS cost_saved_usd
+            FROM llm_cache_hits
+            WHERE ts >= ?
+            """,
+            (since,),
+        ).fetchone()
+        cache_by_purpose_rows = conn.execute(
+            """
+            SELECT
+                purpose,
+                COUNT(*)                              AS hits,
+                COALESCE(SUM(cost_saved_usd), 0)      AS cost_saved_usd
+            FROM llm_cache_hits
+            WHERE ts >= ?
+            GROUP BY purpose
+            ORDER BY hits DESC
+            """,
+            (since,),
+        ).fetchall()
+
     total_calls = kpi_row["total_calls"] or 0
     errors = kpi_row["errors"] or 0
     error_rate = (errors / total_calls) if total_calls > 0 else 0.0
+
+    hits_total = cache_row["hits"] or 0
+    cost_saved = cache_row["cost_saved_usd"] or 0.0
+    # Hit rate = hits / (hits + upstream-calls). Upstream-calls here counts
+    # only `purpose IN ('analyze', 'summary')` to keep the dimension honest
+    # (image and other purposes don't run through the cache yet).
+    cacheable_calls = sum(
+        r["calls"] for r in purpose_rows if r["purpose"] in ("analyze", "summary")
+    )
+    hit_rate_denom = hits_total + cacheable_calls
+    hit_rate = (hits_total / hit_rate_denom) if hit_rate_denom > 0 else 0.0
 
     return {
         "range_days": days,
@@ -283,6 +330,19 @@ def cost_overview(days: int) -> dict:
             }
             for r in top_user_rows
         ],
+        "cache": {
+            "hits": hits_total,
+            "cost_saved_usd": round(cost_saved, 6),
+            "hit_rate": round(hit_rate, 4),
+            "by_purpose": [
+                {
+                    "purpose": r["purpose"],
+                    "hits": r["hits"],
+                    "cost_saved_usd": round(r["cost_saved_usd"], 6),
+                }
+                for r in cache_by_purpose_rows
+            ],
+        },
     }
 
 

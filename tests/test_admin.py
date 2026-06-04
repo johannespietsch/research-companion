@@ -252,6 +252,45 @@ class TestCostOverviewWithData:
         assert all(t["user_id"] != "anon-xyz" for t in top)
 
 
+class TestCacheStats:
+    """The /api/admin/cost-overview response carries a `cache` block with hit
+    counts and estimated savings — the data behind the dashboard's cache tile."""
+
+    def test_empty_cache_block_when_no_hits(self, admin_client, admin_headers):
+        body = admin_client.get(
+            "/api/admin/cost-overview", headers=admin_headers
+        ).json()
+        assert body["cache"] == {
+            "hits": 0,
+            "cost_saved_usd": 0.0,
+            "hit_rate": 0.0,
+            "by_purpose": [],
+        }
+
+    def test_hits_aggregated_with_estimated_savings(
+        self, db, admin_client, admin_headers
+    ):
+        # Two analyze hits (saving $0.002 each) + one summary hit ($0.01).
+        db.record_cache_hit(purpose="analyze", cost_saved_usd=0.002)
+        db.record_cache_hit(purpose="analyze", cost_saved_usd=0.002)
+        db.record_cache_hit(purpose="summary", cost_saved_usd=0.010)
+        # Plus one real upstream analyze (so hit_rate has a denominator).
+        _stamp(db, purpose="analyze")
+
+        body = admin_client.get(
+            "/api/admin/cost-overview", headers=admin_headers
+        ).json()
+        cache = body["cache"]
+        assert cache["hits"] == 3
+        assert abs(cache["cost_saved_usd"] - 0.014) < 1e-9
+        # hit_rate = 3 hits / (3 hits + 1 cacheable real call) = 0.75
+        assert cache["hit_rate"] == 0.75
+        by = {row["purpose"]: row for row in cache["by_purpose"]}
+        assert by["analyze"]["hits"] == 2
+        assert by["summary"]["hits"] == 1
+        assert abs(by["analyze"]["cost_saved_usd"] - 0.004) < 1e-9
+
+
 class TestRangeFiltering:
     def test_rows_older_than_window_excluded(
         self, db, admin_client, admin_headers

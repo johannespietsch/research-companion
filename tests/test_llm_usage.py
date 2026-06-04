@@ -176,6 +176,16 @@ class TestResultCache:
         assert first == second
         rows = _all_llm_calls(db)
         assert len(rows) == 1, f"expected 1 LLM call after cache hit, got {len(rows)}"
+        # The hit was logged with the second ctx's attribution.
+        with db._get_conn() as conn:
+            hits = conn.execute("SELECT * FROM llm_cache_hits").fetchall()
+        assert len(hits) == 1
+        assert hits[0]["purpose"] == "analyze"
+        assert hits[0]["user_id"] == 1
+        assert hits[0]["source_type"] == "article"
+        # cost_saved is estimate_avg_cost_per_call("analyze") at hit time —
+        # 100 input @ $1/MTok + 50 output @ $5/MTok = 0.00035.
+        assert abs(hits[0]["cost_saved_usd"] - 0.00035) < 1e-9
 
     def test_analyze_invalidated_by_profile_change(self, db, monkeypatch):
         """Same text but different profile → different cache key → real call."""
@@ -217,6 +227,11 @@ class TestResultCache:
         assert first == second == "A summary."
         rows = _all_llm_calls(db)
         assert len(rows) == 1, f"expected 1 LLM call after cache hit, got {len(rows)}"
+        with db._get_conn() as conn:
+            hits = conn.execute(
+                "SELECT purpose FROM llm_cache_hits"
+            ).fetchall()
+        assert [h["purpose"] for h in hits] == ["summary"]
 
     def test_summary_fallback_is_not_cached(self, db, monkeypatch):
         """If the LLM call raises, summarize_content returns a truncated slice
