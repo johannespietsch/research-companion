@@ -3,39 +3,19 @@ import logging
 import tempfile
 from pathlib import Path
 
-import httpx
 from telegram import Update
 from telegram.ext import ContextTypes
 
-from bot.analyzer import analyze, analyze_image, summarize_content, to_json_str
+from bot.analyzer import UsageContext, analyze, analyze_image, to_json_str
 from bot.config import MAX_CONTENT_CHARS
 from bot.db import get_or_create_user_by_telegram, save_item
 from bot.fetch_errors import user_message as fetch_error_message
-from bot.fetcher import fetch_url
 from bot.formatting import format_analysis
+from bot.pipeline import PipelineError, analyze_url
 from bot.storage import save_file_from_path
 from bot.transcriber import transcribe
 
 logger = logging.getLogger(__name__)
-
-
-async def _describe_images(image_urls: list[str]) -> str:
-    """Download each image URL and return a combined description string."""
-    descriptions = []
-    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
-        for url in image_urls:
-            try:
-                resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
-                resp.raise_for_status()
-                b64 = base64.b64encode(resp.content).decode()
-                desc = analyze_image(b64)
-                descriptions.append(desc)
-            except Exception:
-                logger.exception(f"Failed to analyse image {url}")
-    if not descriptions:
-        return ""
-    joined = "\n\n".join(f"[Image {i+1}]: {d}" for i, d in enumerate(descriptions))
-    return f"\n\nIMAGE DESCRIPTIONS:\n{joined}"
 
 
 async def _analyze_and_reply(
@@ -94,23 +74,18 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         user_note = " ".join(user_note.split()).strip()
 
         for url in urls:
-            await message.reply_text(f"Fetching {url} ...")
-            fetched = await fetch_url(url)
-            if not fetched["text"].strip():
-                await message.reply_text(fetch_error_message(fetched.get("reason"), url))
+            await message.reply_text(f"Fetching and analysing {url} ...")
+            try:
+                result = await analyze_url(
+                    url,
+                    ctx=UsageContext(user_id=user_id),
+                    save_for_user_id=user_id,
+                    user_note=user_note,
+                )
+            except PipelineError as e:
+                await message.reply_text(fetch_error_message(e.fetched.get("reason"), url))
                 continue
-            await message.reply_text("Analyzing...")
-            text = fetched["text"]
-            image_urls = fetched.get("image_urls") or []
-            if image_urls:
-                text += await _describe_images(image_urls)
-            await _analyze_and_reply(
-                update, user_id, text,
-                source_type="url", source=url, user_note=user_note,
-                file_path=fetched.get("file_path", ""),
-                # Store only a condensed summary of fetched third-party content.
-                store_content=summarize_content(text),
-            )
+            await message.reply_text(format_analysis(result.analysis), parse_mode="HTML")
     else:
         await message.reply_text("Analyzing...")
         await _analyze_and_reply(update, user_id, text, source_type="note")

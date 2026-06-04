@@ -15,7 +15,15 @@ from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Uploa
 from fastapi.responses import FileResponse as FastAPIFileResponse
 from pydantic import BaseModel
 
-from bot.analyzer import UsageContext, analyze, analyze_image, summarize_content, to_json_str, to_plain_text
+from bot.analyzer import UsageContext, analyze, analyze_image, to_json_str, to_plain_text
+from bot.pipeline import (
+    ERR_ANALYZE_FAILED,
+    ERR_FETCH_FAILED,
+    ERR_NO_TEXT,
+    ERR_NO_TRANSCRIPT,
+    PipelineError,
+    analyze_url,
+)
 from bot.auth import require_token
 from bot.config import MAX_CONTENT_CHARS
 from bot.fetch_errors import user_message as fetch_error_message
@@ -39,7 +47,6 @@ from bot.db import (
     set_user_profile,
     upsert_user_by_email,
 )
-from bot.fetcher import fetch_url
 from bot.storage import full_path, save_file
 from bot.transcriber import transcribe
 
@@ -60,12 +67,6 @@ _job_steps: dict[str, str] = {}
 # giving the UI something to render. The full extracted text only ever exists
 # in-memory on this request.
 TRY_PREVIEW_CHARS = 2000
-
-# Source types where empty extracted text means "no transcript available"
-# rather than a generic extraction failure. Worker maps this to a friendly
-# "video transcripts coming with the full product" notice.
-_VIDEO_SOURCE_TYPES = {"youtube", "video"}
-
 
 # ---------------------------------------------------------------------------
 # Knowledge base
@@ -124,18 +125,16 @@ async def submit_url(
     user_note: str = Form(""),
     user_id: int = Depends(require_token),
 ):
-    fetched = await fetch_url(url)
-    if not fetched["text"].strip():
-        raise HTTPException(
-            status_code=422,
-            detail=fetch_error_message(fetched.get("reason"), url),
+    try:
+        result = await analyze_url(
+            url,
+            ctx=UsageContext(user_id=user_id),
+            save_for_user_id=user_id,
+            user_note=user_note,
         )
-    source_type = fetched.get("source_type") or "article"
-    ctx = UsageContext(user_id=user_id, source_type=source_type)
-    analysis = analyze(fetched["text"], ctx=ctx)
-    # Store a condensed summary, not a full copy of the fetched content.
-    save_item(user_id, "url", url, summarize_content(fetched["text"], ctx=ctx), to_json_str(analysis), user_note)
-    return {"analysis": to_plain_text(analysis), "analysis_data": analysis}
+    except PipelineError as e:
+        raise _pipeline_error_to_http(e, url)
+    return {"analysis": to_plain_text(result.analysis), "analysis_data": result.analysis}
 
 
 @router.post("/submit/file", status_code=201)
@@ -233,6 +232,26 @@ def _is_http_url(s: str) -> bool:
         return False
 
 
+def _pipeline_error_to_http(e: PipelineError, url: str) -> HTTPException:
+    """Translate a PipelineError into the JSON HTTPException shape every web
+    URL endpoint returns — kept centralised so the Worker contract stays
+    consistent across /api/try, /api/library/add, and /api/job results."""
+    reason = e.fetched.get("reason")
+    if e.code in (ERR_NO_TEXT, ERR_NO_TRANSCRIPT):
+        return HTTPException(
+            status_code=422,
+            detail={
+                "error": e.code,
+                "reason": reason,
+                "message": fetch_error_message(reason, url),
+            },
+        )
+    if e.code == ERR_FETCH_FAILED:
+        return HTTPException(status_code=502, detail={"error": "fetch-failed"})
+    # ERR_ANALYZE_FAILED and any unknown future code default to 502.
+    return HTTPException(status_code=502, detail={"error": e.code})
+
+
 @router.post("/try")
 async def try_url(req: TryRequest, _: None = Depends(_require_try_secret)):
     """One-shot analysis for anonymous web users.
@@ -246,58 +265,21 @@ async def try_url(req: TryRequest, _: None = Depends(_require_try_secret)):
         raise HTTPException(status_code=400, detail={"error": "invalid-url"})
 
     try:
-        fetched = await fetch_url(url)
-    except Exception as e:
-        logger.exception("fetch_url crashed for %s: %s", url, e)
-        raise HTTPException(status_code=502, detail={"error": "fetch-failed"})
-
-    text = (fetched.get("text") or "").strip()
-    source_type = fetched.get("source_type") or "article"
-
-    if not text:
-        # Distinguish video-with-no-transcript from generic extraction failure
-        # so the Worker can show the right message. `reason` + `message` carry
-        # the specific limitation (e.g. image_only_pdf, rate_limited).
-        reason = fetched.get("reason")
-        if source_type in _VIDEO_SOURCE_TYPES:
-            raise HTTPException(
-                status_code=422,
-                detail={
-                    "error": "no-transcript",
-                    "reason": reason,
-                    "message": fetch_error_message(reason, url),
-                },
-            )
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "error": "extraction-failed",
-                "reason": reason,
-                "message": fetch_error_message(reason, url),
-            },
-        )
-
-    ctx = UsageContext(anon_id=req.anon_id, source_type=source_type)
-    try:
-        analysis = analyze(text, ctx=ctx)
-    except Exception as e:
-        logger.exception("analyze crashed for %s: %s", url, e)
-        raise HTTPException(status_code=502, detail={"error": "analyze-failed"})
+        result = await analyze_url(url, ctx=UsageContext(anon_id=req.anon_id))
+    except PipelineError as e:
+        raise _pipeline_error_to_http(e, url)
 
     # Worker contract: verdict at the top level, analysis dict has the other
     # five fields. analyzer.analyze() returns all six in one dict — split here.
+    analysis = result.analysis
     verdict = analysis.pop("verdict", "skim")
-
-    # The Worker stores content_preview in D1 (for claim-on-signup), so send the
-    # condensed summary rather than a verbatim slice of the source.
-    summary = summarize_content(text, ctx=ctx)
 
     return {
         "url": url,
-        "title": fetched.get("title") or url,
-        "source_type": source_type,
-        "image_urls": fetched.get("image_urls") or [],
-        "content_preview": summary[:TRY_PREVIEW_CHARS],
+        "title": result.title or url,
+        "source_type": result.source_type,
+        "image_urls": result.image_urls,
+        "content_preview": result.summary[:TRY_PREVIEW_CHARS],
         "verdict": verdict,
         "analysis": analysis,
     }
@@ -457,68 +439,24 @@ async def library_add(req: _LibraryAddRequest, _: None = Depends(_require_try_se
         raise HTTPException(status_code=400, detail={"error": "invalid-url"})
 
     try:
-        fetched = await fetch_url(url)
-    except Exception as e:
-        logger.exception("fetch_url crashed for %s: %s", url, e)
-        raise HTTPException(status_code=502, detail={"error": "fetch-failed"})
-
-    text = (fetched.get("text") or "").strip()
-    source_type = fetched.get("source_type") or "article"
-
-    if not text:
-        reason = fetched.get("reason")
-        if source_type in _VIDEO_SOURCE_TYPES:
-            raise HTTPException(
-                status_code=422,
-                detail={
-                    "error": "no-transcript",
-                    "reason": reason,
-                    "message": fetch_error_message(reason, url),
-                },
-            )
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "error": "extraction-failed",
-                "reason": reason,
-                "message": fetch_error_message(reason, url),
-            },
+        result = await analyze_url(
+            url,
+            ctx=UsageContext(user_id=req.user_id),
+            save_for_user_id=req.user_id,
+            user_note=req.user_note,
         )
+    except PipelineError as e:
+        raise _pipeline_error_to_http(e, url)
 
-    ctx = UsageContext(user_id=req.user_id, source_type=source_type)
-    try:
-        analysis = analyze(text, ctx=ctx)
-    except Exception as e:
-        logger.exception("analyze crashed for %s: %s", url, e)
-        raise HTTPException(status_code=502, detail={"error": "analyze-failed"})
-
-    # Data minimisation: store a condensed, audience-neutral summary instead of
-    # a full copy of the fetched third-party content. The full text stays in
-    # memory only for this request; the summary is enough to re-derive verdicts
-    # later under a different profile.
-    summary = summarize_content(text, ctx=ctx)
-
-    save_item(
-        user_id=req.user_id,
-        source_type=source_type,
-        source=url,
-        content=summary,
-        analysis=to_json_str(analysis),
-        user_note=req.user_note,
-    )
-
-    # Fetch the row we just inserted so the Worker gets the canonical id.
-    rows = get_all_items(req.user_id)
-    new_id = rows[0]["id"] if rows else None
-
+    analysis = result.analysis
     verdict = analysis.pop("verdict", "skim")
     return {
-        "id": new_id,
+        "id": result.saved_id,
         "url": url,
-        "title": fetched.get("title") or url,
-        "source_type": source_type,
-        "image_urls": fetched.get("image_urls") or [],
-        "content_preview": summary[:TRY_PREVIEW_CHARS],
+        "title": result.title or url,
+        "source_type": result.source_type,
+        "image_urls": result.image_urls,
+        "content_preview": result.summary[:TRY_PREVIEW_CHARS],
         "verdict": verdict,
         "analysis": analysis,
     }
@@ -617,77 +555,48 @@ async def _run_job(
     user_note: str,
     anon_id: str | None = None,
 ) -> None:
-    """Background task: fetch → summarize → analyze(summary) → optionally save."""
+    """Background task: routes through the unified URL pipeline and stamps
+    progress steps for the polling UI. The pipeline does its own progression
+    (fetch → images → summary → analyze); we surface coarse steps here so
+    the browser has something to show — finer per-step progress would need
+    a callback API on the pipeline, parked as a follow-up."""
     try:
-        _job_steps[job_id] = "fetching"
+        ctx = UsageContext(user_id=user_id, anon_id=anon_id, job_id=job_id)
+
+        def _on_step(label: str) -> None:
+            _job_steps[job_id] = label
+
         try:
-            fetched = await fetch_url(url)
-        except Exception:
-            logger.exception("job %s: fetch_url crashed for %s", job_id, url)
-            set_job_error(job_id, "fetch-failed")
-            return
-
-        text = (fetched.get("text") or "").strip()
-        source_type = fetched.get("source_type") or "article"
-
-        if not text:
-            if source_type in _VIDEO_SOURCE_TYPES:
-                set_job_error(job_id, "no-transcript")
-            else:
-                set_job_error(job_id, "extraction-failed")
-            return
-
-        loop = asyncio.get_running_loop()
-        ctx = UsageContext(
-            user_id=user_id, anon_id=anon_id, job_id=job_id, source_type=source_type
-        )
-
-        # Summarise first — the summary is the canonical stored representation
-        # and the basis for the analysis verdict.
-        _job_steps[job_id] = "summarizing"
-        try:
-            summary = await loop.run_in_executor(None, lambda: summarize_content(text, ctx=ctx))
-        except Exception:
-            logger.exception("job %s: summarize_content crashed", job_id)
-            summary = text[:TRY_PREVIEW_CHARS]
-
-        _job_steps[job_id] = "analyzing"
-        try:
-            analysis = await loop.run_in_executor(None, lambda: analyze(summary, ctx=ctx))
-        except Exception:
-            logger.exception("job %s: analyze crashed", job_id)
-            set_job_error(job_id, "analyze-failed")
-            return
-
-        saved_id: int | None = None
-        if user_id is not None:
-            saved_id = save_item(
-                user_id=user_id,
-                source_type=source_type,
-                source=url,
-                content=summary,
-                analysis=to_json_str(analysis),
+            result = await analyze_url(
+                url,
+                ctx=ctx,
+                save_for_user_id=user_id,
                 user_note=user_note,
+                on_step=_on_step,
             )
+        except PipelineError as e:
+            set_job_error(job_id, e.code)
+            return
 
+        analysis = result.analysis
         verdict = analysis.pop("verdict", "skim")
         # `content` is the full stored brief, exposed so the result page can
         # show the basis for the verdict. `content_preview` is kept for the
         # Worker's D1 claim path, which stays on a 2k slice to bound row size.
-        result: dict = {
+        payload: dict = {
             "url": url,
-            "title": fetched.get("title") or url,
-            "source_type": source_type,
-            "image_urls": fetched.get("image_urls") or [],
-            "content": summary,
-            "content_preview": summary[:TRY_PREVIEW_CHARS],
+            "title": result.title or url,
+            "source_type": result.source_type,
+            "image_urls": result.image_urls,
+            "content": result.summary,
+            "content_preview": result.summary[:TRY_PREVIEW_CHARS],
             "verdict": verdict,
             "analysis": analysis,
         }
-        if saved_id is not None:
-            result["id"] = saved_id
+        if result.saved_id is not None:
+            payload["id"] = result.saved_id
 
-        set_job_done(job_id, result)
+        set_job_done(job_id, payload)
     except Exception:
         logger.exception("job %s: unexpected failure", job_id)
         set_job_error(job_id, "internal-error")

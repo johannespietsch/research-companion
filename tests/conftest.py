@@ -42,12 +42,17 @@ def db():
 
 @pytest.fixture
 def client(monkeypatch):
-    """FastAPI TestClient with `analyze` and `fetch_url` mocked so we don't hit
-    the network or the LLM. Tests that need different mock behavior can
-    monkeypatch over these defaults."""
+    """FastAPI TestClient with the LLM + fetch path mocked.
+
+    Post the bot.pipeline refactor, `fetch_url`, `analyze`, and
+    `summarize_content` are no longer imported into bot.api — they live
+    inside bot.pipeline. Tests that need to override one of these should
+    patch `bot.pipeline.<name>` rather than `bot.api.<name>`.
+    """
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
     import bot.api
+    import bot.pipeline
 
     async def fake_fetch_url(url):
         return {
@@ -71,9 +76,13 @@ def client(monkeypatch):
     def fake_summarize_content(text, **_kwargs):
         return "Neutral summary of the content."
 
-    monkeypatch.setattr(bot.api, "fetch_url", fake_fetch_url)
+    # Pipeline's external dependencies — replace the names as the pipeline
+    # module sees them.
+    monkeypatch.setattr(bot.pipeline, "fetch_url", fake_fetch_url)
+    monkeypatch.setattr(bot.pipeline, "analyze", fake_analyze)
+    monkeypatch.setattr(bot.pipeline, "summarize_content", fake_summarize_content)
+    # /submit/text still calls analyze directly in bot.api — patch there too.
     monkeypatch.setattr(bot.api, "analyze", fake_analyze)
-    monkeypatch.setattr(bot.api, "summarize_content", fake_summarize_content)
 
     app = FastAPI()
     app.include_router(bot.api.router)
