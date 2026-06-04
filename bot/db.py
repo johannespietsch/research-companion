@@ -109,6 +109,9 @@ _CREATE_INDEXES_SQL = [
     "CREATE INDEX IF NOT EXISTS idx_analyze_traces_ts ON analyze_traces(ts DESC)",
     "CREATE INDEX IF NOT EXISTS idx_analyze_traces_retention ON analyze_traces(retention_until)",
     "CREATE INDEX IF NOT EXISTS idx_processed_updates_ts ON processed_updates(ts)",
+    "CREATE INDEX IF NOT EXISTS idx_llm_cache_created_at ON llm_cache(created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_llm_cache_hits_ts ON llm_cache_hits(ts DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_llm_cache_hits_purpose ON llm_cache_hits(purpose, ts DESC)",
 ]
 
 # Per-call LLM usage log. One row per upstream API call (analyze, summary,
@@ -196,6 +199,44 @@ CREATE TABLE IF NOT EXISTS processed_updates (
 )"""
 
 PROCESSED_UPDATES_RETENTION_SECONDS = 24 * 3_600  # 24h is well past any plausible retry
+
+# Content-addressed cache of LLM results (analyze + summary). Keyed by a hash
+# of everything that determines the output (provider, model, prompt template,
+# schema where applicable, profile text for analyze, input content). Any
+# change to those inputs auto-invalidates because the key changes. Stops the
+# same content from costing tokens twice — e.g. user retries, Telegram
+# delivers a duplicate, or the prompt is identical across two users with the
+# same profile.
+_CREATE_LLM_CACHE_SQL = """\
+CREATE TABLE IF NOT EXISTS llm_cache (
+    cache_key   TEXT PRIMARY KEY,
+    purpose     TEXT NOT NULL DEFAULT '',
+    payload     TEXT NOT NULL,
+    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S', 'now'))
+)"""
+
+LLM_CACHE_TTL_SECONDS = 30 * 24 * 3_600  # 30d — disk bound, not correctness
+
+# Hit log for the cache above. One row per cache hit so the admin dashboard
+# can show a "calls saved / cost avoided" tile alongside the regular spend
+# numbers. The actual cached payload lives in `llm_cache`; this table is
+# pure event log. Cost is captured at hit time (estimated from recent
+# average cost-per-call for the same purpose) so the savings number stays
+# honest even after a model/price change.
+_CREATE_LLM_CACHE_HITS_SQL = """\
+CREATE TABLE IF NOT EXISTS llm_cache_hits (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts            TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S', 'now')),
+    purpose       TEXT    NOT NULL DEFAULT '',
+    user_id       INTEGER,
+    anon_id       TEXT,
+    source_type   TEXT    NOT NULL DEFAULT '',
+    cost_saved_usd REAL   NOT NULL DEFAULT 0
+)"""
+
+# Same retention as the cache itself — keep just long enough to show on the
+# dashboard's longest window.
+LLM_CACHE_HITS_RETENTION_SECONDS = 30 * 24 * 3_600
 
 # Allowed feedback signals. Explicit taps + cheap implicit proxies. Kept as an
 # allowlist so the data stays clean enough to learn from.
@@ -293,6 +334,8 @@ def _init() -> None:
         conn.execute(_CREATE_LLM_CALLS_SQL)
         conn.execute(_CREATE_ANALYZE_TRACES_SQL)
         conn.execute(_CREATE_PROCESSED_UPDATES_SQL)
+        conn.execute(_CREATE_LLM_CACHE_SQL)
+        conn.execute(_CREATE_LLM_CACHE_HITS_SQL)
         for stmt in _CREATE_INDEXES_SQL:
             conn.execute(stmt)
 
@@ -639,6 +682,8 @@ def prune_maintenance(now=None) -> dict:
     now_str = _ts(now)
     jobs_cutoff = _ts(now - timedelta(seconds=JOB_RETENTION_SECONDS))
     updates_cutoff = _ts(now - timedelta(seconds=PROCESSED_UPDATES_RETENTION_SECONDS))
+    llm_cache_cutoff = _ts(now - timedelta(seconds=LLM_CACHE_TTL_SECONDS))
+    llm_cache_hits_cutoff = _ts(now - timedelta(seconds=LLM_CACHE_HITS_RETENTION_SECONDS))
     with _get_conn() as conn:
         errors = conn.execute("DELETE FROM error_log WHERE ts < ?", (err_cutoff,)).rowcount or 0
         cache = conn.execute(
@@ -655,9 +700,16 @@ def prune_maintenance(now=None) -> dict:
         updates = conn.execute(
             "DELETE FROM processed_updates WHERE ts < ?", (updates_cutoff,)
         ).rowcount or 0
+        llm_cache = conn.execute(
+            "DELETE FROM llm_cache WHERE created_at < ?", (llm_cache_cutoff,)
+        ).rowcount or 0
+        llm_cache_hits = conn.execute(
+            "DELETE FROM llm_cache_hits WHERE ts < ?", (llm_cache_hits_cutoff,)
+        ).rowcount or 0
     return {
         "error_log": errors, "url_cache": cache, "link_codes": codes,
-        "jobs": jobs, "processed_updates": updates,
+        "jobs": jobs, "processed_updates": updates, "llm_cache": llm_cache,
+        "llm_cache_hits": llm_cache_hits,
     }
 
 
@@ -718,6 +770,84 @@ def claim_telegram_update(update_id: int) -> bool:
             (update_id,),
         )
         return cur.rowcount > 0
+
+
+# ---------------------------------------------------------------------------
+# LLM result cache (content-addressed)
+# ---------------------------------------------------------------------------
+
+def get_cached_llm_result(cache_key: str) -> str | None:
+    """Return the cached payload for `cache_key`, or None on miss.
+
+    The caller knows what to do with the string (json.loads for analyze,
+    return as-is for summary). Keeping the table type-agnostic means we
+    can reuse the same machinery for any future LLM purpose.
+    """
+    with _get_conn() as conn:
+        row = conn.execute(
+            "SELECT payload FROM llm_cache WHERE cache_key = ?", (cache_key,)
+        ).fetchone()
+    return row["payload"] if row else None
+
+
+def set_cached_llm_result(cache_key: str, purpose: str, payload: str) -> None:
+    """Persist an LLM result. Uses ON CONFLICT DO UPDATE so concurrent first-
+    misses (two requests with the same input racing past `get_cached_llm_result`
+    returning None) settle on the later value rather than crash. Same payload
+    either way — both ran the same model on the same inputs."""
+    with _get_conn() as conn:
+        conn.execute(
+            "INSERT INTO llm_cache (cache_key, purpose, payload) VALUES (?, ?, ?) "
+            "ON CONFLICT(cache_key) DO UPDATE SET "
+            "  payload = excluded.payload, "
+            "  created_at = strftime('%Y-%m-%dT%H:%M:%S','now')",
+            (cache_key, purpose, payload),
+        )
+
+
+def record_cache_hit(
+    *,
+    purpose: str,
+    user_id: int | None = None,
+    anon_id: str | None = None,
+    source_type: str = "",
+    cost_saved_usd: float = 0.0,
+) -> None:
+    """Log one cache hit. Best-effort — a DB blip here must never break the
+    analyse path. Cost saved is estimated by the caller from recent average
+    cost-per-call for the same purpose."""
+    try:
+        with _get_conn() as conn:
+            conn.execute(
+                "INSERT INTO llm_cache_hits (purpose, user_id, anon_id, source_type, cost_saved_usd) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (purpose, user_id, anon_id, source_type, float(cost_saved_usd)),
+            )
+    except Exception:
+        import logging as _logging
+        _logging.getLogger(__name__).exception("record_cache_hit failed")
+
+
+def estimate_avg_cost_per_call(purpose: str, lookback_days: int = 7) -> float:
+    """Average cost per *successful* upstream call of this purpose in the
+    recent past. Used to attach an estimated savings amount to cache hits.
+
+    Falls back to 0 when there's no data yet — the dashboard then shows
+    "calls saved" without a $ figure, which is still meaningful.
+    """
+    since = (
+        datetime.now(timezone.utc) - timedelta(days=lookback_days)
+    ).strftime("%Y-%m-%dT%H:%M:%S")
+    try:
+        with _get_conn() as conn:
+            row = conn.execute(
+                "SELECT AVG(cost_usd) AS avg_cost FROM llm_calls "
+                "WHERE purpose = ? AND status = 'ok' AND ts >= ? AND cost_usd > 0",
+                (purpose, since),
+            ).fetchone()
+        return float(row["avg_cost"] or 0.0)
+    except Exception:
+        return 0.0
 
 
 # ---------------------------------------------------------------------------
