@@ -256,6 +256,59 @@ class TestResultCache:
         assert result2 == "proper summary"
 
 
+class TestImageCache:
+    """analyze_image must cache too — its non-determinism is what breaks the
+    *analyze* cache on the Telegram URL path, which appends image
+    descriptions to the article text before calling analyze."""
+
+    def test_second_call_with_same_image_is_a_cache_hit(self, db, monkeypatch):
+        from bot import analyzer
+        monkeypatch.setattr(analyzer, "_PROVIDER", "anthropic")
+        monkeypatch.setattr(analyzer, "_MODEL", "claude-haiku-4-5-20251001")
+
+        fake = _FakeAnthropic(input_tokens=300, output_tokens=80, text="A photo of a cat.")
+        monkeypatch.setattr(analyzer, "_get_client", lambda: fake)
+
+        b64 = "ZmFrZS1pbWFnZS1ieXRlcw=="  # "fake-image-bytes"
+        first = analyzer.analyze_image(b64)
+        second = analyzer.analyze_image(b64)
+        assert first == second == "A photo of a cat."
+        rows = _all_llm_calls(db)
+        assert len(rows) == 1, f"expected 1 LLM call, got {len(rows)}"
+        with db._get_conn() as conn:
+            hits = conn.execute(
+                "SELECT purpose FROM llm_cache_hits"
+            ).fetchall()
+        assert [h["purpose"] for h in hits] == ["image"]
+
+    def test_different_image_bytes_dont_collide(self, db, monkeypatch):
+        from bot import analyzer
+        monkeypatch.setattr(analyzer, "_PROVIDER", "anthropic")
+        monkeypatch.setattr(analyzer, "_MODEL", "claude-haiku-4-5-20251001")
+
+        fake = _FakeAnthropic(input_tokens=100, output_tokens=20, text="desc")
+        monkeypatch.setattr(analyzer, "_get_client", lambda: fake)
+
+        analyzer.analyze_image("aaaa")
+        analyzer.analyze_image("bbbb")
+        # Two distinct images → no cache hit → two upstream calls.
+        assert len(_all_llm_calls(db)) == 2
+
+    def test_caption_is_part_of_the_key(self, db, monkeypatch):
+        """Same image bytes but different caption → different cache key.
+        Caption changes the prompt, so the model's output may differ."""
+        from bot import analyzer
+        monkeypatch.setattr(analyzer, "_PROVIDER", "anthropic")
+        monkeypatch.setattr(analyzer, "_MODEL", "claude-haiku-4-5-20251001")
+
+        fake = _FakeAnthropic(input_tokens=100, output_tokens=20, text="desc")
+        monkeypatch.setattr(analyzer, "_get_client", lambda: fake)
+
+        analyzer.analyze_image("samebytes", caption="cat")
+        analyzer.analyze_image("samebytes", caption="dog")
+        assert len(_all_llm_calls(db)) == 2
+
+
 class TestOpenAICapture:
     def test_analyze_reads_openai_usage(self, db, monkeypatch):
         from bot import analyzer

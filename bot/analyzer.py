@@ -282,6 +282,28 @@ def _cache_key_summary(text: str) -> str:
     return h.hexdigest()
 
 
+def _cache_key_image(b64: str, caption: str) -> str:
+    """Cache key for `analyze_image()` calls.
+
+    Keyed on the exact base64 image bytes + caption + model/provider.
+    Same image + same caption → same description, deterministically.
+
+    Why this matters even though analyze_image is rare: the Telegram URL
+    handler appends image descriptions to the article text before calling
+    `analyze()`. Without caching the image step, those descriptions vary
+    between calls (LLM non-determinism), the combined analyze input differs,
+    and the *analyze* cache misses too. So caching here is what makes the
+    end-to-end Telegram path actually hit `llm_cache`.
+    """
+    h = hashlib.sha256()
+    h.update(b"image\x00")
+    h.update(_PROVIDER.encode()); h.update(b"\x00")
+    h.update(_MODEL.encode()); h.update(b"\x00")
+    h.update(caption.encode()); h.update(b"\x00")
+    h.update(b64.encode())
+    return h.hexdigest()
+
+
 def _try_cache_get(cache_key: str):
     """Best-effort cache read. A DB blip should never break analysis — fall
     through to the LLM if the lookup fails for any reason."""
@@ -494,7 +516,20 @@ def summarize_content(text: str, *, ctx: UsageContext | None = None) -> str:
 
 
 def analyze_image(b64: str, caption: str = "", *, ctx: UsageContext | None = None) -> str:
-    """Describe and extract key info from a base64-encoded JPEG image."""
+    """Describe and extract key info from a base64-encoded JPEG image.
+
+    Cached (since fix/cache-analyze-image) because the Telegram URL handler
+    appends image descriptions to the article text before calling `analyze()`.
+    Without this cache the inner LLM non-determinism propagates outward and
+    `analyze()`'s cache misses every time, even on identical articles.
+    """
+    cache_key = _cache_key_image(b64, caption)
+    cached = _try_cache_get(cache_key)
+    if cached is not None:
+        logger.info("image cache hit (key=%s...)", cache_key[:12])
+        _record_cache_hit(purpose="image", ctx=ctx)
+        return cached
+
     prompt = "Extract and describe all text and key information visible in this image."
     if caption:
         prompt += f" Context provided: {caption}"
@@ -517,7 +552,9 @@ def analyze_image(b64: str, caption: str = "", *, ctx: UsageContext | None = Non
             in_tok, out_tok = _anthropic_tokens(resp)
             _record_usage(purpose="image", input_tokens=in_tok, output_tokens=out_tok,
                           started_at=started, ctx=ctx)
-            return resp.content[0].text
+            out = resp.content[0].text
+            _try_cache_set(cache_key, "image", out)
+            return out
 
         resp = client.chat.completions.create(
             model=_MODEL,
@@ -532,7 +569,9 @@ def analyze_image(b64: str, caption: str = "", *, ctx: UsageContext | None = Non
         in_tok, out_tok = _openai_tokens(resp)
         _record_usage(purpose="image", input_tokens=in_tok, output_tokens=out_tok,
                       started_at=started, ctx=ctx)
-        return resp.choices[0].message.content
+        out = resp.choices[0].message.content
+        _try_cache_set(cache_key, "image", out)
+        return out
     except Exception as e:
         _record_usage(purpose="image", input_tokens=0, output_tokens=0,
                       started_at=started, ctx=ctx, status="error", error=str(e)[:200])
