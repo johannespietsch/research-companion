@@ -414,6 +414,7 @@ class TestJobFlow:
         # fetched text (the canonical-representation contract).
         import asyncio
         import bot.api
+        import bot.pipeline
 
         captured = {}
 
@@ -425,7 +426,9 @@ class TestJobFlow:
                 "verdict": "skim",
             }
 
-        monkeypatch.setattr(bot.api, "analyze", capture_analyze)
+        # Post-pipeline refactor: analyze + summarize_content live inside
+        # bot.pipeline, so that's the module to patch for run-time overrides.
+        monkeypatch.setattr(bot.pipeline, "analyze", capture_analyze)
         db.create_job("job-3")
         asyncio.run(bot.api._run_job("job-3", "https://example.com/x", None, ""))
         assert captured["text"] == "Neutral summary of the content."
@@ -433,11 +436,12 @@ class TestJobFlow:
     def test_run_job_no_text_sets_extraction_error(self, client, db, monkeypatch):
         import asyncio
         import bot.api
+        import bot.pipeline
 
         async def empty_fetch(url):
             return {"text": "", "title": url, "source_type": "article", "reason": "no_text"}
 
-        monkeypatch.setattr(bot.api, "fetch_url", empty_fetch)
+        monkeypatch.setattr(bot.pipeline, "fetch_url", empty_fetch)
         db.create_job("job-4")
         asyncio.run(bot.api._run_job("job-4", "https://example.com/x", None, ""))
         rec = db.get_job_record("job-4")
@@ -447,11 +451,12 @@ class TestJobFlow:
     def test_run_job_video_no_text_sets_no_transcript(self, client, db, monkeypatch):
         import asyncio
         import bot.api
+        import bot.pipeline
 
         async def empty_video_fetch(url):
             return {"text": "", "title": url, "source_type": "youtube", "reason": "no_transcript"}
 
-        monkeypatch.setattr(bot.api, "fetch_url", empty_video_fetch)
+        monkeypatch.setattr(bot.pipeline, "fetch_url", empty_video_fetch)
         db.create_job("job-5")
         asyncio.run(bot.api._run_job("job-5", "https://example.com/x", None, ""))
         rec = db.get_job_record("job-5")
