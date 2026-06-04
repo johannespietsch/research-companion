@@ -269,10 +269,9 @@ def cost_overview(days: int) -> dict:
     hits_total = cache_row["hits"] or 0
     cost_saved = cache_row["cost_saved_usd"] or 0.0
     # Hit rate = hits / (hits + upstream-calls). Upstream-calls here counts
-    # only `purpose IN ('analyze', 'summary')` to keep the dimension honest
-    # (image and other purposes don't run through the cache yet).
+    # purposes that go through the cache (`analyze`, `summary`, `image`).
     cacheable_calls = sum(
-        r["calls"] for r in purpose_rows if r["purpose"] in ("analyze", "summary")
+        r["calls"] for r in purpose_rows if r["purpose"] in ("analyze", "summary", "image")
     )
     hit_rate_denom = hits_total + cacheable_calls
     hit_rate = (hits_total / hit_rate_denom) if hit_rate_denom > 0 else 0.0
