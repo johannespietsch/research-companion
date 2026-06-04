@@ -151,6 +151,30 @@ def _webhook_secret_ok(provided: str | None) -> bool:
     return secrets.compare_digest(provided or "", WEBHOOK_SECRET)
 
 
+# Live references to in-flight webhook handlers. Background tasks can be
+# garbage-collected if nothing holds a reference to them — we add each task
+# here on creation and let `add_done_callback` clean it up on completion.
+_webhook_tasks: set[asyncio.Task] = set()
+
+
+async def _process_update_in_background(update: Update) -> None:
+    """Run the Telegram handler chain off the webhook request path.
+
+    Telegram retries any webhook call that doesn't ack within ~60s. Long-form
+    content (video transcribe → summarise → analyse) easily exceeds that, so
+    awaiting `process_update` inside the request handler turned the same
+    update into an N-times-retried storm — every retry started a fresh chain
+    while the previous one was still spending tokens. Decoupling the ack from
+    the work makes the timeout irrelevant. Errors are logged but not
+    re-raised — the task is fire-and-forget by design.
+    """
+    try:
+        await telegram_app.process_update(update)
+    except Exception:
+        update_id = getattr(update, "update_id", "?")
+        logger.exception("background process_update failed for update %s", update_id)
+
+
 @app.post("/webhook")
 async def webhook(request: Request) -> Response:
     if not telegram_app or not WEBHOOK_URL:
@@ -162,7 +186,13 @@ async def webhook(request: Request) -> Response:
         return Response(status_code=403)
     data = await request.json()
     update = Update.de_json(data, telegram_app.bot)
-    await telegram_app.process_update(update)
+    # Do NOT await — see _process_update_in_background. We must ack within
+    # Telegram's webhook timeout (~60s) regardless of how long the handler
+    # chain ends up running, or the same update will be redelivered and
+    # double-processed.
+    task = asyncio.create_task(_process_update_in_background(update))
+    _webhook_tasks.add(task)
+    task.add_done_callback(_webhook_tasks.discard)
     return Response(status_code=200)
 
 
