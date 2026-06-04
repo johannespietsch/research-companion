@@ -108,6 +108,7 @@ _CREATE_INDEXES_SQL = [
     "CREATE INDEX IF NOT EXISTS idx_llm_calls_anon ON llm_calls(anon_id, ts DESC)",
     "CREATE INDEX IF NOT EXISTS idx_analyze_traces_ts ON analyze_traces(ts DESC)",
     "CREATE INDEX IF NOT EXISTS idx_analyze_traces_retention ON analyze_traces(retention_until)",
+    "CREATE INDEX IF NOT EXISTS idx_processed_updates_ts ON processed_updates(ts)",
 ]
 
 # Per-call LLM usage log. One row per upstream API call (analyze, summary,
@@ -180,6 +181,21 @@ CREATE TABLE IF NOT EXISTS analyze_traces (
 ANALYZE_TRACE_RETENTION_SECONDS = int(
     os.getenv("ANALYZE_TRACE_RETENTION_SECONDS") or 30 * 24 * 3_600
 )
+
+# Telegram update-id dedup ledger. The webhook claims an `update_id` before
+# scheduling any background work; a second arrival of the same id (a
+# Telegram retry) finds the row already present and is dropped. This is the
+# belt-and-braces follow-up to the fire-and-forget webhook fix in #34 — even
+# if the handler chain ever blocks again, retries can't double-process.
+# Retention is short — Telegram's active retry window is minutes, but we keep
+# rows for a generous interval so a delayed retry still dedups cleanly.
+_CREATE_PROCESSED_UPDATES_SQL = """\
+CREATE TABLE IF NOT EXISTS processed_updates (
+    update_id  INTEGER PRIMARY KEY,
+    ts         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S', 'now'))
+)"""
+
+PROCESSED_UPDATES_RETENTION_SECONDS = 24 * 3_600  # 24h is well past any plausible retry
 
 # Allowed feedback signals. Explicit taps + cheap implicit proxies. Kept as an
 # allowlist so the data stays clean enough to learn from.
@@ -276,6 +292,7 @@ def _init() -> None:
         conn.execute(_CREATE_JOBS_SQL)
         conn.execute(_CREATE_LLM_CALLS_SQL)
         conn.execute(_CREATE_ANALYZE_TRACES_SQL)
+        conn.execute(_CREATE_PROCESSED_UPDATES_SQL)
         for stmt in _CREATE_INDEXES_SQL:
             conn.execute(stmt)
 
@@ -621,6 +638,7 @@ def prune_maintenance(now=None) -> dict:
     cache_cutoff = _ts(now - timedelta(seconds=URL_CACHE_TTL_SECONDS))
     now_str = _ts(now)
     jobs_cutoff = _ts(now - timedelta(seconds=JOB_RETENTION_SECONDS))
+    updates_cutoff = _ts(now - timedelta(seconds=PROCESSED_UPDATES_RETENTION_SECONDS))
     with _get_conn() as conn:
         errors = conn.execute("DELETE FROM error_log WHERE ts < ?", (err_cutoff,)).rowcount or 0
         cache = conn.execute(
@@ -634,7 +652,13 @@ def prune_maintenance(now=None) -> dict:
             "DELETE FROM jobs WHERE status != 'pending' AND updated_at < ?",
             (jobs_cutoff,),
         ).rowcount or 0
-    return {"error_log": errors, "url_cache": cache, "link_codes": codes, "jobs": jobs}
+        updates = conn.execute(
+            "DELETE FROM processed_updates WHERE ts < ?", (updates_cutoff,)
+        ).rowcount or 0
+    return {
+        "error_log": errors, "url_cache": cache, "link_codes": codes,
+        "jobs": jobs, "processed_updates": updates,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -669,6 +693,31 @@ def get_job_record(job_id: str) -> sqlite3.Row | None:
             "SELECT id, status, result, error FROM jobs WHERE id = ?",
             (job_id,),
         ).fetchone()
+
+
+# ---------------------------------------------------------------------------
+# Telegram update-id dedup
+# ---------------------------------------------------------------------------
+
+def claim_telegram_update(update_id: int) -> bool:
+    """Atomically reserve a Telegram update_id for processing.
+
+    Returns True if this is the first time we've seen this id and the caller
+    should proceed with the handler chain. Returns False if it was already
+    claimed (a Telegram retry, or a duplicate webhook delivery), meaning the
+    caller should ack 200 but do no work.
+
+    Implementation uses INSERT OR IGNORE so the check-and-set is a single
+    atomic operation — two simultaneous arrivals of the same id can both
+    pass an "exists" check but only one INSERT succeeds. SQLite reports the
+    successful insert via rowcount == 1.
+    """
+    with _get_conn() as conn:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO processed_updates (update_id) VALUES (?)",
+            (update_id,),
+        )
+        return cur.rowcount > 0
 
 
 # ---------------------------------------------------------------------------

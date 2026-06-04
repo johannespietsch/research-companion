@@ -352,17 +352,59 @@ class TestPruneMaintenance:
                 (NEW,),
             )
 
+        # Old + new processed_updates rows — old should prune (past 24h).
+        with db._get_conn() as conn:
+            conn.execute("INSERT INTO processed_updates (update_id, ts) VALUES (1, ?)", (OLD,))
+            conn.execute("INSERT INTO processed_updates (update_id, ts) VALUES (2, ?)", (NEW,))
+
         counts = db.prune_maintenance(now=datetime(2026, 5, 20, tzinfo=timezone.utc))
-        assert counts == {"error_log": 1, "url_cache": 1, "link_codes": 1, "jobs": 1}
+        assert counts == {
+            "error_log": 1, "url_cache": 1, "link_codes": 1, "jobs": 1,
+            "processed_updates": 1,
+        }
 
         with db._get_conn() as conn:
             assert [r["message"] for r in conn.execute("SELECT message FROM error_log")] == ["new"]
             assert [r["url"] for r in conn.execute("SELECT url FROM url_cache")] == ["https://new"]
             assert [r["code"] for r in conn.execute("SELECT code FROM link_codes")] == ["NEW"]
             assert {r["id"] for r in conn.execute("SELECT id FROM jobs")} == {"old-pending", "new-done"}
+            assert [r["update_id"] for r in conn.execute("SELECT update_id FROM processed_updates")] == [2]
 
     def test_idempotent_on_empty(self, db):
         from datetime import datetime, timezone
 
         counts = db.prune_maintenance(now=datetime(2026, 5, 20, tzinfo=timezone.utc))
-        assert counts == {"error_log": 0, "url_cache": 0, "link_codes": 0, "jobs": 0}
+        assert counts == {
+            "error_log": 0, "url_cache": 0, "link_codes": 0, "jobs": 0,
+            "processed_updates": 0,
+        }
+
+
+class TestClaimTelegramUpdate:
+    """First arrival of an update_id claims it; subsequent calls return False
+    so the caller knows it's a retry and skips processing."""
+
+    def test_first_claim_returns_true(self, db):
+        assert db.claim_telegram_update(12345) is True
+
+    def test_second_claim_for_same_id_returns_false(self, db):
+        assert db.claim_telegram_update(12345) is True
+        assert db.claim_telegram_update(12345) is False
+        assert db.claim_telegram_update(12345) is False  # still false
+
+    def test_distinct_ids_each_claim(self, db):
+        assert db.claim_telegram_update(1) is True
+        assert db.claim_telegram_update(2) is True
+        assert db.claim_telegram_update(3) is True
+        # And they all stay claimed
+        assert db.claim_telegram_update(1) is False
+        assert db.claim_telegram_update(2) is False
+
+    def test_row_persists_for_dedup_window(self, db):
+        db.claim_telegram_update(999)
+        with db._get_conn() as conn:
+            row = conn.execute(
+                "SELECT update_id, ts FROM processed_updates WHERE update_id = 999"
+            ).fetchone()
+        assert row["update_id"] == 999
+        assert row["ts"]  # default-stamped

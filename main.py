@@ -186,6 +186,18 @@ async def webhook(request: Request) -> Response:
         return Response(status_code=403)
     data = await request.json()
     update = Update.de_json(data, telegram_app.bot)
+    # Belt-and-braces dedup: even with the fire-and-forget fix below, an
+    # earlier blocked-handler era backlog (or any future bug that re-stalls
+    # the ack path) could see Telegram retrying the same update_id while a
+    # background task is still running. claim_telegram_update is an atomic
+    # INSERT OR IGNORE — only the first call gets True. Updates without an
+    # update_id (malformed payloads / test stubs) bypass dedup, since there's
+    # nothing meaningful to key on.
+    if update is not None and getattr(update, "update_id", None) is not None:
+        from bot.db import claim_telegram_update
+        if not claim_telegram_update(update.update_id):
+            logger.info("dropping duplicate webhook for update_id=%s", update.update_id)
+            return Response(status_code=200)
     # Do NOT await — see _process_update_in_background. We must ack within
     # Telegram's webhook timeout (~60s) regardless of how long the handler
     # chain ends up running, or the same update will be redelivered and

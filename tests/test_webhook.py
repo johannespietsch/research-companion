@@ -164,6 +164,50 @@ class TestWebhookFireAndForget:
         assert any("background process_update failed" in rec.message for rec in caplog.records)
 
 
+class TestWebhookDedup:
+    """A second arrival of the same Telegram update_id must NOT spawn another
+    handler run. Belt-and-braces for any future bug that re-stalls the ack
+    path — without this, a slow handler could still see N copies of the same
+    work scheduled in parallel before each retry ack'd.
+    """
+
+    @pytest.fixture
+    def client(self, main_mod, monkeypatch):
+        app_stub = MagicMock()
+        app_stub.process_update = AsyncMock()
+        monkeypatch.setattr(main_mod, "telegram_app", app_stub)
+        monkeypatch.setattr(main_mod, "WEBHOOK_URL", "https://example.com")
+        monkeypatch.setattr(main_mod, "WEBHOOK_SECRET", "s3cret")
+        # Use a real Update-like object with update_id so dedup engages.
+        monkeypatch.setattr(
+            main_mod.Update, "de_json",
+            lambda data, bot: type("U", (), {"update_id": data["update_id"]})(),
+        )
+        return TestClient(main_mod.app), app_stub
+
+    def test_duplicate_update_id_drops_silently(self, client, main_mod):
+        c, app_stub = client
+        hdr = {"X-Telegram-Bot-Api-Secret-Token": "s3cret"}
+
+        r1 = c.post("/webhook", json={"update_id": 42}, headers=hdr)
+        r2 = c.post("/webhook", json={"update_id": 42}, headers=hdr)
+        # Both ack 200 — we want Telegram to stop retrying — but only the
+        # first one scheduled work.
+        assert r1.status_code == 200
+        assert r2.status_code == 200
+        _drain_webhook_tasks(main_mod)
+        assert app_stub.process_update.await_count == 1
+
+    def test_distinct_update_ids_both_process(self, client, main_mod):
+        c, app_stub = client
+        hdr = {"X-Telegram-Bot-Api-Secret-Token": "s3cret"}
+
+        c.post("/webhook", json={"update_id": 100}, headers=hdr)
+        c.post("/webhook", json={"update_id": 101}, headers=hdr)
+        _drain_webhook_tasks(main_mod)
+        assert app_stub.process_update.await_count == 2
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
