@@ -353,14 +353,23 @@ class TestPruneMaintenance:
             )
 
         # Old + new processed_updates rows — old should prune (past 24h).
+        # Old + new llm_cache rows — old should prune (past 30d TTL).
         with db._get_conn() as conn:
             conn.execute("INSERT INTO processed_updates (update_id, ts) VALUES (1, ?)", (OLD,))
             conn.execute("INSERT INTO processed_updates (update_id, ts) VALUES (2, ?)", (NEW,))
+            conn.execute(
+                "INSERT INTO llm_cache (cache_key, purpose, payload, created_at) VALUES ('k_old', 'analyze', '{}', ?)",
+                (OLD,),
+            )
+            conn.execute(
+                "INSERT INTO llm_cache (cache_key, purpose, payload, created_at) VALUES ('k_new', 'analyze', '{}', ?)",
+                (NEW,),
+            )
 
         counts = db.prune_maintenance(now=datetime(2026, 5, 20, tzinfo=timezone.utc))
         assert counts == {
             "error_log": 1, "url_cache": 1, "link_codes": 1, "jobs": 1,
-            "processed_updates": 1,
+            "processed_updates": 1, "llm_cache": 1,
         }
 
         with db._get_conn() as conn:
@@ -369,6 +378,7 @@ class TestPruneMaintenance:
             assert [r["code"] for r in conn.execute("SELECT code FROM link_codes")] == ["NEW"]
             assert {r["id"] for r in conn.execute("SELECT id FROM jobs")} == {"old-pending", "new-done"}
             assert [r["update_id"] for r in conn.execute("SELECT update_id FROM processed_updates")] == [2]
+            assert [r["cache_key"] for r in conn.execute("SELECT cache_key FROM llm_cache")] == ["k_new"]
 
     def test_idempotent_on_empty(self, db):
         from datetime import datetime, timezone
@@ -376,7 +386,7 @@ class TestPruneMaintenance:
         counts = db.prune_maintenance(now=datetime(2026, 5, 20, tzinfo=timezone.utc))
         assert counts == {
             "error_log": 0, "url_cache": 0, "link_codes": 0, "jobs": 0,
-            "processed_updates": 0,
+            "processed_updates": 0, "llm_cache": 0,
         }
 
 
@@ -408,3 +418,22 @@ class TestClaimTelegramUpdate:
             ).fetchone()
         assert row["update_id"] == 999
         assert row["ts"]  # default-stamped
+
+
+class TestLlmCache:
+    """Content-addressed cache helpers used by analyzer.py to avoid paying
+    LLM cost twice for identical (model, prompt, content) inputs."""
+
+    def test_round_trips_payload(self, db):
+        db.set_cached_llm_result("k1", "analyze", '{"hello": "world"}')
+        assert db.get_cached_llm_result("k1") == '{"hello": "world"}'
+
+    def test_miss_returns_none(self, db):
+        assert db.get_cached_llm_result("never-set") is None
+
+    def test_set_is_upsert(self, db):
+        """Concurrent first-misses (two requests racing past a None lookup)
+        must both succeed — the second insert UPDATEs rather than crashing."""
+        db.set_cached_llm_result("k", "analyze", "v1")
+        db.set_cached_llm_result("k", "analyze", "v2")
+        assert db.get_cached_llm_result("k") == "v2"

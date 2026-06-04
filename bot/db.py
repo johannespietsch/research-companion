@@ -109,6 +109,7 @@ _CREATE_INDEXES_SQL = [
     "CREATE INDEX IF NOT EXISTS idx_analyze_traces_ts ON analyze_traces(ts DESC)",
     "CREATE INDEX IF NOT EXISTS idx_analyze_traces_retention ON analyze_traces(retention_until)",
     "CREATE INDEX IF NOT EXISTS idx_processed_updates_ts ON processed_updates(ts)",
+    "CREATE INDEX IF NOT EXISTS idx_llm_cache_created_at ON llm_cache(created_at)",
 ]
 
 # Per-call LLM usage log. One row per upstream API call (analyze, summary,
@@ -196,6 +197,23 @@ CREATE TABLE IF NOT EXISTS processed_updates (
 )"""
 
 PROCESSED_UPDATES_RETENTION_SECONDS = 24 * 3_600  # 24h is well past any plausible retry
+
+# Content-addressed cache of LLM results (analyze + summary). Keyed by a hash
+# of everything that determines the output (provider, model, prompt template,
+# schema where applicable, profile text for analyze, input content). Any
+# change to those inputs auto-invalidates because the key changes. Stops the
+# same content from costing tokens twice — e.g. user retries, Telegram
+# delivers a duplicate, or the prompt is identical across two users with the
+# same profile.
+_CREATE_LLM_CACHE_SQL = """\
+CREATE TABLE IF NOT EXISTS llm_cache (
+    cache_key   TEXT PRIMARY KEY,
+    purpose     TEXT NOT NULL DEFAULT '',
+    payload     TEXT NOT NULL,
+    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S', 'now'))
+)"""
+
+LLM_CACHE_TTL_SECONDS = 30 * 24 * 3_600  # 30d — disk bound, not correctness
 
 # Allowed feedback signals. Explicit taps + cheap implicit proxies. Kept as an
 # allowlist so the data stays clean enough to learn from.
@@ -293,6 +311,7 @@ def _init() -> None:
         conn.execute(_CREATE_LLM_CALLS_SQL)
         conn.execute(_CREATE_ANALYZE_TRACES_SQL)
         conn.execute(_CREATE_PROCESSED_UPDATES_SQL)
+        conn.execute(_CREATE_LLM_CACHE_SQL)
         for stmt in _CREATE_INDEXES_SQL:
             conn.execute(stmt)
 
@@ -639,6 +658,7 @@ def prune_maintenance(now=None) -> dict:
     now_str = _ts(now)
     jobs_cutoff = _ts(now - timedelta(seconds=JOB_RETENTION_SECONDS))
     updates_cutoff = _ts(now - timedelta(seconds=PROCESSED_UPDATES_RETENTION_SECONDS))
+    llm_cache_cutoff = _ts(now - timedelta(seconds=LLM_CACHE_TTL_SECONDS))
     with _get_conn() as conn:
         errors = conn.execute("DELETE FROM error_log WHERE ts < ?", (err_cutoff,)).rowcount or 0
         cache = conn.execute(
@@ -655,9 +675,12 @@ def prune_maintenance(now=None) -> dict:
         updates = conn.execute(
             "DELETE FROM processed_updates WHERE ts < ?", (updates_cutoff,)
         ).rowcount or 0
+        llm_cache = conn.execute(
+            "DELETE FROM llm_cache WHERE created_at < ?", (llm_cache_cutoff,)
+        ).rowcount or 0
     return {
         "error_log": errors, "url_cache": cache, "link_codes": codes,
-        "jobs": jobs, "processed_updates": updates,
+        "jobs": jobs, "processed_updates": updates, "llm_cache": llm_cache,
     }
 
 
@@ -718,6 +741,39 @@ def claim_telegram_update(update_id: int) -> bool:
             (update_id,),
         )
         return cur.rowcount > 0
+
+
+# ---------------------------------------------------------------------------
+# LLM result cache (content-addressed)
+# ---------------------------------------------------------------------------
+
+def get_cached_llm_result(cache_key: str) -> str | None:
+    """Return the cached payload for `cache_key`, or None on miss.
+
+    The caller knows what to do with the string (json.loads for analyze,
+    return as-is for summary). Keeping the table type-agnostic means we
+    can reuse the same machinery for any future LLM purpose.
+    """
+    with _get_conn() as conn:
+        row = conn.execute(
+            "SELECT payload FROM llm_cache WHERE cache_key = ?", (cache_key,)
+        ).fetchone()
+    return row["payload"] if row else None
+
+
+def set_cached_llm_result(cache_key: str, purpose: str, payload: str) -> None:
+    """Persist an LLM result. Uses ON CONFLICT DO UPDATE so concurrent first-
+    misses (two requests with the same input racing past `get_cached_llm_result`
+    returning None) settle on the later value rather than crash. Same payload
+    either way — both ran the same model on the same inputs."""
+    with _get_conn() as conn:
+        conn.execute(
+            "INSERT INTO llm_cache (cache_key, purpose, payload) VALUES (?, ?, ?) "
+            "ON CONFLICT(cache_key) DO UPDATE SET "
+            "  payload = excluded.payload, "
+            "  created_at = strftime('%Y-%m-%dT%H:%M:%S','now')",
+            (cache_key, purpose, payload),
+        )
 
 
 # ---------------------------------------------------------------------------

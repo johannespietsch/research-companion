@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import os
@@ -242,6 +243,64 @@ def _normalize(raw: dict) -> dict:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Result caching
+# ---------------------------------------------------------------------------
+#
+# Both analyze() and summarize_content() check a content-addressed cache
+# (bot.db.llm_cache) before calling the LLM. Cache keys hash every input that
+# affects the output: provider, model, prompt template, response schema where
+# applicable, profile text, and the input content. Any change to those inputs
+# changes the key, so a prompt or model bump auto-invalidates without any
+# explicit version flag. Cache misses pay the LLM cost as before; hits skip
+# the upstream call entirely.
+#
+# Cache hits are not written to `llm_calls` — that table is "upstream API
+# calls made". Hits are visible via Fly logs (logger.info) and we'll add a
+# hit-rate tile to the admin dashboard separately once we have a feel for
+# how often this fires.
+
+def _cache_key_analyze(text: str, profile: str) -> str:
+    h = hashlib.sha256()
+    h.update(b"analyze\x00")
+    h.update(_PROVIDER.encode()); h.update(b"\x00")
+    h.update(_MODEL.encode()); h.update(b"\x00")
+    h.update(_PROMPT.encode()); h.update(b"\x00")
+    h.update(json.dumps(_TOOL_SCHEMA, sort_keys=True).encode()); h.update(b"\x00")
+    h.update((profile or "").encode()); h.update(b"\x00")
+    h.update(text.encode())
+    return h.hexdigest()
+
+
+def _cache_key_summary(text: str) -> str:
+    h = hashlib.sha256()
+    h.update(b"summary\x00")
+    h.update(_PROVIDER.encode()); h.update(b"\x00")
+    h.update(_MODEL.encode()); h.update(b"\x00")
+    h.update(_SUMMARY_PROMPT.encode()); h.update(b"\x00")
+    h.update(text.encode())
+    return h.hexdigest()
+
+
+def _try_cache_get(cache_key: str):
+    """Best-effort cache read. A DB blip should never break analysis — fall
+    through to the LLM if the lookup fails for any reason."""
+    try:
+        from bot.db import get_cached_llm_result
+        return get_cached_llm_result(cache_key)
+    except Exception:
+        logger.exception("llm_cache read failed; treating as miss")
+        return None
+
+
+def _try_cache_set(cache_key: str, purpose: str, payload: str) -> None:
+    try:
+        from bot.db import set_cached_llm_result
+        set_cached_llm_result(cache_key, purpose, payload)
+    except Exception:
+        logger.exception("llm_cache write failed; result not cached")
+
+
 def analyze(text: str, user_id: int | None = None, *, ctx: UsageContext | None = None) -> dict:
     """Returns a dict with keys: main_idea, why_it_matters, category, quick_win, bigger_play, time_required, verdict."""
     # Back-compat: callers that still pass `user_id` positionally get it merged
@@ -252,6 +311,23 @@ def analyze(text: str, user_id: int | None = None, *, ctx: UsageContext | None =
         ctx = UsageContext(user_id=user_id, anon_id=ctx.anon_id, job_id=ctx.job_id, source_type=ctx.source_type)
 
     profile = _load_profile(ctx.user_id)
+
+    # Content-addressed cache lookup. Key spans every input that affects the
+    # output, so a prompt/model/schema change auto-invalidates. Skips the
+    # upstream LLM call entirely on hit — no llm_calls row written because
+    # nothing was actually called.
+    cache_key = _cache_key_analyze(text, profile)
+    cached = _try_cache_get(cache_key)
+    if cached is not None:
+        try:
+            result = json.loads(cached)
+            if isinstance(result, dict) and all(k in result for k in ANALYSIS_FIELDS):
+                logger.info("analyze cache hit (key=%s...)", cache_key[:12])
+                return result
+        except json.JSONDecodeError:
+            # Cache row was corrupt — fall through and overwrite below.
+            logger.warning("analyze cache had non-JSON payload; refreshing")
+
     profile_block = f"\nAbout the person you are analysing for:\n{profile}\n" if profile else ""
     prompt = _PROMPT.format(profile_block=profile_block, text=text)
 
@@ -273,6 +349,7 @@ def analyze(text: str, user_id: int | None = None, *, ctx: UsageContext | None =
                 if getattr(block, "type", None) == "tool_use" and block.name == "record_analysis":
                     result = _normalize(block.input)
                     _capture_trace(text=text, profile=profile, output=result, ctx=ctx)
+                    _try_cache_set(cache_key, "analyze", json.dumps(result, ensure_ascii=False))
                     return result
             raise RuntimeError("Anthropic did not return a record_analysis tool_use block")
 
@@ -291,6 +368,7 @@ def analyze(text: str, user_id: int | None = None, *, ctx: UsageContext | None =
             raise RuntimeError(f"OpenAI returned non-JSON content: {e}: {content[:200]}")
         result = _normalize(raw)
         _capture_trace(text=text, profile=profile, output=result, ctx=ctx)
+        _try_cache_set(cache_key, "analyze", json.dumps(result, ensure_ascii=False))
         return result
     except Exception as e:
         # Log the failed attempt so failure rate shows up next to spend.
@@ -346,6 +424,17 @@ def summarize_content(text: str, *, ctx: UsageContext | None = None) -> str:
     text = (text or "").strip()
     if not text:
         return ""
+
+    # Cache: keyed purely by (provider, model, prompt template, content).
+    # Hit returns the cached summary as-is; miss runs the LLM and caches the
+    # successful output (NOT the truncation fallback below — that would
+    # poison subsequent calls for the same content).
+    cache_key = _cache_key_summary(text)
+    cached = _try_cache_get(cache_key)
+    if cached is not None:
+        logger.info("summary cache hit (key=%s...)", cache_key[:12])
+        return cached[:SUMMARY_MAX_CHARS]
+
     prompt = _SUMMARY_PROMPT.format(text=text)
     max_tokens = _summary_output_tokens(text)
     started = time.monotonic()
@@ -371,7 +460,11 @@ def summarize_content(text: str, *, ctx: UsageContext | None = None) -> str:
             out = (resp.choices[0].message.content or "").strip()
         _record_usage(purpose="summary", input_tokens=in_tok, output_tokens=out_tok,
                       started_at=started, ctx=ctx)
-        return out[:SUMMARY_MAX_CHARS] if out else text[:SUMMARY_MAX_CHARS]
+        if out:
+            _try_cache_set(cache_key, "summary", out[:SUMMARY_MAX_CHARS])
+            return out[:SUMMARY_MAX_CHARS]
+        # Empty model output — return the truncated source but don't cache.
+        return text[:SUMMARY_MAX_CHARS]
     except Exception as e:
         _record_usage(purpose="summary", input_tokens=0, output_tokens=0,
                       started_at=started, ctx=ctx, status="error", error=str(e)[:200])

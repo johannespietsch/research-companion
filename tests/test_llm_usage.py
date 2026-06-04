@@ -147,6 +147,100 @@ class TestAnthropicCapture:
         assert r["cost_usd"] == 0.0
 
 
+class TestResultCache:
+    """analyze() and summarize_content() check llm_cache before calling the
+    LLM. A second call with identical (model, prompt, content) must skip the
+    upstream entirely — no llm_calls row written, no token spend, same
+    output returned."""
+
+    def test_analyze_second_call_is_a_cache_hit(self, db, monkeypatch):
+        from bot import analyzer
+        monkeypatch.setattr(analyzer, "_PROVIDER", "anthropic")
+        monkeypatch.setattr(analyzer, "_MODEL", "claude-haiku-4-5-20251001")
+
+        fake = _FakeAnthropic(input_tokens=100, output_tokens=50, tool_input={
+            "main_idea": "x", "why_it_matters": "y", "category": "c",
+            "quick_win": "qw", "bigger_play": "bp", "time_required": "5m",
+            "verdict": "watch",
+        })
+        monkeypatch.setattr(analyzer, "_get_client", lambda: fake)
+
+        first = analyzer.analyze("the same text", ctx=analyzer.UsageContext(
+            user_id=1, source_type="article"
+        ))
+        second = analyzer.analyze("the same text", ctx=analyzer.UsageContext(
+            user_id=1, source_type="article"
+        ))
+        # Identical output, but only ONE llm_calls row — the second call
+        # hit the cache and skipped the upstream.
+        assert first == second
+        rows = _all_llm_calls(db)
+        assert len(rows) == 1, f"expected 1 LLM call after cache hit, got {len(rows)}"
+
+    def test_analyze_invalidated_by_profile_change(self, db, monkeypatch):
+        """Same text but different profile → different cache key → real call."""
+        from bot import analyzer
+        monkeypatch.setattr(analyzer, "_PROVIDER", "anthropic")
+        monkeypatch.setattr(analyzer, "_MODEL", "claude-haiku-4-5-20251001")
+
+        # Two distinct users with distinct profiles. The user_id flows into
+        # _load_profile, which reads users.profile — set them explicitly so
+        # the cache key differs between them.
+        u1 = db.get_or_create_user_by_telegram(1)
+        u2 = db.get_or_create_user_by_telegram(2)
+        db.set_user_profile(u1, "Profile A")
+        db.set_user_profile(u2, "Profile B")
+
+        fake = _FakeAnthropic(input_tokens=100, output_tokens=50, tool_input={
+            "main_idea": "x", "why_it_matters": "y", "category": "c",
+            "quick_win": "qw", "bigger_play": "bp", "time_required": "5m",
+            "verdict": "watch",
+        })
+        monkeypatch.setattr(analyzer, "_get_client", lambda: fake)
+
+        analyzer.analyze("same text", ctx=analyzer.UsageContext(user_id=u1))
+        analyzer.analyze("same text", ctx=analyzer.UsageContext(user_id=u2))
+        # Two different profiles → two different cache keys → two upstream
+        # calls. (Cache only helps within a single profile-content pair.)
+        assert len(_all_llm_calls(db)) == 2
+
+    def test_summarize_content_second_call_is_a_cache_hit(self, db, monkeypatch):
+        from bot import analyzer
+        monkeypatch.setattr(analyzer, "_PROVIDER", "anthropic")
+        monkeypatch.setattr(analyzer, "_MODEL", "claude-haiku-4-5-20251001")
+
+        fake = _FakeAnthropic(input_tokens=500, output_tokens=200, text="A summary.")
+        monkeypatch.setattr(analyzer, "_get_client", lambda: fake)
+
+        first = analyzer.summarize_content("the source text")
+        second = analyzer.summarize_content("the source text")
+        assert first == second == "A summary."
+        rows = _all_llm_calls(db)
+        assert len(rows) == 1, f"expected 1 LLM call after cache hit, got {len(rows)}"
+
+    def test_summary_fallback_is_not_cached(self, db, monkeypatch):
+        """If the LLM call raises, summarize_content returns a truncated slice
+        as a safety fallback. That truncation must NOT poison the cache for
+        future calls — the next call with the same text should retry the LLM."""
+        from bot import analyzer
+        monkeypatch.setattr(analyzer, "_PROVIDER", "anthropic")
+        monkeypatch.setattr(analyzer, "_MODEL", "claude-haiku-4-5-20251001")
+
+        # First call: model raises → fallback returns truncated text.
+        class Boom:
+            messages = SimpleNamespace(create=lambda **kw: (_ for _ in ()).throw(RuntimeError("rate-limited")))
+        monkeypatch.setattr(analyzer, "_get_client", lambda: Boom())
+        result1 = analyzer.summarize_content("x" * 200)
+        assert result1.startswith("x")  # fallback truncation
+
+        # Second call: model succeeds → fresh upstream call, not the
+        # truncated fallback from before.
+        fake = _FakeAnthropic(input_tokens=10, output_tokens=5, text="proper summary")
+        monkeypatch.setattr(analyzer, "_get_client", lambda: fake)
+        result2 = analyzer.summarize_content("x" * 200)
+        assert result2 == "proper summary"
+
+
 class TestOpenAICapture:
     def test_analyze_reads_openai_usage(self, db, monkeypatch):
         from bot import analyzer
