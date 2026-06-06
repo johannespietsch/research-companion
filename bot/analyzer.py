@@ -460,6 +460,15 @@ sponsor segments, and verbatim padding.
 and only short phrases (under ~25 words) where exact wording matters.
 - Scale length to the source: a short article stays short; a long, dense, \
 multi-topic source should yield a long, thoroughly sectioned brief.
+- Write the brief in the SAME language as the source content. If the source mixes \
+languages, use the dominant one. Do not translate.
+- Anchor every relative time expression ("this year", "last week", "a few months \
+ago", "recently") to the source date shown below — NOT to your own training \
+cutoff. If the source itself states an absolute date, preserve that exact date. \
+Do not invent specific years that the source left vague.
+
+SOURCE METADATA:
+- Published: {published_at}
 
 CONTENT:
 {text}"""
@@ -472,6 +481,18 @@ SUMMARY_MAX_CHARS = 100_000
 # SUMMARY_MAX_CHARS at the model's average chars/token, and well under the
 # Haiku 4.5 64k hard limit. Scaled per source below.
 _SUMMARY_MAX_OUTPUT_TOKENS = 32_000
+
+
+def _published_at_for_prompt(published_at: str | None) -> str:
+    """Render the SOURCE METADATA Published line. Falls back to today tagged
+    as a best estimate when the caller doesn't have a real date — this still
+    anchors the model to the right year, which is what fixed the Haiku date
+    hallucinations (e.g. Haiku writing "October 2023" for a transcript that
+    said "Oktober 2025")."""
+    if published_at and published_at.strip():
+        return published_at.strip()
+    from datetime import date
+    return f"{date.today().isoformat()} (today; actual publication date unknown)"
 
 
 def _summary_output_tokens(text: str) -> int:
@@ -487,23 +508,38 @@ def _summary_output_tokens(text: str) -> int:
     return max(512, min(_SUMMARY_MAX_OUTPUT_TOKENS, approx_input_tokens))
 
 
-def summarize_content(text: str, *, ctx: UsageContext | None = None) -> str:
+def summarize_content(
+    text: str,
+    *,
+    ctx: UsageContext | None = None,
+    published_at: str | None = None,
+) -> str:
     """Distil source content into a faithful, length-scaled structured brief.
 
     Stored instead of the full fetched text: rich enough to re-derive verdicts
     under a different profile and to power retrieval/chat, but a derived brief
     rather than a verbatim copy. Falls back to a truncated slice if the model
     call fails, so persistence never breaks on an LLM hiccup.
+
+    `published_at` is the source's publication date (ISO YYYY-MM-DD), used to
+    anchor relative time expressions ("this year") so the model doesn't fill
+    them in from its own training cutoff. If unknown, today's date is passed
+    in tagged as a best-estimate fallback — still better than letting the
+    model default to its training year, which is what produced the date
+    hallucinations seen on non-English transcripts.
     """
     text = (text or "").strip()
     if not text:
         return ""
 
     model = _resolve_model("summary", ctx)
+    published_at_str = _published_at_for_prompt(published_at)
 
     # Cache: keyed by (provider, model, prompt template, content). Anon and
     # signed-in callers land on different models so their results are
-    # partitioned naturally by the cache key.
+    # partitioned naturally by the cache key. published_at is deliberately
+    # NOT part of the key — a per-day fallback would otherwise blow the cache
+    # daily for any source without a real publication date.
     cache_key = _cache_key_summary(text, model)
     cached = _try_cache_get(cache_key)
     if cached is not None:
@@ -511,7 +547,7 @@ def summarize_content(text: str, *, ctx: UsageContext | None = None) -> str:
         _record_cache_hit(purpose="summary", ctx=ctx)
         return cached[:SUMMARY_MAX_CHARS]
 
-    prompt = _SUMMARY_PROMPT.format(text=text)
+    prompt = _SUMMARY_PROMPT.format(text=text, published_at=published_at_str)
     max_tokens = _summary_output_tokens(text)
     started = time.monotonic()
     try:

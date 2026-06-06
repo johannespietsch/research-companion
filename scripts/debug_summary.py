@@ -85,10 +85,13 @@ def main() -> int:
     print(f"mode:           {'anon' if args.anon else 'signed-in (user_id=1)'}")
     print(f"resolved model: {resolved_model}")
 
+    published_at = fetched.get("published_at") or ""
     print()
     print("=== FETCH ===")
     print(f"source_type:        {fetched.get('source_type')}")
     print(f"title:              {fetched.get('title')}")
+    print(f"language:           {fetched.get('language') or '(unknown)'}")
+    print(f"published_at:       {published_at or '(unknown — will fall back to today)'}")
     print(f"fetched text chars: {len(text):,}  (MAX_CONTENT_CHARS={MAX_CONTENT_CHARS:,})")
     if len(text) >= MAX_CONTENT_CHARS:
         print(f"*** input was TRUNCATED at MAX_CONTENT_CHARS before summarization ***")
@@ -99,7 +102,7 @@ def main() -> int:
     print(f"_SUMMARY_MAX_OUTPUT_TOKENS:{_SUMMARY_MAX_OUTPUT_TOKENS:>7,}  (hard ceiling)")
     print(f"requested max_tokens:     {requested_max_tokens:,}  (scaled: ~input_chars // 4, 1:1 with input tokens)")
 
-    summary = summarize_content(text, ctx=ctx)
+    summary = summarize_content(text, ctx=ctx, published_at=published_at)
 
     # Estimate output tokens used to detect a max_tokens-shaped cutoff. The
     # char cap (SUMMARY_MAX_CHARS) and the token cap (requested max_tokens)
