@@ -152,6 +152,8 @@ class TestAnalyzerHook:
         from bot import analyzer
         monkeypatch.setattr(analyzer, "_PROVIDER", "anthropic")
         monkeypatch.setattr(analyzer, "_MODEL", "claude-haiku-4-5-20251001")
+
+        monkeypatch.setattr(analyzer, "_PREMIUM_MODEL", "claude-haiku-4-5-20251001")
         fake = _FakeAnthropic(input_tokens=10, output_tokens=5, tool_input=_TOOL_INPUT)
         monkeypatch.setattr(analyzer, "_get_client", lambda: fake)
 
@@ -175,6 +177,8 @@ class TestAnalyzerHook:
         from bot import analyzer
         monkeypatch.setattr(analyzer, "_PROVIDER", "anthropic")
         monkeypatch.setattr(analyzer, "_MODEL", "claude-haiku-4-5-20251001")
+
+        monkeypatch.setattr(analyzer, "_PREMIUM_MODEL", "claude-haiku-4-5-20251001")
         fake = _FakeAnthropic(input_tokens=10, output_tokens=5, tool_input=_TOOL_INPUT)
         monkeypatch.setattr(analyzer, "_get_client", lambda: fake)
 
@@ -192,6 +196,8 @@ class TestAnalyzerHook:
         from bot import analyzer
         monkeypatch.setattr(analyzer, "_PROVIDER", "anthropic")
         monkeypatch.setattr(analyzer, "_MODEL", "claude-haiku-4-5-20251001")
+
+        monkeypatch.setattr(analyzer, "_PREMIUM_MODEL", "claude-haiku-4-5-20251001")
 
         class Boom:
             messages = SimpleNamespace(
@@ -211,6 +217,8 @@ class TestAnalyzerHook:
         from bot import analyzer
         monkeypatch.setattr(analyzer, "_PROVIDER", "openai")
         monkeypatch.setattr(analyzer, "_MODEL", "gpt-4o-mini")
+
+        monkeypatch.setattr(analyzer, "_PREMIUM_MODEL", "gpt-4o-mini")
 
         fake = _FakeOpenAI(
             prompt_tokens=20, completion_tokens=10,

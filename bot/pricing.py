@@ -9,13 +9,14 @@ past rows keep the cost they were stamped with at write time.
 Prices are USD per million tokens, as (input, output). Sources:
   - Anthropic:        https://www.anthropic.com/pricing
   - OpenAI Platform:  https://openai.com/api/pricing
-Update both when bumping a model in analyzer._MODEL.
+Update both when bumping a model in analyzer._MODEL or analyzer._PREMIUM_MODEL.
 """
 from __future__ import annotations
 
 # (input_per_mtok, output_per_mtok)
 PRICES_PER_MTOK: dict[str, tuple[float, float]] = {
     "claude-haiku-4-5-20251001": (1.00, 5.00),
+    "claude-sonnet-4-6": (3.00, 15.00),
     "gpt-4o-mini": (0.15, 0.60),
 }
 

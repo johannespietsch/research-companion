@@ -80,6 +80,8 @@ class TestAnthropicCapture:
         monkeypatch.setattr(analyzer, "_PROVIDER", "anthropic")
         monkeypatch.setattr(analyzer, "_MODEL", "claude-haiku-4-5-20251001")
 
+        monkeypatch.setattr(analyzer, "_PREMIUM_MODEL", "claude-haiku-4-5-20251001")
+
         fake = _FakeAnthropic(input_tokens=200, output_tokens=80, tool_input={
             "main_idea": "x", "why_it_matters": "y", "category": "c",
             "quick_win": "qw", "bigger_play": "bp", "time_required": "5m",
@@ -110,6 +112,8 @@ class TestAnthropicCapture:
         monkeypatch.setattr(analyzer, "_PROVIDER", "anthropic")
         monkeypatch.setattr(analyzer, "_MODEL", "claude-haiku-4-5-20251001")
 
+        monkeypatch.setattr(analyzer, "_PREMIUM_MODEL", "claude-haiku-4-5-20251001")
+
         fake = _FakeAnthropic(input_tokens=900, output_tokens=300, text="A summary.")
         monkeypatch.setattr(analyzer, "_get_client", lambda: fake)
 
@@ -127,6 +131,8 @@ class TestAnthropicCapture:
         from bot import analyzer
         monkeypatch.setattr(analyzer, "_PROVIDER", "anthropic")
         monkeypatch.setattr(analyzer, "_MODEL", "claude-haiku-4-5-20251001")
+
+        monkeypatch.setattr(analyzer, "_PREMIUM_MODEL", "claude-haiku-4-5-20251001")
 
         class Boom:
             messages = SimpleNamespace(create=lambda **kw: (_ for _ in ()).throw(RuntimeError("rate-limited")))
@@ -157,6 +163,8 @@ class TestResultCache:
         from bot import analyzer
         monkeypatch.setattr(analyzer, "_PROVIDER", "anthropic")
         monkeypatch.setattr(analyzer, "_MODEL", "claude-haiku-4-5-20251001")
+
+        monkeypatch.setattr(analyzer, "_PREMIUM_MODEL", "claude-haiku-4-5-20251001")
 
         fake = _FakeAnthropic(input_tokens=100, output_tokens=50, tool_input={
             "main_idea": "x", "why_it_matters": "y", "category": "c",
@@ -193,6 +201,8 @@ class TestResultCache:
         monkeypatch.setattr(analyzer, "_PROVIDER", "anthropic")
         monkeypatch.setattr(analyzer, "_MODEL", "claude-haiku-4-5-20251001")
 
+        monkeypatch.setattr(analyzer, "_PREMIUM_MODEL", "claude-haiku-4-5-20251001")
+
         # Two distinct users with distinct profiles. The user_id flows into
         # _load_profile, which reads users.profile — set them explicitly so
         # the cache key differs between them.
@@ -219,6 +229,8 @@ class TestResultCache:
         monkeypatch.setattr(analyzer, "_PROVIDER", "anthropic")
         monkeypatch.setattr(analyzer, "_MODEL", "claude-haiku-4-5-20251001")
 
+        monkeypatch.setattr(analyzer, "_PREMIUM_MODEL", "claude-haiku-4-5-20251001")
+
         fake = _FakeAnthropic(input_tokens=500, output_tokens=200, text="A summary.")
         monkeypatch.setattr(analyzer, "_get_client", lambda: fake)
 
@@ -240,6 +252,8 @@ class TestResultCache:
         from bot import analyzer
         monkeypatch.setattr(analyzer, "_PROVIDER", "anthropic")
         monkeypatch.setattr(analyzer, "_MODEL", "claude-haiku-4-5-20251001")
+
+        monkeypatch.setattr(analyzer, "_PREMIUM_MODEL", "claude-haiku-4-5-20251001")
 
         # First call: model raises → fallback returns truncated text.
         class Boom:
@@ -266,6 +280,8 @@ class TestImageCache:
         monkeypatch.setattr(analyzer, "_PROVIDER", "anthropic")
         monkeypatch.setattr(analyzer, "_MODEL", "claude-haiku-4-5-20251001")
 
+        monkeypatch.setattr(analyzer, "_PREMIUM_MODEL", "claude-haiku-4-5-20251001")
+
         fake = _FakeAnthropic(input_tokens=300, output_tokens=80, text="A photo of a cat.")
         monkeypatch.setattr(analyzer, "_get_client", lambda: fake)
 
@@ -286,6 +302,8 @@ class TestImageCache:
         monkeypatch.setattr(analyzer, "_PROVIDER", "anthropic")
         monkeypatch.setattr(analyzer, "_MODEL", "claude-haiku-4-5-20251001")
 
+        monkeypatch.setattr(analyzer, "_PREMIUM_MODEL", "claude-haiku-4-5-20251001")
+
         fake = _FakeAnthropic(input_tokens=100, output_tokens=20, text="desc")
         monkeypatch.setattr(analyzer, "_get_client", lambda: fake)
 
@@ -301,6 +319,8 @@ class TestImageCache:
         monkeypatch.setattr(analyzer, "_PROVIDER", "anthropic")
         monkeypatch.setattr(analyzer, "_MODEL", "claude-haiku-4-5-20251001")
 
+        monkeypatch.setattr(analyzer, "_PREMIUM_MODEL", "claude-haiku-4-5-20251001")
+
         fake = _FakeAnthropic(input_tokens=100, output_tokens=20, text="desc")
         monkeypatch.setattr(analyzer, "_get_client", lambda: fake)
 
@@ -314,6 +334,8 @@ class TestOpenAICapture:
         from bot import analyzer
         monkeypatch.setattr(analyzer, "_PROVIDER", "openai")
         monkeypatch.setattr(analyzer, "_MODEL", "gpt-4o-mini")
+
+        monkeypatch.setattr(analyzer, "_PREMIUM_MODEL", "gpt-4o-mini")
 
         fake = _FakeOpenAI(prompt_tokens=500, completion_tokens=120, content=(
             '{"main_idea":"x","why_it_matters":"y","category":"c",'

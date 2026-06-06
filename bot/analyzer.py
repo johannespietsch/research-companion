@@ -29,6 +29,7 @@ class UsageContext:
 def _record_usage(
     *,
     purpose: str,
+    model: str,
     input_tokens: int,
     output_tokens: int,
     started_at: float,
@@ -45,11 +46,11 @@ def _record_usage(
     from bot.db import insert_llm_call
 
     latency_ms = int((time.monotonic() - started_at) * 1000)
-    cost = pricing.cost_usd(_MODEL, input_tokens, output_tokens)
+    cost = pricing.cost_usd(model, input_tokens, output_tokens)
     c = ctx or UsageContext()
     insert_llm_call(
         provider=_PROVIDER,
-        model=_MODEL,
+        model=model,
         purpose=purpose,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
@@ -64,7 +65,7 @@ def _record_usage(
     )
 
 
-def _capture_trace(*, text: str, profile: str, output: dict, ctx: UsageContext | None) -> None:
+def _capture_trace(*, model: str, text: str, profile: str, output: dict, ctx: UsageContext | None) -> None:
     """Best-effort write of one row to analyze_traces. Gated by env flag inside
     `record_analyze_trace`; never raises into the caller."""
     from bot.db import record_analyze_trace
@@ -72,7 +73,7 @@ def _capture_trace(*, text: str, profile: str, output: dict, ctx: UsageContext |
     c = ctx or UsageContext()
     record_analyze_trace(
         provider=_PROVIDER,
-        model=_MODEL,
+        model=model,
         source_type=c.source_type,
         input_text=text,
         profile_text=profile,
@@ -108,6 +109,29 @@ if not _ANTHROPIC_KEY and not _OPENAI_KEY:
 
 _PROVIDER = "anthropic" if _ANTHROPIC_KEY else "openai"
 _MODEL = "claude-haiku-4-5-20251001" if _PROVIDER == "anthropic" else "gpt-4o-mini"
+
+# Premium model used for signed-in users on the text-heavy steps where
+# long-context fidelity meaningfully changes output quality. Anon users (and
+# the image step for everyone) stay on `_MODEL` to keep landing-page tries
+# cheap. Per-tier routing is Anthropic-only — the OpenAI fallback path is a
+# single model.
+_PREMIUM_MODEL = "claude-sonnet-4-6"
+_PREMIUM_PURPOSES: frozenset[str] = frozenset({"summary", "analyze"})
+
+
+def _resolve_model(purpose: str, ctx: UsageContext | None) -> str:
+    """Pick the model for one LLM call based on (purpose, signed-in?).
+
+    Signed-in callers are detected by `ctx.user_id is not None`. The
+    cache key hashes the resolved model, so anon and signed-in results
+    are partitioned naturally — exactly what we want, since different
+    models produce different outputs."""
+    if _PROVIDER != "anthropic":
+        return _MODEL
+    signed_in = ctx is not None and ctx.user_id is not None
+    if signed_in and purpose in _PREMIUM_PURPOSES:
+        return _PREMIUM_MODEL
+    return _MODEL
 
 _client = None
 
@@ -260,11 +284,11 @@ def _normalize(raw: dict) -> dict:
 # hit-rate tile to the admin dashboard separately once we have a feel for
 # how often this fires.
 
-def _cache_key_analyze(text: str, profile: str) -> str:
+def _cache_key_analyze(text: str, profile: str, model: str) -> str:
     h = hashlib.sha256()
     h.update(b"analyze\x00")
     h.update(_PROVIDER.encode()); h.update(b"\x00")
-    h.update(_MODEL.encode()); h.update(b"\x00")
+    h.update(model.encode()); h.update(b"\x00")
     h.update(_PROMPT.encode()); h.update(b"\x00")
     h.update(json.dumps(_TOOL_SCHEMA, sort_keys=True).encode()); h.update(b"\x00")
     h.update((profile or "").encode()); h.update(b"\x00")
@@ -272,17 +296,17 @@ def _cache_key_analyze(text: str, profile: str) -> str:
     return h.hexdigest()
 
 
-def _cache_key_summary(text: str) -> str:
+def _cache_key_summary(text: str, model: str) -> str:
     h = hashlib.sha256()
     h.update(b"summary\x00")
     h.update(_PROVIDER.encode()); h.update(b"\x00")
-    h.update(_MODEL.encode()); h.update(b"\x00")
+    h.update(model.encode()); h.update(b"\x00")
     h.update(_SUMMARY_PROMPT.encode()); h.update(b"\x00")
     h.update(text.encode())
     return h.hexdigest()
 
 
-def _cache_key_image(b64: str, caption: str) -> str:
+def _cache_key_image(b64: str, caption: str, model: str) -> str:
     """Cache key for `analyze_image()` calls.
 
     Keyed on the exact base64 image bytes + caption + model/provider.
@@ -298,7 +322,7 @@ def _cache_key_image(b64: str, caption: str) -> str:
     h = hashlib.sha256()
     h.update(b"image\x00")
     h.update(_PROVIDER.encode()); h.update(b"\x00")
-    h.update(_MODEL.encode()); h.update(b"\x00")
+    h.update(model.encode()); h.update(b"\x00")
     h.update(caption.encode()); h.update(b"\x00")
     h.update(b64.encode())
     return h.hexdigest()
@@ -352,12 +376,13 @@ def analyze(text: str, user_id: int | None = None, *, ctx: UsageContext | None =
         ctx = UsageContext(user_id=user_id, anon_id=ctx.anon_id, job_id=ctx.job_id, source_type=ctx.source_type)
 
     profile = _load_profile(ctx.user_id)
+    model = _resolve_model("analyze", ctx)
 
     # Content-addressed cache lookup. Key spans every input that affects the
     # output, so a prompt/model/schema change auto-invalidates. Skips the
     # upstream LLM call entirely on hit — no llm_calls row written because
     # nothing was actually called.
-    cache_key = _cache_key_analyze(text, profile)
+    cache_key = _cache_key_analyze(text, profile, model)
     cached = _try_cache_get(cache_key)
     if cached is not None:
         try:
@@ -378,30 +403,30 @@ def analyze(text: str, user_id: int | None = None, *, ctx: UsageContext | None =
     try:
         if _PROVIDER == "anthropic":
             resp = client.messages.create(
-                model=_MODEL,
+                model=model,
                 max_tokens=1024,
                 tools=[_ANTHROPIC_TOOL],
                 tool_choice={"type": "tool", "name": "record_analysis"},
                 messages=[{"role": "user", "content": prompt}],
             )
             in_tok, out_tok = _anthropic_tokens(resp)
-            _record_usage(purpose="analyze", input_tokens=in_tok, output_tokens=out_tok,
+            _record_usage(purpose="analyze", model=model, input_tokens=in_tok, output_tokens=out_tok,
                           started_at=started, ctx=ctx)
             for block in resp.content:
                 if getattr(block, "type", None) == "tool_use" and block.name == "record_analysis":
                     result = _normalize(block.input)
-                    _capture_trace(text=text, profile=profile, output=result, ctx=ctx)
+                    _capture_trace(model=model, text=text, profile=profile, output=result, ctx=ctx)
                     _try_cache_set(cache_key, "analyze", json.dumps(result, ensure_ascii=False))
                     return result
             raise RuntimeError("Anthropic did not return a record_analysis tool_use block")
 
         resp = client.chat.completions.create(
-            model=_MODEL,
+            model=model,
             response_format={"type": "json_object"},
             messages=[{"role": "user", "content": prompt + _OPENAI_JSON_SUFFIX}],
         )
         in_tok, out_tok = _openai_tokens(resp)
-        _record_usage(purpose="analyze", input_tokens=in_tok, output_tokens=out_tok,
+        _record_usage(purpose="analyze", model=model, input_tokens=in_tok, output_tokens=out_tok,
                       started_at=started, ctx=ctx)
         content = resp.choices[0].message.content or "{}"
         try:
@@ -409,12 +434,12 @@ def analyze(text: str, user_id: int | None = None, *, ctx: UsageContext | None =
         except json.JSONDecodeError as e:
             raise RuntimeError(f"OpenAI returned non-JSON content: {e}: {content[:200]}")
         result = _normalize(raw)
-        _capture_trace(text=text, profile=profile, output=result, ctx=ctx)
+        _capture_trace(model=model, text=text, profile=profile, output=result, ctx=ctx)
         _try_cache_set(cache_key, "analyze", json.dumps(result, ensure_ascii=False))
         return result
     except Exception as e:
         # Log the failed attempt so failure rate shows up next to spend.
-        _record_usage(purpose="analyze", input_tokens=0, output_tokens=0,
+        _record_usage(purpose="analyze", model=model, input_tokens=0, output_tokens=0,
                       started_at=started, ctx=ctx, status="error", error=str(e)[:200])
         raise
 
@@ -474,11 +499,12 @@ def summarize_content(text: str, *, ctx: UsageContext | None = None) -> str:
     if not text:
         return ""
 
-    # Cache: keyed purely by (provider, model, prompt template, content).
-    # Hit returns the cached summary as-is; miss runs the LLM and caches the
-    # successful output (NOT the truncation fallback below — that would
-    # poison subsequent calls for the same content).
-    cache_key = _cache_key_summary(text)
+    model = _resolve_model("summary", ctx)
+
+    # Cache: keyed by (provider, model, prompt template, content). Anon and
+    # signed-in callers land on different models so their results are
+    # partitioned naturally by the cache key.
+    cache_key = _cache_key_summary(text, model)
     cached = _try_cache_get(cache_key)
     if cached is not None:
         logger.info("summary cache hit (key=%s...)", cache_key[:12])
@@ -492,7 +518,7 @@ def summarize_content(text: str, *, ctx: UsageContext | None = None) -> str:
         client = _get_client()
         if _PROVIDER == "anthropic":
             resp = client.messages.create(
-                model=_MODEL,
+                model=model,
                 max_tokens=max_tokens,
                 messages=[{"role": "user", "content": prompt}],
             )
@@ -503,7 +529,7 @@ def summarize_content(text: str, *, ctx: UsageContext | None = None) -> str:
             ).strip()
         else:
             resp = client.chat.completions.create(
-                model=_MODEL,
+                model=model,
                 max_tokens=max_tokens,
                 messages=[{"role": "user", "content": prompt}],
             )
@@ -523,7 +549,7 @@ def summarize_content(text: str, *, ctx: UsageContext | None = None) -> str:
                 max_tokens, out_tok, len(out), len(text),
                 (ctx.source_type if ctx else "") or "",
             )
-        _record_usage(purpose="summary", input_tokens=in_tok, output_tokens=out_tok,
+        _record_usage(purpose="summary", model=model, input_tokens=in_tok, output_tokens=out_tok,
                       started_at=started, ctx=ctx)
         if out:
             _try_cache_set(cache_key, "summary", out[:SUMMARY_MAX_CHARS])
@@ -531,7 +557,7 @@ def summarize_content(text: str, *, ctx: UsageContext | None = None) -> str:
         # Empty model output — return the truncated source but don't cache.
         return text[:SUMMARY_MAX_CHARS]
     except Exception as e:
-        _record_usage(purpose="summary", input_tokens=0, output_tokens=0,
+        _record_usage(purpose="summary", model=model, input_tokens=0, output_tokens=0,
                       started_at=started, ctx=ctx, status="error", error=str(e)[:200])
         logger.warning("summarize_content failed; storing truncated slice: %s", e)
         return text[:SUMMARY_MAX_CHARS]
@@ -545,7 +571,8 @@ def analyze_image(b64: str, caption: str = "", *, ctx: UsageContext | None = Non
     Without this cache the inner LLM non-determinism propagates outward and
     `analyze()`'s cache misses every time, even on identical articles.
     """
-    cache_key = _cache_key_image(b64, caption)
+    model = _resolve_model("image", ctx)
+    cache_key = _cache_key_image(b64, caption, model)
     cached = _try_cache_get(cache_key)
     if cached is not None:
         logger.info("image cache hit (key=%s...)", cache_key[:12])
@@ -561,7 +588,7 @@ def analyze_image(b64: str, caption: str = "", *, ctx: UsageContext | None = Non
     try:
         if _PROVIDER == "anthropic":
             resp = client.messages.create(
-                model=_MODEL,
+                model=model,
                 max_tokens=1024,
                 messages=[{
                     "role": "user",
@@ -572,14 +599,14 @@ def analyze_image(b64: str, caption: str = "", *, ctx: UsageContext | None = Non
                 }],
             )
             in_tok, out_tok = _anthropic_tokens(resp)
-            _record_usage(purpose="image", input_tokens=in_tok, output_tokens=out_tok,
+            _record_usage(purpose="image", model=model, input_tokens=in_tok, output_tokens=out_tok,
                           started_at=started, ctx=ctx)
             out = resp.content[0].text
             _try_cache_set(cache_key, "image", out)
             return out
 
         resp = client.chat.completions.create(
-            model=_MODEL,
+            model=model,
             messages=[{
                 "role": "user",
                 "content": [
@@ -589,13 +616,13 @@ def analyze_image(b64: str, caption: str = "", *, ctx: UsageContext | None = Non
             }],
         )
         in_tok, out_tok = _openai_tokens(resp)
-        _record_usage(purpose="image", input_tokens=in_tok, output_tokens=out_tok,
+        _record_usage(purpose="image", model=model, input_tokens=in_tok, output_tokens=out_tok,
                       started_at=started, ctx=ctx)
         out = resp.choices[0].message.content
         _try_cache_set(cache_key, "image", out)
         return out
     except Exception as e:
-        _record_usage(purpose="image", input_tokens=0, output_tokens=0,
+        _record_usage(purpose="image", model=model, input_tokens=0, output_tokens=0,
                       started_at=started, ctx=ctx, status="error", error=str(e)[:200])
         raise
 

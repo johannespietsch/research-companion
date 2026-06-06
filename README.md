@@ -402,10 +402,15 @@ Existing databases are migrated automatically on startup.
 
 ## AI Providers
 
-| Provider | Model | Used When |
+The Anthropic path dispatches per (task, user tier) so signed-in users get the more capable Sonnet on the text-heavy steps while anon traffic stays on Haiku for cost. See `bot.analyzer._resolve_model`.
+
+| Task | Anon | Signed-in |
 |---|---|---|
-| Anthropic | claude-haiku-4-5 | `ANTHROPIC_API_KEY` is set (preferred) |
-| OpenAI | gpt-4o-mini | Fallback when only `OPENAI_API_KEY` is set |
+| summary | claude-haiku-4-5 | claude-sonnet-4-6 |
+| analyze (verdict) | claude-haiku-4-5 | claude-sonnet-4-6 |
+| image (chart/screenshot extraction) | claude-haiku-4-5 | claude-haiku-4-5 |
+
+If only `OPENAI_API_KEY` is set the bot falls back to `gpt-4o-mini` for every task — per-tier routing is Anthropic-only.
 
 Both text analysis and vision (photo) analysis are supported through either provider.
 
