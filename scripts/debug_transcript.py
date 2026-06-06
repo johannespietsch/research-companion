@@ -26,7 +26,10 @@ logger = logging.getLogger("debug.transcript")
 
 
 def _raw_youtube_transcript_len(url: str) -> int | None:
-    """Pre-truncation raw transcript length, or None if not YouTube / unavailable."""
+    """Pre-truncation raw transcript length, or None if not YouTube / unavailable.
+
+    Mirrors `_youtube_transcript`'s language-agnostic selection so it works for
+    non-English videos too — preferring manual over auto-generated."""
     from bot.fetcher import _YT_PATTERNS
 
     match = _YT_PATTERNS.search(url)
@@ -37,7 +40,13 @@ def _raw_youtube_transcript_len(url: str) -> int | None:
         from youtube_transcript_api import YouTubeTranscriptApi
 
         api = YouTubeTranscriptApi()
-        fetched = api.fetch(video_id)
+        transcripts = list(api.list(video_id))
+        manual = next((t for t in transcripts if not t.is_generated), None)
+        generated = next((t for t in transcripts if t.is_generated), None)
+        transcript = manual or generated
+        if transcript is None:
+            return None
+        fetched = transcript.fetch()
         return sum(len(s.text) + 1 for s in fetched)  # +1 mirrors the " ".join
     except Exception as e:
         logger.warning("raw transcript fetch failed: %s", e)
@@ -64,6 +73,8 @@ def main() -> int:
     print(f"source_type:  {fetched.get('source_type')}")
     print(f"title:        {fetched.get('title')}")
     print(f"image_urls:   {len(fetched.get('image_urls') or [])}")
+    if fetched.get("language"):
+        print(f"language:     {fetched['language']}")
     if fetched.get("reason"):
         print(f"reason:       {fetched['reason']}")
 

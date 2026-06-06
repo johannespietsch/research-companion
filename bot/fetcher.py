@@ -105,15 +105,26 @@ def _youtube_transcript(url: str) -> dict:
     thumb = _youtube_thumbnail(video_id)
     try:
         api = YouTubeTranscriptApi()
-        fetched = api.fetch(video_id)
-        text = " ".join(snippet.text for snippet in fetched)
-        title = _youtube_oembed_title(url) or f"YouTube video ({video_id})"
-        return {
-            "text": f"{title}\n\nTranscript:\n{text}"[:MAX_CONTENT_CHARS],
-            "title": title,
-            "source_type": "youtube",
-            "image_urls": [thumb],
-        }
+        # Enumerate every available transcript instead of forcing 'en'. Prefer
+        # manually-created over auto-generated, but DON'T translate — keep the
+        # source language so the LLM summarises in the speaker's tongue. The
+        # previous `api.fetch(video_id)` defaulted to English and silently
+        # dropped to yt-dlp for every non-English-captioned video.
+        transcripts = list(api.list(video_id))
+        manual = next((t for t in transcripts if not t.is_generated), None)
+        generated = next((t for t in transcripts if t.is_generated), None)
+        transcript = manual or generated
+        if transcript is not None:
+            fetched = transcript.fetch()
+            text = " ".join(snippet.text for snippet in fetched)
+            title = _youtube_oembed_title(url) or f"YouTube video ({video_id})"
+            return {
+                "text": f"{title}\n\nTranscript:\n{text}"[:MAX_CONTENT_CHARS],
+                "title": title,
+                "source_type": "youtube",
+                "image_urls": [thumb],
+                "language": transcript.language_code,
+            }
     except Exception:
         logger.info(f"No transcript for {video_id}, falling back to yt-dlp")
 
@@ -291,10 +302,19 @@ def _yt_dlp_extract(url: str) -> dict:
     uploader = info.get("uploader") or info.get("channel") or ""
     description = info.get("description") or ""
     duration = int(info.get("duration") or 0)
+    language = info.get("language") or ""
     source_type = "youtube" if "vimeo" not in url and "youtube" in url else "video"
 
-    # Pass 2: best-effort subtitle download. A 429 here drops us back to the
-    # description; it does NOT take the whole extract down with it.
+    # Pass 2: best-effort subtitle download. Prefer the video's detected
+    # language so non-English videos don't degrade to description-only, then
+    # fall through to common English variants for back-compat. A 429 here
+    # drops us back to the description; it does NOT take the whole extract
+    # down with it.
+    lang_pref: list[str] = []
+    for lang in (language, "en", "en-US", "en-GB"):
+        if lang and lang not in lang_pref:
+            lang_pref.append(lang)
+
     subtitle_text = ""
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -304,7 +324,7 @@ def _yt_dlp_extract(url: str) -> dict:
                 "ignore_no_formats_error": True,
                 "writesubtitles": True,
                 "writeautomaticsub": True,
-                "subtitleslangs": ["en", "en-US", "en-GB"],
+                "subtitleslangs": lang_pref,
                 "subtitlesformat": "vtt",
                 "paths": {"home": tmpdir},
                 "outtmpl": os.path.join("%(id)s", "%(id)s.%(ext)s"),
@@ -346,6 +366,7 @@ def _yt_dlp_extract(url: str) -> dict:
         "source_type": source_type,
         "has_transcript": bool(subtitle_text),
         "duration": duration,
+        "language": language,
     }
 
 

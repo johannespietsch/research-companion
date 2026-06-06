@@ -18,14 +18,21 @@ VIDEO_ID = "dQw4w9WgXcQ"
 
 
 class TestYouTubeFallbackChain:
+    def _mock_transcript(self, *, language_code: str = "en", is_generated: bool = False, snippets=("hello", "world")):
+        """Build a Transcript-shaped mock whose `.fetch()` yields snippets with `.text`."""
+        t = MagicMock()
+        t.language_code = language_code
+        t.is_generated = is_generated
+        t.fetch.return_value = [MagicMock(text=s) for s in snippets]
+        return t
+
     def test_uses_transcript_api_when_available(self):
         from bot import fetcher
 
         with patch("youtube_transcript_api.YouTubeTranscriptApi") as TranscriptApi, \
              patch.object(fetcher, "_youtube_oembed_title", return_value="Real Title"):
-            TranscriptApi.return_value.fetch.return_value = [
-                MagicMock(text="hello"),
-                MagicMock(text="world"),
+            TranscriptApi.return_value.list.return_value = [
+                self._mock_transcript(snippets=("hello", "world")),
             ]
             result = fetcher._youtube_transcript(YOUTUBE_URL)
 
@@ -34,13 +41,45 @@ class TestYouTubeFallbackChain:
         assert any("ytimg.com" in u for u in result.get("image_urls", []))
         # Real video title surfaces instead of the "YouTube video (<id>)" placeholder.
         assert result["title"] == "Real Title"
+        assert result["language"] == "en"
+
+    def test_prefers_manual_over_auto_generated_transcript(self):
+        """When both manual and auto-generated transcripts exist, the manually
+        created one wins — it's usually higher fidelity (real captions vs. ASR)."""
+        from bot import fetcher
+
+        manual = self._mock_transcript(language_code="de", is_generated=False, snippets=("manual",))
+        auto = self._mock_transcript(language_code="en", is_generated=True, snippets=("auto",))
+        with patch("youtube_transcript_api.YouTubeTranscriptApi") as TranscriptApi, \
+             patch.object(fetcher, "_youtube_oembed_title", return_value="t"):
+            # Order shouldn't matter — manual is selected regardless.
+            TranscriptApi.return_value.list.return_value = [auto, manual]
+            result = fetcher._youtube_transcript(YOUTUBE_URL)
+
+        assert "manual" in result["text"]
+        assert "auto" not in result["text"]
+        assert result["language"] == "de"
+
+    def test_uses_non_english_auto_generated_when_thats_all_there_is(self):
+        """A German-only auto-generated transcript should be picked up (regression
+        for the English-default behaviour that silently dropped non-en videos)."""
+        from bot import fetcher
+
+        de_auto = self._mock_transcript(language_code="de", is_generated=True, snippets=("guten", "tag"))
+        with patch("youtube_transcript_api.YouTubeTranscriptApi") as TranscriptApi, \
+             patch.object(fetcher, "_youtube_oembed_title", return_value="t"):
+            TranscriptApi.return_value.list.return_value = [de_auto]
+            result = fetcher._youtube_transcript(YOUTUBE_URL)
+
+        assert "guten tag" in result["text"]
+        assert result["language"] == "de"
 
     def test_transcript_api_title_falls_back_to_placeholder(self):
         from bot import fetcher
 
         with patch("youtube_transcript_api.YouTubeTranscriptApi") as TranscriptApi, \
              patch.object(fetcher, "_youtube_oembed_title", return_value=None):
-            TranscriptApi.return_value.fetch.return_value = [MagicMock(text="hi")]
+            TranscriptApi.return_value.list.return_value = [self._mock_transcript(snippets=("hi",))]
             result = fetcher._youtube_transcript(YOUTUBE_URL)
 
         assert result["title"] == f"YouTube video ({VIDEO_ID})"
@@ -51,7 +90,7 @@ class TestYouTubeFallbackChain:
         with patch("youtube_transcript_api.YouTubeTranscriptApi") as TranscriptApi, \
              patch.object(fetcher, "_yt_dlp_extract") as extract, \
              patch.object(fetcher, "_yt_dlp_transcribe") as transcribe:
-            TranscriptApi.return_value.fetch.side_effect = Exception("blocked")
+            TranscriptApi.return_value.list.side_effect = Exception("blocked")
             extract.return_value = {
                 "text": "Title\nBy: ch\n\nTranscript:\nsubs body",
                 "title": "Title",
@@ -72,7 +111,7 @@ class TestYouTubeFallbackChain:
         with patch("youtube_transcript_api.YouTubeTranscriptApi") as TranscriptApi, \
              patch.object(fetcher, "_yt_dlp_extract") as extract, \
              patch.object(fetcher, "_yt_dlp_transcribe") as transcribe:
-            TranscriptApi.return_value.fetch.side_effect = Exception("blocked")
+            TranscriptApi.return_value.list.side_effect = Exception("blocked")
             extract.return_value = {
                 "text": "Title\nBy: ch\n\nshort description",
                 "title": "Title",
@@ -98,7 +137,7 @@ class TestYouTubeFallbackChain:
         with patch("youtube_transcript_api.YouTubeTranscriptApi") as TranscriptApi, \
              patch.object(fetcher, "_yt_dlp_extract") as extract, \
              patch.object(fetcher, "_yt_dlp_transcribe") as transcribe:
-            TranscriptApi.return_value.fetch.side_effect = Exception("blocked")
+            TranscriptApi.return_value.list.side_effect = Exception("blocked")
             extract.return_value = {
                 "text": "Title\nBy: ch\n\nlong description",
                 "title": "Title",
@@ -118,7 +157,7 @@ class TestYouTubeFallbackChain:
         with patch("youtube_transcript_api.YouTubeTranscriptApi") as TranscriptApi, \
              patch.object(fetcher, "_yt_dlp_extract") as extract, \
              patch.object(fetcher, "_yt_dlp_transcribe") as transcribe:
-            TranscriptApi.return_value.fetch.side_effect = Exception("blocked")
+            TranscriptApi.return_value.list.side_effect = Exception("blocked")
             extract.return_value = {
                 "text": "Title\nBy: ch\n\ndescription text",
                 "title": "Title",
@@ -142,7 +181,7 @@ class TestYouTubeFallbackChain:
         with patch("youtube_transcript_api.YouTubeTranscriptApi") as TranscriptApi, \
              patch.object(fetcher, "_yt_dlp_extract") as extract, \
              patch.object(fetcher, "_yt_dlp_transcribe") as transcribe:
-            TranscriptApi.return_value.fetch.side_effect = Exception("blocked")
+            TranscriptApi.return_value.list.side_effect = Exception("blocked")
             extract.return_value = {
                 "text": "",
                 "title": YOUTUBE_URL,
