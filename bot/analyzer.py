@@ -439,20 +439,27 @@ multi-topic source should yield a long, thoroughly sectioned brief.
 CONTENT:
 {text}"""
 
-# Upper bound on a stored brief. Generous enough not to truncate a long
-# multi-topic distillation, but still a derived brief — not a verbatim copy of
-# the source (which keeps the data-minimisation / copyright posture).
-SUMMARY_MAX_CHARS = 32_000
-# Anthropic output-token ceiling we'll request. Scaled per source below.
-_SUMMARY_MAX_OUTPUT_TOKENS = 8_000
+# Upper bound on a stored brief. Matches MAX_CONTENT_CHARS so a faithful brief
+# can be as long as the source (the summary is still a derived brief — the
+# prompt strips filler and reorganises — it's just not artificially capped).
+SUMMARY_MAX_CHARS = 100_000
+# Anthropic output-token ceiling we'll request. Sized to comfortably reach
+# SUMMARY_MAX_CHARS at the model's average chars/token, and well under the
+# Haiku 4.5 64k hard limit. Scaled per source below.
+_SUMMARY_MAX_OUTPUT_TOKENS = 32_000
 
 
 def _summary_output_tokens(text: str) -> int:
-    """Scale requested output length to the source (~4 chars/token), so short
-    inputs get short briefs and long ones get room for a full sectioned brief."""
+    """Scale requested output length 1:1 to the source (~4 chars/token).
+
+    The prompt asks the model to preserve every distinct claim and scale
+    length to the source. A faithful brief is almost always shorter than
+    verbatim input, so the model self-regulates and stops at end_turn well
+    before the cap. Earlier ratios (//4, //2) were binding before the model
+    finished and showed up as summaries ending mid-section. 1:1 makes
+    truncation a rare edge case."""
     approx_input_tokens = len(text) // 4
-    # Target roughly a quarter of the input, floored/capped to sane bounds.
-    return max(512, min(_SUMMARY_MAX_OUTPUT_TOKENS, approx_input_tokens // 4))
+    return max(512, min(_SUMMARY_MAX_OUTPUT_TOKENS, approx_input_tokens))
 
 
 def summarize_content(text: str, *, ctx: UsageContext | None = None) -> str:
@@ -490,6 +497,7 @@ def summarize_content(text: str, *, ctx: UsageContext | None = None) -> str:
                 messages=[{"role": "user", "content": prompt}],
             )
             in_tok, out_tok = _anthropic_tokens(resp)
+            stop_reason = getattr(resp, "stop_reason", None)
             out = "".join(
                 b.text for b in resp.content if getattr(b, "type", None) == "text"
             ).strip()
@@ -500,7 +508,21 @@ def summarize_content(text: str, *, ctx: UsageContext | None = None) -> str:
                 messages=[{"role": "user", "content": prompt}],
             )
             in_tok, out_tok = _openai_tokens(resp)
+            stop_reason = getattr(resp.choices[0], "finish_reason", None)
             out = (resp.choices[0].message.content or "").strip()
+        # Surface max-tokens truncation distinctly from the SUMMARY_MAX_CHARS
+        # cap — they bound the output independently. The token cap is the
+        # binding constraint for long inputs and shows up as a summary that
+        # ends mid-word / mid-section even though `len(summary)` is well
+        # under SUMMARY_MAX_CHARS.
+        if stop_reason in ("max_tokens", "length"):
+            logger.warning(
+                "summary truncated by max_tokens (requested=%d, output_tokens=%d, "
+                "output_chars=%d, input_chars=%d, source_type=%s) — bump "
+                "_summary_output_tokens or raise _SUMMARY_MAX_OUTPUT_TOKENS",
+                max_tokens, out_tok, len(out), len(text),
+                (ctx.source_type if ctx else "") or "",
+            )
         _record_usage(purpose="summary", input_tokens=in_tok, output_tokens=out_tok,
                       started_at=started, ctx=ctx)
         if out:
