@@ -303,6 +303,14 @@ def _yt_dlp_extract(url: str) -> dict:
     description = info.get("description") or ""
     duration = int(info.get("duration") or 0)
     language = info.get("language") or ""
+    # yt-dlp returns YYYYMMDD as a string; normalise to ISO so it flows
+    # cleanly into prompts and (later) into stored item rows.
+    upload_date_raw = info.get("upload_date") or ""
+    published_at = (
+        f"{upload_date_raw[:4]}-{upload_date_raw[4:6]}-{upload_date_raw[6:8]}"
+        if len(upload_date_raw) == 8 and upload_date_raw.isdigit()
+        else ""
+    )
     source_type = "youtube" if "vimeo" not in url and "youtube" in url else "video"
 
     # Pass 2: best-effort subtitle download. Prefer the video's detected
@@ -367,6 +375,7 @@ def _yt_dlp_extract(url: str) -> dict:
         "has_transcript": bool(subtitle_text),
         "duration": duration,
         "language": language,
+        "published_at": published_at,
     }
 
 

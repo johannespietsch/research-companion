@@ -75,6 +75,8 @@ def main() -> int:
     print(f"image_urls:   {len(fetched.get('image_urls') or [])}")
     if fetched.get("language"):
         print(f"language:     {fetched['language']}")
+    if fetched.get("published_at"):
+        print(f"published_at: {fetched['published_at']}")
     if fetched.get("reason"):
         print(f"reason:       {fetched['reason']}")
 

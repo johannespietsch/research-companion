@@ -162,9 +162,16 @@ async def analyze_url(
 
     # Summarise on a thread so we don't block the event loop on the LLM
     # call. The async wrapper around a sync call mirrors what _run_job did.
+    # `published_at` (when available from yt-dlp) anchors the model's
+    # interpretation of relative dates in the source — without it, models
+    # silently default to their training-cutoff year.
     _step("summarizing")
+    published_at = fetched.get("published_at") or ""
     loop = asyncio.get_running_loop()
-    summary = await loop.run_in_executor(None, lambda: summarize_content(text, ctx=ctx))
+    summary = await loop.run_in_executor(
+        None,
+        lambda: summarize_content(text, ctx=ctx, published_at=published_at),
+    )
 
     _step("analyzing")
     try:
