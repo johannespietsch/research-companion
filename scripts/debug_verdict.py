@@ -1,16 +1,19 @@
 """Debug step 3: fetch + summarize + analyze a URL — the full pipeline ending in a verdict.
 
-Uses the real `bot.pipeline.analyze_url`, so this is exactly what `/api/try`
-runs for an anonymous user (no `save_for_user_id`).
+Uses the real `bot.pipeline.analyze_url`. By default runs as a signed-in
+user (ctx.user_id=1) so the dispatch picks Sonnet 4.6 for summary +
+analyze — same code path real signed-in users hit. Pass `--anon` to
+simulate the anonymous /api/try caller (Haiku 4.5 throughout).
 
 Surfaces all limits along the chain:
   - bot.config.MAX_CONTENT_CHARS    (fetched text cap)
   - bot.analyzer.SUMMARY_MAX_CHARS  (summary cap — analyze() runs on the summary, not the raw text)
-  - profile text (DEFAULT_PROFILE for anon, or the file passed via --profile)
+  - profile text (DEFAULT_PROFILE if --profile not given; --profile reads from a file)
 
 Run:
-    python -m scripts.debug_verdict <url>                       # anon → DEFAULT_PROFILE
-    python -m scripts.debug_verdict <url> --profile PROFILE.md  # use a custom profile file
+    python -m scripts.debug_verdict <url>                       # signed-in path (default)
+    python -m scripts.debug_verdict <url> --anon                # anon /api/try path
+    python -m scripts.debug_verdict <url> --profile PROFILE.md  # signed-in with a custom profile
 """
 from __future__ import annotations
 
@@ -38,29 +41,44 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("url")
     parser.add_argument(
+        "--anon",
+        action="store_true",
+        help="Simulate the anonymous /api/try caller (no user_id in ctx). "
+        "Default is signed-in (ctx.user_id=1) so the dispatch picks the "
+        "premium model.",
+    )
+    parser.add_argument(
         "--profile",
-        help="Path to a profile file (e.g. PROFILE.md). Omit to use DEFAULT_PROFILE (anon).",
+        help="Path to a profile file (e.g. PROFILE.md). Omit to use DEFAULT_PROFILE.",
     )
     args = parser.parse_args()
 
-    # Resolve which profile the analyzer will use. We monkey-patch
-    # _load_profile so analyze() picks up the supplied file without needing a
-    # signed-in user_id, mirroring the anon path otherwise.
+    # Resolve which profile the analyzer will use. We always monkey-patch
+    # _load_profile so analyze() picks up the configured text without
+    # touching the real DB — independent of the tier flag.
     if args.profile:
         profile_text = Path(args.profile).read_text(encoding="utf-8").strip()
         profile_source = f"file: {args.profile}"
-        analyzer._load_profile = lambda user_id=None: profile_text  # type: ignore[assignment]
     else:
         profile_text = DEFAULT_PROFILE
-        profile_source = "DEFAULT_PROFILE (anon)"
+        profile_source = "DEFAULT_PROFILE"
+    analyzer._load_profile = lambda user_id=None: profile_text  # type: ignore[assignment]
+
+    ctx = UsageContext(user_id=None if args.anon else 1)
+    resolved_summary_model = analyzer._resolve_model("summary", ctx)
+    resolved_analyze_model = analyzer._resolve_model("analyze", ctx)
+
+    print()
+    print("=== TIER ===")
+    print(f"mode:           {'anon' if args.anon else 'signed-in (user_id=1)'}")
+    print(f"summary model:  {resolved_summary_model}")
+    print(f"analyze model:  {resolved_analyze_model}")
 
     print()
     print("=== PROFILE ===")
     print(f"source: {profile_source}")
     print(f"chars:  {len(profile_text):,}")
     print(profile_text)
-
-    ctx = UsageContext()  # anon: no user_id / anon_id / job_id
 
     def on_step(label: str) -> None:
         logger.info("pipeline step: %s", label)

@@ -8,11 +8,16 @@ Surfaces the limits applied at this stage:
   - bot.analyzer._summary_output_tokens(text) — actual max_tokens requested,
     scaled to the input length.
 
+By default runs as a signed-in user (ctx.user_id=1) so the model dispatch
+picks Sonnet 4.6 — same code path real signed-in users hit. Pass `--anon`
+to simulate an anonymous /api/try caller (Haiku 4.5).
+
 Hits the same content-addressed cache as the production pipeline; a "cache hit"
 log line means no LLM call was made.
 
 Run:
-    python -m scripts.debug_summary <url>
+    python -m scripts.debug_summary <url>            # signed-in path (default)
+    python -m scripts.debug_summary <url> --anon     # anon /api/try path
 """
 from __future__ import annotations
 
@@ -44,6 +49,13 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("url")
     parser.add_argument(
+        "--anon",
+        action="store_true",
+        help="Simulate the anonymous /api/try caller (no user_id in ctx). "
+        "Default is signed-in (ctx.user_id=1) so the dispatch picks the "
+        "premium model.",
+    )
+    parser.add_argument(
         "--no-cache",
         action="store_true",
         help="Force a fresh LLM call (the summary cache key doesn't include "
@@ -62,6 +74,16 @@ def main() -> int:
         return 1
 
     requested_max_tokens = _summary_output_tokens(text)
+    ctx = UsageContext(
+        user_id=None if args.anon else 1,
+        source_type=fetched.get("source_type") or "",
+    )
+    resolved_model = analyzer._resolve_model("summary", ctx)
+
+    print()
+    print("=== TIER ===")
+    print(f"mode:           {'anon' if args.anon else 'signed-in (user_id=1)'}")
+    print(f"resolved model: {resolved_model}")
 
     print()
     print("=== FETCH ===")
@@ -77,7 +99,6 @@ def main() -> int:
     print(f"_SUMMARY_MAX_OUTPUT_TOKENS:{_SUMMARY_MAX_OUTPUT_TOKENS:>7,}  (hard ceiling)")
     print(f"requested max_tokens:     {requested_max_tokens:,}  (scaled: ~input_chars // 4, 1:1 with input tokens)")
 
-    ctx = UsageContext(source_type=fetched.get("source_type") or "")
     summary = summarize_content(text, ctx=ctx)
 
     # Estimate output tokens used to detect a max_tokens-shaped cutoff. The

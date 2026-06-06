@@ -159,13 +159,15 @@ Example list output:
 
 ### Debugging the pipeline
 
-Three scripts walk the URL → analysis chain step by step and surface the internal length limits that bound each stage. Use them to see exactly where a piece of content is being truncated (`MAX_CONTENT_CHARS` on the fetched text, requested `max_tokens` on the summary call, `SUMMARY_MAX_CHARS` on the stored brief).
+Three scripts walk the URL → analysis chain step by step and surface the internal length limits that bound each stage. Use them to see exactly where a piece of content is being truncated (`MAX_CONTENT_CHARS` on the fetched text, requested `max_tokens` on the summary call, `SUMMARY_MAX_CHARS` on the stored brief) and which model the dispatch resolves to.
 
 ```bash
-python -m scripts.debug_transcript <url>                       # fetched text + char limits
-python -m scripts.debug_summary <url> [--no-cache]             # + summary, with token-cap fill ratio
-python -m scripts.debug_verdict <url> [--profile PROFILE.md]   # + verdict; defaults to anon DEFAULT_PROFILE
+python -m scripts.debug_transcript <url>                          # fetched text + char limits
+python -m scripts.debug_summary <url> [--anon] [--no-cache]       # + summary, with token-cap fill ratio
+python -m scripts.debug_verdict <url> [--anon] [--profile PROFILE.md]  # + verdict; profile defaults to DEFAULT_PROFILE
 ```
+
+`debug_summary` and `debug_verdict` default to the **signed-in path** (`ctx.user_id=1` → Sonnet 4.6 on summary + analyze), matching what a real signed-in user sees. Pass `--anon` to simulate the anonymous `/api/try` caller (Haiku throughout).
 
 `--no-cache` on `debug_summary` bypasses the content-addressed cache so you see a fresh LLM call after changing prompts or token caps (the cache key doesn't include `max_tokens`, so a stale truncated summary would otherwise be returned).
 
