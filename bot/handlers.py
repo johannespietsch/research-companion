@@ -28,7 +28,7 @@ async def _send_agent_briefs(
     source_title: str = "",
     source_url: str = "",
 ) -> None:
-    """Send a copyable 'do this with your AI' brief per action, after the analysis.
+    """Send a copyable 'try this' brief per action, after the analysis.
 
     Sent as separate messages so each stays within Telegram's length limit and
     each <pre> block is independently tap-to-copy.
