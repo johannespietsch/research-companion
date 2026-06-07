@@ -203,9 +203,10 @@ _TOOL_SCHEMA = {
         "first_step": {
             "type": "string",
             "description": (
-                "The very first concrete move for the quick win — one copy-pasteable "
-                "step they could hand straight to an AI assistant to start (e.g. the "
-                "exact command, file to open, or one-line task). Imperative, no preamble."
+                "The single most concrete first move for the quick win — a specific, "
+                "do-able action (e.g. the exact command to run, the file or page to "
+                "open, the search to make, or the first thing to write). Imperative, "
+                "no preamble, and no meta-advice about using AI/assistants."
             ),
         },
         "bigger_play": {
@@ -256,7 +257,7 @@ Analyze the following content and produce a structured analysis covering the req
 The actions are the point of this analysis — make them the strongest part:
 - `grounded_in`: name the one specific claim/result/quote/section in this content the actions build on, so they're traceable to the source.
 - `quick_win`: an imperative action they can finish in 30–90 minutes this weekend (low activation energy).
-- `first_step`: the single first move for the quick win, phrased so it could be handed straight to an AI assistant to begin.
+- `first_step`: the single most concrete first move for the quick win — a specific, do-able action (a command, a file/page to open, a thing to write), not meta-advice about using AI.
 - `bigger_play`: the more ambitious multi-week arc for when they're ready to commit.
 Make the difference between quick_win and bigger_play obvious; don't just restate one as the other. Every action must be concrete and specific to this person — never generic advice.
 
