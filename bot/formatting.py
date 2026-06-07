@@ -34,15 +34,15 @@ def format_agent_brief(action: dict) -> str:
     """Render one handoff action as a Telegram-HTML message with a copyable block.
 
     The brief sits in a <pre> block so Telegram offers tap-to-copy — the user
-    pastes it straight into whatever AI assistant they use.
+    pastes it straight into whatever assistant they use (ChatGPT, Claude, …).
     """
     label = (action.get("label") or "Action").strip()
     brief = (action.get("brief") or "").strip()
     if not brief:
         return ""
     return (
-        f"📋 <b>{html.escape(label)} — do this with your AI</b>\n"
-        f"<i>tap to copy, paste into ChatGPT / Claude / Cursor / Codex…</i>\n"
+        f"📋 <b>{html.escape(label)} — try this</b>\n"
+        f"<i>tap to copy, then paste into ChatGPT, Claude, Cursor, Codex…</i>\n"
         f"<pre>{html.escape(brief)}</pre>"
     )
 

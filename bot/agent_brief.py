@@ -1,9 +1,9 @@
-"""Build agent-agnostic 'do this with AI' handoff briefs from an analysis.
+"""Build agent-agnostic 'try this' handoff briefs from an analysis.
 
 The brief is a self-contained, paste-anywhere instruction the user drops into
-their own AI assistant (ChatGPT, Claude, Cursor, Codex, Gemini — we don't name
-one). filter.fyi finds the signal and hands it off; the user's own AI does the
-work, so this adds no inference cost on our side — the brief is pure templating
+their assistant of choice (ChatGPT, Claude, Cursor, Codex, Gemini — we don't name
+one). filter.fyi finds the signal and hands it off; the user's own assistant does
+the work, so this adds no inference cost on our side — the brief is pure templating
 over fields the analysis already produced.
 
 Security: source-derived text (the grounded claim + a summary excerpt) is wrapped
@@ -44,7 +44,8 @@ def build_agent_brief(
 ) -> str:
     """Render one agent-agnostic handoff brief.
 
-    Returns a plain-text block the user can paste into any AI assistant. Empty
+    Returns a plain-text block the user can paste into their assistant of choice
+    (ChatGPT, Claude, Cursor, Codex, …). Empty
     `action` yields an empty string (nothing to hand off).
     """
     action = (action or "").strip()
