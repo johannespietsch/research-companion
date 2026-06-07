@@ -68,9 +68,20 @@ def client(monkeypatch):
             "why_it_matters": "Practical AI pattern.",
             "grounded_in": "They show a 12-point eval lift from reranking retrieved chunks.",
             "category": "ai-engineering",
-            "quick_win": "Wire up a 20-doc RAG demo this afternoon.",
-            "first_step": "Create rag_demo.py and load 20 markdown files into a vector store.",
-            "bigger_play": "Build an evaluated RAG pipeline over your own corpus.",
+            "suggestions": [
+                {
+                    "title": "Wire up a RAG demo",
+                    "detail": "Stand up a 20-doc retrieval demo this afternoon to feel the pattern.",
+                    "first_step": "Create rag_demo.py and load 20 markdown files into a vector store.",
+                    "effort": "~2 hrs",
+                },
+                {
+                    "title": "Add a reranker",
+                    "detail": "Wrap the retriever with a cross-encoder reranker and measure the lift.",
+                    "first_step": "pip install sentence-transformers and rerank the top 50 hits.",
+                    "effort": "a weekend",
+                },
+            ],
             "time_required": "10 min read",
             "verdict": "watch",
         }

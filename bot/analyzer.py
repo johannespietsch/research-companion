@@ -149,21 +149,26 @@ def _get_client():
     return _client
 
 
+# Scalar (string) analysis fields. The actionable follow-ups live in a separate
+# `suggestions` array (0–5 items) handled alongside these — see SUGGESTION_FIELDS.
 ANALYSIS_FIELDS = (
     "main_idea",
     "why_it_matters",
     "grounded_in",
     "category",
-    "quick_win",
-    "first_step",
-    "bigger_play",
     "time_required",
     "verdict",
 )
 
-# Older stored items used a single `suggested_experiment`. Kept as a constant so
-# renderers can fall back to it; new analyses populate quick_win + bigger_play.
+# Each suggestion is a self-contained next step. 0–5 per analysis; an empty list
+# is valid and expected when the content has no follow-up worth the reader's time.
+SUGGESTION_FIELDS = ("title", "detail", "first_step", "effort")
+MAX_SUGGESTIONS = 5
+
+# Legacy fields from before the suggestions[] migration. Kept so _normalize can
+# synthesize suggestions from older cached/stored analyses for uniform rendering.
 LEGACY_EXPERIMENT_FIELD = "suggested_experiment"
+_LEGACY_ACTION_FIELDS = ("quick_win", "bigger_play", "first_step", "suggested_experiment")
 
 VERDICTS = ("watch", "skim", "skip")
 
@@ -191,31 +196,43 @@ _TOOL_SCHEMA = {
             "type": "string",
             "description": "Short topic tag (kebab-case), e.g. 'ai-engineering', 'productivity', 'crypto-trading'.",
         },
-        "quick_win": {
-            "type": "string",
+        "suggestions": {
+            "type": "array",
+            "maxItems": MAX_SUGGESTIONS,
             "description": (
-                "A concrete, scoped action this person can finish in 30–90 minutes "
-                "THIS WEEKEND — low activation energy, no setup marathon. Specific to "
-                "their situation, not generic advice. Phrase it as an imperative "
-                "instruction ('Add X to your Y…'), not a suggestion to consider."
+                "0 to 5 concrete next steps the reader could take, ordered best-first "
+                "and varied in ambition (a 30-minute quick win through a multi-week "
+                "project). Each must be specific to this person and genuinely worth "
+                "their time. QUALITY OVER QUANTITY: return an EMPTY array if the "
+                "content is purely informational/news with no follow-up worth doing — "
+                "never invent busywork. We always respect the reader's time."
             ),
-        },
-        "first_step": {
-            "type": "string",
-            "description": (
-                "The single most concrete first move for the quick win — a specific, "
-                "do-able action (e.g. the exact command to run, the file or page to "
-                "open, the search to make, or the first thing to write). Imperative, "
-                "no preamble, and no meta-advice about using AI/assistants."
-            ),
-        },
-        "bigger_play": {
-            "type": "string",
-            "description": (
-                "A more ambitious multi-session/multi-week project for when they're "
-                "ready to commit — the deeper arc that builds real capability. Make "
-                "the difference from the quick win clear."
-            ),
+            "items": {
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "A 3–6 word imperative label, e.g. 'Add a reranker'.",
+                    },
+                    "detail": {
+                        "type": "string",
+                        "description": "One sentence: what to do and why it pays off, specific to this person.",
+                    },
+                    "first_step": {
+                        "type": "string",
+                        "description": (
+                            "The single most concrete first move — the exact command to run, "
+                            "file/page to open, or first thing to write. Imperative, no preamble, "
+                            "no meta-advice about using AI/assistants."
+                        ),
+                    },
+                    "effort": {
+                        "type": "string",
+                        "description": "Rough commitment, e.g. '~30 min', '~2 hrs', 'a weekend', 'multi-week'.",
+                    },
+                },
+                "required": list(SUGGESTION_FIELDS),
+            },
         },
         "time_required": {
             "type": "string",
@@ -227,7 +244,7 @@ _TOOL_SCHEMA = {
             "description": "How worth the user's time: 'watch' (engage fully), 'skim' (worth a quick look), 'skip' (not for them).",
         },
     },
-    "required": list(ANALYSIS_FIELDS),
+    "required": list(ANALYSIS_FIELDS) + ["suggestions"],
 }
 
 _ANTHROPIC_TOOL = {
@@ -254,22 +271,22 @@ _PROMPT = """You are my personal AI research analyst.
 {profile_block}
 Analyze the following content and produce a structured analysis covering the required fields. Be concrete and specific to this person — `why_it_matters` should speak to their situation, not give generic advice.
 
-The actions are the point of this analysis — make them the strongest part:
-- `grounded_in`: name the one specific claim/result/quote/section in this content the actions build on, so they're traceable to the source.
-- `quick_win`: an imperative action they can finish in 30–90 minutes this weekend (low activation energy).
-- `first_step`: the single most concrete first move for the quick win — a specific, do-able action (a command, a file/page to open, a thing to write), not meta-advice about using AI.
-- `bigger_play`: the more ambitious multi-week arc for when they're ready to commit.
-Make the difference between quick_win and bigger_play obvious; don't just restate one as the other. Every action must be concrete and specific to this person — never generic advice.
+The suggestions are the point of this analysis — make them the strongest part:
+- `grounded_in`: name the one specific claim/result/quote/section in this content the suggestions build on, so they're traceable to the source.
+- `suggestions`: 0 to 5 concrete next steps, ordered best-first, varied in ambition (a 30-minute quick win through a multi-week project). Each has a short `title`, a one-sentence `detail`, a concrete `first_step`, and an `effort` estimate. Every one must be specific to this person and genuinely worth their time — never generic advice.
+  QUALITY OVER QUANTITY. Do not pad to hit a number. If the content is purely informational or news with no follow-up genuinely worth the reader's time, return an EMPTY `suggestions` array — we always respect the reader's time.
 
 CONTENT:
 {text}"""
 
 _OPENAI_JSON_SUFFIX = (
-    "\n\nRespond with a single JSON object containing exactly these keys: "
+    "\n\nRespond with a single JSON object containing these keys: "
     + ", ".join(ANALYSIS_FIELDS)
-    + ". 'verdict' must be one of: "
+    + ", suggestions. 'verdict' must be one of: "
     + ", ".join(VERDICTS)
-    + "."
+    + ". 'suggestions' is an array of 0 to 5 objects, each with: "
+    + ", ".join(SUGGESTION_FIELDS)
+    + " (return [] if there's no follow-up worth the reader's time)."
 )
 
 
@@ -281,12 +298,54 @@ def _load_profile(user_id: int | None) -> str:
 
 
 def _normalize(raw: dict) -> dict:
-    """Coerce LLM output into our exact schema (string fields, verdict in allowed set)."""
+    """Coerce LLM output into our schema: scalar string fields + a suggestions list.
+
+    Also upgrades legacy analyses (cached or stored before the suggestions[]
+    migration) by synthesizing suggestions from their quick_win/bigger_play
+    fields, so every downstream renderer can rely on `suggestions`.
+    """
     out = {k: str(raw.get(k, "")).strip() for k in ANALYSIS_FIELDS}
     if out["verdict"].lower() not in VERDICTS:
         out["verdict"] = "skim"
     else:
         out["verdict"] = out["verdict"].lower()
+    out["suggestions"] = _normalize_suggestions(raw)
+    return out
+
+
+def _normalize_suggestions(raw: dict) -> list[dict]:
+    raw_list = raw.get("suggestions")
+    if isinstance(raw_list, list):
+        items: list[dict] = []
+        for s in raw_list[:MAX_SUGGESTIONS]:
+            if not isinstance(s, dict):
+                continue
+            item = {k: str(s.get(k, "")).strip() for k in SUGGESTION_FIELDS}
+            if item["title"] or item["detail"]:  # drop empty rows
+                items.append(item)
+        return items
+    return _legacy_suggestions(raw)
+
+
+def _legacy_suggestions(raw: dict) -> list[dict]:
+    """Build suggestions[] from the old quick_win/bigger_play/suggested_experiment
+    fields, so analyses produced before the migration still render as boxes."""
+    out: list[dict] = []
+    quick_win = str(raw.get("quick_win", "")).strip()
+    if quick_win:
+        out.append({
+            "title": "Quick win",
+            "detail": quick_win,
+            "first_step": str(raw.get("first_step", "")).strip(),
+            "effort": "a weekend",
+        })
+    bigger_play = str(raw.get("bigger_play", "")).strip()
+    if bigger_play:
+        out.append({"title": "Bigger play", "detail": bigger_play, "first_step": "", "effort": "multi-week"})
+    if not out:
+        legacy = str(raw.get(LEGACY_EXPERIMENT_FIELD, "")).strip()
+        if legacy:
+            out.append({"title": "Try this", "detail": legacy, "first_step": "", "effort": ""})
     return out
 
 
@@ -427,7 +486,7 @@ def analyze(text: str, user_id: int | None = None, *, ctx: UsageContext | None =
         if _PROVIDER == "anthropic":
             resp = client.messages.create(
                 model=model,
-                max_tokens=1024,
+                max_tokens=2048,  # room for up to 5 suggestions + scalar fields
                 tools=[_ANTHROPIC_TOOL],
                 tool_choice={"type": "tool", "name": "record_analysis"},
                 messages=[{"role": "user", "content": prompt}],
@@ -736,4 +795,16 @@ def to_plain_text(analysis: dict) -> str:
         if not value:
             continue
         lines.append(f"{_LEGACY_FIELD_LABELS[key]}: {value}")
+    suggestions = analysis.get("suggestions") or []
+    if suggestions:
+        parts = ["Suggestions:"]
+        for s in suggestions:
+            title = (s.get("title") or "").strip()
+            detail = (s.get("detail") or "").strip()
+            effort = (s.get("effort") or "").strip()
+            parts.append(f"- {title}" + (f" ({effort})" if effort else "") + (f": {detail}" if detail else ""))
+            first_step = (s.get("first_step") or "").strip()
+            if first_step:
+                parts.append(f"  First step: {first_step}")
+        lines.append("\n".join(parts))
     return "\n\n".join(lines)
