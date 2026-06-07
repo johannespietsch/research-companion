@@ -6,9 +6,10 @@ A Telegram bot that acts as a personal AI research analyst. Send it links, artic
 
 1. **Ingest** -- send any content to the bot via Telegram (URLs, text, voice, video, photos, documents)
 2. **Extract** -- fetches and extracts text from the source (smart handling for YouTube, Twitter/X, articles, PDFs, audio transcription)
-3. **Analyze** -- an LLM produces a structured breakdown: main idea, why it matters, category, suggested experiment, time to explore
-4. **Store** -- saves the original content, analysis, and your context message to a local knowledge base
-5. **Browse** -- query and review your knowledge base from the CLI
+3. **Analyze** -- an LLM produces a structured breakdown: main idea, why it matters, the source point it's grounded in, category, a quick win (+ first step) and a bigger play, time to explore, and a watch/skim/skip verdict
+4. **Hand off** -- each suggestion ships a tool-agnostic "try this" brief the reader can paste straight into their own assistant (ChatGPT, Claude, Cursor, Codex…) to plan and execute — built by `bot/agent_brief.py`, zero extra inference cost
+5. **Store** -- saves the original content, analysis, and your context message to a local knowledge base
+6. **Browse** -- query and review your knowledge base from the CLI
 
 ## Supported Input Types
 
@@ -254,10 +255,19 @@ Response shape:
   "analysis": {
     "main_idea": "…",
     "why_it_matters": "…",
+    "grounded_in": "the specific source claim the actions rest on",
     "category": "kebab-case",
-    "suggested_experiment": "…",
+    "quick_win": "imperative 30–90 min action",
+    "first_step": "one copy-pasteable opening move for the quick win",
+    "bigger_play": "the more ambitious multi-week arc",
     "time_required": "12 min read"
-  }
+  },
+  // One "try this" handoff per tier, built from the fields above (pure
+  // templating — no extra LLM call). `brief` is the paste-anywhere text.
+  "actions": [
+    { "kind": "quick_win",   "label": "⚡ Quick win",   "text": "…", "brief": "…" },
+    { "kind": "bigger_play", "label": "🚀 Bigger play", "text": "…", "brief": "…" }
+  ]
 }
 ```
 
