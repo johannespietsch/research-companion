@@ -6,8 +6,10 @@ from bot.analyzer import ANALYSIS_FIELDS, parse_stored
 _SECTION_EMOJIS = {
     "main_idea": "💡",
     "why_it_matters": "🎯",
+    "grounded_in": "📎",
     "category": "🏷",
     "quick_win": "⚡",
+    "first_step": "👣",
     "bigger_play": "🚀",
     "suggested_experiment": "🧪",  # legacy rows
     "time_required": "⏱",
@@ -17,13 +19,32 @@ _SECTION_EMOJIS = {
 _FIELD_LABELS = {
     "main_idea": "Main idea",
     "why_it_matters": "Why it matters",
+    "grounded_in": "Based on",
     "category": "Category",
     "quick_win": "Quick win (30–90 min)",
+    "first_step": "First step",
     "bigger_play": "Bigger play (when you're ready)",
     "suggested_experiment": "Suggested experiment",  # legacy rows
     "time_required": "Time required to explore",
     "verdict": "Verdict",
 }
+
+
+def format_agent_brief(action: dict) -> str:
+    """Render one handoff action as a Telegram-HTML message with a copyable block.
+
+    The brief sits in a <pre> block so Telegram offers tap-to-copy — the user
+    pastes it straight into whatever AI assistant they use.
+    """
+    label = (action.get("label") or "Action").strip()
+    brief = (action.get("brief") or "").strip()
+    if not brief:
+        return ""
+    return (
+        f"📋 <b>{html.escape(label)} — do this with your AI</b>\n"
+        f"<i>tap to copy, paste into ChatGPT / Claude / Cursor / Codex…</i>\n"
+        f"<pre>{html.escape(brief)}</pre>"
+    )
 
 
 def format_analysis(analysis) -> str:

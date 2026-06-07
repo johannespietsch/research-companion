@@ -152,8 +152,10 @@ def _get_client():
 ANALYSIS_FIELDS = (
     "main_idea",
     "why_it_matters",
+    "grounded_in",
     "category",
     "quick_win",
+    "first_step",
     "bigger_play",
     "time_required",
     "verdict",
@@ -176,6 +178,15 @@ _TOOL_SCHEMA = {
             "type": "string",
             "description": "Why this is relevant to this person specifically.",
         },
+        "grounded_in": {
+            "type": "string",
+            "description": (
+                "The single most concrete thing IN THIS CONTENT that the actions "
+                "rest on — a specific claim, result, quote, or timestamp/section. "
+                "One sentence, quoted or closely paraphrased, so the action is "
+                "traceable back to the source. Not a restatement of main_idea."
+            ),
+        },
         "category": {
             "type": "string",
             "description": "Short topic tag (kebab-case), e.g. 'ai-engineering', 'productivity', 'crypto-trading'.",
@@ -185,7 +196,16 @@ _TOOL_SCHEMA = {
             "description": (
                 "A concrete, scoped action this person can finish in 30–90 minutes "
                 "THIS WEEKEND — low activation energy, no setup marathon. Specific to "
-                "their situation, not generic advice."
+                "their situation, not generic advice. Phrase it as an imperative "
+                "instruction ('Add X to your Y…'), not a suggestion to consider."
+            ),
+        },
+        "first_step": {
+            "type": "string",
+            "description": (
+                "The very first concrete move for the quick win — one copy-pasteable "
+                "step they could hand straight to an AI assistant to start (e.g. the "
+                "exact command, file to open, or one-line task). Imperative, no preamble."
             ),
         },
         "bigger_play": {
@@ -233,10 +253,12 @@ _PROMPT = """You are my personal AI research analyst.
 {profile_block}
 Analyze the following content and produce a structured analysis covering the required fields. Be concrete and specific to this person — `why_it_matters` should speak to their situation, not give generic advice.
 
-For the action, give TWO distinct tiers, both grounded in this content:
-- `quick_win`: something they can actually finish in 30–90 minutes this weekend (low activation energy).
+The actions are the point of this analysis — make them the strongest part:
+- `grounded_in`: name the one specific claim/result/quote/section in this content the actions build on, so they're traceable to the source.
+- `quick_win`: an imperative action they can finish in 30–90 minutes this weekend (low activation energy).
+- `first_step`: the single first move for the quick win, phrased so it could be handed straight to an AI assistant to begin.
 - `bigger_play`: the more ambitious multi-week arc for when they're ready to commit.
-Make the difference between the two obvious; don't just restate one as the other.
+Make the difference between quick_win and bigger_play obvious; don't just restate one as the other. Every action must be concrete and specific to this person — never generic advice.
 
 CONTENT:
 {text}"""
@@ -670,8 +692,10 @@ def analyze_image(b64: str, caption: str = "", *, ctx: UsageContext | None = Non
 _LEGACY_FIELD_LABELS = {
     "main_idea": "Main idea",
     "why_it_matters": "Why it matters",
+    "grounded_in": "Based on",
     "category": "Category",
     "quick_win": "Quick win (30–90 min)",
+    "first_step": "First step",
     "bigger_play": "Bigger play (when you're ready)",
     "suggested_experiment": "Suggested experiment",  # legacy items
     "time_required": "Time required to explore",

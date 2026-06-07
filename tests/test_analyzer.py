@@ -54,3 +54,23 @@ class TestNormalizeTwoModeExperiment:
         assert out["quick_win"] == ""
         assert out["bigger_play"] == ""
         assert out["verdict"] == "skip"
+
+
+class TestActionSchema:
+    def test_grounding_and_first_step_in_schema(self):
+        from bot import analyzer
+
+        for field in ("grounded_in", "first_step"):
+            assert field in analyzer.ANALYSIS_FIELDS
+            assert field in analyzer._TOOL_SCHEMA["properties"]
+            assert field in analyzer._TOOL_SCHEMA["required"]
+
+    def test_normalize_round_trips_new_fields(self):
+        from bot import analyzer
+
+        out = analyzer._normalize({
+            "grounded_in": "the key claim", "first_step": "open the file",
+            "quick_win": "do x", "verdict": "watch",
+        })
+        assert out["grounded_in"] == "the key claim"
+        assert out["first_step"] == "open the file"
