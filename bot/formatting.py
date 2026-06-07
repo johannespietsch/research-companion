@@ -36,12 +36,14 @@ def format_agent_brief(action: dict) -> str:
     The brief sits in a <pre> block so Telegram offers tap-to-copy — the user
     pastes it straight into whatever assistant they use (ChatGPT, Claude, …).
     """
-    label = (action.get("label") or "Action").strip()
+    title = (action.get("title") or action.get("label") or "Action").strip()
+    effort = (action.get("effort") or "").strip()
     brief = (action.get("brief") or "").strip()
     if not brief:
         return ""
+    head = html.escape(title) + (f" · {html.escape(effort)}" if effort else "")
     return (
-        f"📋 <b>{html.escape(label)} — try this</b>\n"
+        f"📋 <b>{head} — try this</b>\n"
         f"<i>tap to copy, then paste into ChatGPT, Claude, Cursor, Codex…</i>\n"
         f"<pre>{html.escape(brief)}</pre>"
     )
@@ -73,6 +75,20 @@ def _format_dict(analysis: dict) -> str:
         label = _FIELD_LABELS.get(key, key)
         prefix = f"{emoji} " if emoji else ""
         parts.append(f"{prefix}<b>{html.escape(label)}</b>\n{html.escape(value)}")
+
+    suggestions = analysis.get("suggestions")
+    if isinstance(suggestions, list) and suggestions:
+        block = ["🎯 <b>Suggestions</b>"]
+        for s in suggestions:
+            title = html.escape((s.get("title") or "").strip())
+            detail = html.escape((s.get("detail") or "").strip())
+            effort = html.escape((s.get("effort") or "").strip())
+            head = f"• <b>{title}</b>" + (f" — <i>{effort}</i>" if effort else "")
+            block.append(head + (f"\n{detail}" if detail else ""))
+        parts.append("\n".join(block))
+    elif isinstance(suggestions, list):
+        # Explicitly no follow-up — we value the reader's time, so say so.
+        parts.append("🎯 <b>No action needed</b>\nNothing here is worth a special follow-up — this one's just to stay informed.")
     return "\n\n".join(parts)
 
 

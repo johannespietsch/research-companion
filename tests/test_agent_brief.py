@@ -15,29 +15,45 @@ _ANALYSIS = {
     "why_it_matters": "Practical AI pattern.",
     "grounded_in": "They show a 12-point eval lift from reranking retrieved chunks.",
     "category": "ai-engineering",
-    "quick_win": "Add a reranker to your existing RAG demo.",
-    "first_step": "Open rag_demo.py and wrap the retriever call with a reranker.",
-    "bigger_play": "Build an evaluated RAG pipeline over your own corpus.",
+    "suggestions": [
+        {
+            "title": "Add a reranker",
+            "detail": "Add a reranker to your existing RAG demo.",
+            "first_step": "Open rag_demo.py and wrap the retriever call with a reranker.",
+            "effort": "~2 hrs",
+        },
+        {
+            "title": "Build an eval harness",
+            "detail": "Build an evaluated RAG pipeline over your own corpus.",
+            "first_step": "Collect 50 query/answer pairs into eval.jsonl.",
+            "effort": "multi-week",
+        },
+    ],
     "time_required": "10 min read",
     "verdict": "watch",
 }
 
 
 class TestBuildActions:
-    def test_builds_one_action_per_tier_with_both_briefs(self):
+    def test_builds_one_action_per_suggestion_with_both_briefs(self):
         actions = agent_brief.build_actions(_ANALYSIS)
-        assert [a["kind"] for a in actions] == ["quick_win", "bigger_play"]
-        assert all(a["text"] for a in actions)
+        assert [a["index"] for a in actions] == [0, 1]
+        assert [a["title"] for a in actions] == ["Add a reranker", "Build an eval harness"]
+        assert [a["effort"] for a in actions] == ["~2 hrs", "multi-week"]
         assert all(a["brief"] for a in actions)
         assert all(a["brief_link"] for a in actions)
 
-    def test_skips_tiers_without_text(self):
-        analysis = dict(_ANALYSIS, bigger_play="")
+    def test_skips_empty_suggestion_rows(self):
+        analysis = dict(_ANALYSIS, suggestions=[
+            {"title": "", "detail": "", "first_step": "", "effort": ""},
+            _ANALYSIS["suggestions"][0],
+        ])
         actions = agent_brief.build_actions(analysis)
-        assert [a["kind"] for a in actions] == ["quick_win"]
+        assert [a["title"] for a in actions] == ["Add a reranker"]
 
-    def test_empty_analysis_yields_no_actions(self):
+    def test_no_suggestions_yields_no_actions(self):
         assert agent_brief.build_actions({}) == []
+        assert agent_brief.build_actions({"suggestions": []}) == []
 
 
 class TestBuildAgentBrief:

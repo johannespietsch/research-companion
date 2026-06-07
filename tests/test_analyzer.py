@@ -33,44 +33,58 @@ class TestSummarizeContent:
         assert small < large
 
 
-class TestNormalizeTwoModeExperiment:
-    def test_keeps_quick_win_and_bigger_play(self):
+class TestNormalizeSuggestions:
+    def test_keeps_and_clamps_suggestions(self):
+        from bot import analyzer
+
+        raw_suggestions = [
+            {"title": f"S{i}", "detail": f"do {i}", "first_step": f"step {i}", "effort": "~1 hr"}
+            for i in range(8)  # over the cap
+        ]
+        out = analyzer._normalize({
+            "main_idea": "x", "why_it_matters": "y", "grounded_in": "g", "category": "c",
+            "suggestions": raw_suggestions, "time_required": "10 min", "verdict": "watch",
+        })
+        assert len(out["suggestions"]) == analyzer.MAX_SUGGESTIONS  # clamped to 5
+        assert out["suggestions"][0] == {"title": "S0", "detail": "do 0", "first_step": "step 0", "effort": "~1 hr"}
+        assert set(out["suggestions"][0].keys()) == set(analyzer.SUGGESTION_FIELDS)
+
+    def test_empty_suggestions_is_valid(self):
+        from bot import analyzer
+
+        out = analyzer._normalize({"verdict": "skip", "suggestions": []})
+        assert out["suggestions"] == []  # 0 actions is a legitimate result
+
+    def test_drops_empty_suggestion_rows(self):
+        from bot import analyzer
+
+        out = analyzer._normalize({"verdict": "watch", "suggestions": [
+            {"title": "", "detail": "", "first_step": "x", "effort": "y"},  # dropped
+            {"title": "Keep", "detail": "real", "first_step": "", "effort": ""},
+        ]})
+        assert [s["title"] for s in out["suggestions"]] == ["Keep"]
+
+    def test_legacy_quick_win_synthesized_into_suggestions(self):
         from bot import analyzer
 
         out = analyzer._normalize({
-            "main_idea": "x", "why_it_matters": "y", "category": "c",
-            "quick_win": "do this in an hour", "bigger_play": "the multi-week arc",
-            "time_required": "10 min", "verdict": "watch",
+            "main_idea": "x", "verdict": "watch",
+            "quick_win": "do this in an hour", "first_step": "open file",
+            "bigger_play": "the multi-week arc",
         })
-        assert out["quick_win"] == "do this in an hour"
-        assert out["bigger_play"] == "the multi-week arc"
-        assert "suggested_experiment" not in out  # old field dropped from new schema
-        assert set(out.keys()) == set(analyzer.ANALYSIS_FIELDS)
-
-    def test_missing_fields_default_to_empty(self):
-        from bot import analyzer
-
-        out = analyzer._normalize({"verdict": "skip"})
-        assert out["quick_win"] == ""
-        assert out["bigger_play"] == ""
-        assert out["verdict"] == "skip"
+        titles = [s["title"] for s in out["suggestions"]]
+        assert titles == ["Quick win", "Bigger play"]
+        assert out["suggestions"][0]["detail"] == "do this in an hour"
+        assert out["suggestions"][0]["first_step"] == "open file"
 
 
 class TestActionSchema:
-    def test_grounding_and_first_step_in_schema(self):
+    def test_scalar_fields_and_suggestions_in_schema(self):
         from bot import analyzer
 
-        for field in ("grounded_in", "first_step"):
-            assert field in analyzer.ANALYSIS_FIELDS
-            assert field in analyzer._TOOL_SCHEMA["properties"]
-            assert field in analyzer._TOOL_SCHEMA["required"]
-
-    def test_normalize_round_trips_new_fields(self):
-        from bot import analyzer
-
-        out = analyzer._normalize({
-            "grounded_in": "the key claim", "first_step": "open the file",
-            "quick_win": "do x", "verdict": "watch",
-        })
-        assert out["grounded_in"] == "the key claim"
-        assert out["first_step"] == "open the file"
+        assert "grounded_in" in analyzer.ANALYSIS_FIELDS
+        assert "quick_win" not in analyzer.ANALYSIS_FIELDS  # moved into suggestions[]
+        assert "suggestions" in analyzer._TOOL_SCHEMA["properties"]
+        assert "suggestions" in analyzer._TOOL_SCHEMA["required"]
+        item = analyzer._TOOL_SCHEMA["properties"]["suggestions"]["items"]
+        assert set(item["required"]) == set(analyzer.SUGGESTION_FIELDS)

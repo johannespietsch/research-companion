@@ -26,13 +26,6 @@ from __future__ import annotations
 SUMMARY_EXCERPT_CHARS = 1500
 PROFILE_CHARS = 600
 
-# Tiers we generate a brief for, in display order, with the label/why shown to
-# the user. `key` is the analysis field holding the action text; the third entry
-# is the field whose value becomes the action's "first move" (None = no step).
-_ACTION_TIERS = (
-    ("quick_win", "⚡ Quick win", "first_step"),
-    ("bigger_play", "🚀 Bigger play", None),
-)
 
 
 def _clip_sentence(text: str, limit: int) -> str:
@@ -126,22 +119,25 @@ def build_actions(
     source_url: str = "",
     summary_excerpt: str = "",
 ) -> list[dict]:
-    """Build the `actions` list (one entry per tier that has action text).
+    """Build the `actions` list — one entry per suggestion (0–5).
 
-    Each entry: {kind, label, text, brief, brief_link}. `brief` is the full
-    copy-paste version; `brief_link` is the concise version for "open in …" deep
-    links. Pure templating — no extra LLM calls.
+    Each entry: {index, title, detail, effort, brief, brief_link}. `brief` is the
+    full copy-paste version; `brief_link` is the concise version for "open in …"
+    deep links. Pure templating — no extra LLM calls. Returns [] when the
+    analysis has no suggestions (content with no follow-up worth the time).
     """
     grounded_in = (analysis.get("grounded_in") or "").strip()
     actions: list[dict] = []
-    for key, label, first_step_key in _ACTION_TIERS:
-        text = (analysis.get(key) or "").strip()
-        if not text:
+    for i, s in enumerate(analysis.get("suggestions") or []):
+        if not isinstance(s, dict):
             continue
-        first_step = (analysis.get(first_step_key) or "").strip() if first_step_key else ""
+        title = (s.get("title") or "").strip()
+        detail = (s.get("detail") or "").strip()
+        if not (title or detail):
+            continue
         kw = dict(
-            action=text,
-            first_step=first_step,
+            action=detail or title,
+            first_step=(s.get("first_step") or "").strip(),
             grounded_in=grounded_in,
             profile=profile,
             source_title=source_title,
@@ -149,9 +145,10 @@ def build_actions(
             summary_excerpt=summary_excerpt,
         )
         actions.append({
-            "kind": key,
-            "label": label,
-            "text": text,
+            "index": i,
+            "title": title or "Try this",
+            "detail": detail,
+            "effort": (s.get("effort") or "").strip(),
             "brief": build_agent_brief(**kw, variant="full"),
             "brief_link": build_agent_brief(**kw, variant="link"),
         })

@@ -90,10 +90,10 @@ class TestLibraryAdd:
         assert body["verdict"] == "watch"
         assert body["id"] is not None
         assert "main_idea" in body["analysis"]
-        # Agent-handoff actions: one per tier, each with a paste-able brief.
-        kinds = [a["kind"] for a in body["actions"]]
-        assert kinds == ["quick_win", "bigger_play"]
-        assert all(a["brief"] for a in body["actions"])
+        # Agent-handoff actions: one per suggestion, each with a paste-able brief.
+        actions = body["actions"]
+        assert [a["index"] for a in actions] == [0, 1]
+        assert all(a["title"] and a["brief"] and a["brief_link"] for a in actions)
 
     def test_rejects_invalid_url(self, client, auth_headers):
         uid = self._make_user(client, auth_headers)
