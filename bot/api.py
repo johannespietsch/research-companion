@@ -16,6 +16,7 @@ from fastapi.responses import FileResponse as FastAPIFileResponse
 from pydantic import BaseModel
 
 from bot.analyzer import UsageContext, analyze, analyze_image, to_json_str, to_plain_text
+from bot.agent_brief import build_actions
 from bot.pipeline import (
     ERR_ANALYZE_FAILED,
     ERR_FETCH_FAILED,
@@ -68,6 +69,31 @@ _job_steps: dict[str, str] = {}
 # in-memory on this request.
 TRY_PREVIEW_CHARS = 2000
 
+
+def _actions_for(
+    analysis: dict,
+    *,
+    user_id: int | None,
+    source_text: str,
+    source_title: str = "",
+    source_url: str = "",
+) -> list[dict]:
+    """Build the agent-handoff `actions` list for a response.
+
+    Personalizes the brief with the signed-in user's profile (anon gets none),
+    and grounds it in a bounded excerpt of the content. Pure templating — no
+    extra LLM calls.
+    """
+    profile = get_user_profile(user_id) if user_id is not None else ""
+    return build_actions(
+        analysis,
+        profile=profile or "",
+        source_title=source_title,
+        source_url=source_url,
+        summary_excerpt=source_text or "",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Knowledge base
 # ---------------------------------------------------------------------------
@@ -116,7 +142,11 @@ async def submit_text(
 ):
     analysis = analyze(text, ctx=UsageContext(user_id=user_id, source_type="note"))
     save_item(user_id, "note", "", text, to_json_str(analysis), user_note)
-    return {"analysis": to_plain_text(analysis), "analysis_data": analysis}
+    return {
+        "analysis": to_plain_text(analysis),
+        "analysis_data": analysis,
+        "actions": _actions_for(analysis, user_id=user_id, source_text=text),
+    }
 
 
 @router.post("/submit/url", status_code=201)
@@ -134,7 +164,17 @@ async def submit_url(
         )
     except PipelineError as e:
         raise _pipeline_error_to_http(e, url)
-    return {"analysis": to_plain_text(result.analysis), "analysis_data": result.analysis}
+    return {
+        "analysis": to_plain_text(result.analysis),
+        "analysis_data": result.analysis,
+        "actions": _actions_for(
+            result.analysis,
+            user_id=user_id,
+            source_text=result.summary,
+            source_title=result.title,
+            source_url=url,
+        ),
+    }
 
 
 @router.post("/submit/file", status_code=201)
@@ -182,7 +222,13 @@ async def submit_file(
 
     analysis = analyze(text, ctx=UsageContext(user_id=user_id, source_type=source_type))
     save_item(user_id, source_type, name, text, to_json_str(analysis), user_note, file_path=stored_file_path)
-    return {"analysis": to_plain_text(analysis), "analysis_data": analysis}
+    return {
+        "analysis": to_plain_text(analysis),
+        "analysis_data": analysis,
+        "actions": _actions_for(
+            analysis, user_id=user_id, source_text=text, source_title=name
+        ),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -282,6 +328,13 @@ async def try_url(req: TryRequest, _: None = Depends(_require_try_secret)):
         "content_preview": result.summary[:TRY_PREVIEW_CHARS],
         "verdict": verdict,
         "analysis": analysis,
+        "actions": _actions_for(
+            analysis,
+            user_id=None,
+            source_text=result.summary,
+            source_title=result.title,
+            source_url=url,
+        ),
     }
 
 
@@ -459,6 +512,13 @@ async def library_add(req: _LibraryAddRequest, _: None = Depends(_require_try_se
         "content_preview": result.summary[:TRY_PREVIEW_CHARS],
         "verdict": verdict,
         "analysis": analysis,
+        "actions": _actions_for(
+            analysis,
+            user_id=req.user_id,
+            source_text=result.summary,
+            source_title=result.title,
+            source_url=url,
+        ),
     }
 
 
@@ -592,6 +652,13 @@ async def _run_job(
             "content_preview": result.summary[:TRY_PREVIEW_CHARS],
             "verdict": verdict,
             "analysis": analysis,
+            "actions": _actions_for(
+                analysis,
+                user_id=user_id,
+                source_text=result.summary,
+                source_title=result.title,
+                source_url=url,
+            ),
         }
         if result.saved_id is not None:
             payload["id"] = result.saved_id

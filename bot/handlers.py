@@ -6,16 +6,44 @@ from pathlib import Path
 from telegram import Update
 from telegram.ext import ContextTypes
 
+from bot.agent_brief import build_actions
 from bot.analyzer import UsageContext, analyze, analyze_image, to_json_str
 from bot.config import MAX_CONTENT_CHARS
-from bot.db import get_or_create_user_by_telegram, save_item
+from bot.db import get_or_create_user_by_telegram, get_user_profile, save_item
 from bot.fetch_errors import user_message as fetch_error_message
-from bot.formatting import format_analysis
+from bot.formatting import format_agent_brief, format_analysis
 from bot.pipeline import PipelineError, analyze_url
 from bot.storage import save_file_from_path
 from bot.transcriber import transcribe
 
 logger = logging.getLogger(__name__)
+
+
+async def _send_agent_briefs(
+    message,
+    analysis: dict,
+    user_id: int,
+    *,
+    source_text: str = "",
+    source_title: str = "",
+    source_url: str = "",
+) -> None:
+    """Send a copyable 'do this with your AI' brief per action, after the analysis.
+
+    Sent as separate messages so each stays within Telegram's length limit and
+    each <pre> block is independently tap-to-copy.
+    """
+    actions = build_actions(
+        analysis,
+        profile=get_user_profile(user_id) or "",
+        source_title=source_title,
+        source_url=source_url,
+        summary_excerpt=source_text,
+    )
+    for action in actions:
+        block = format_agent_brief(action)
+        if block:
+            await message.reply_text(block, parse_mode="HTML")
 
 
 async def _analyze_and_reply(
@@ -48,6 +76,13 @@ async def _analyze_and_reply(
     )
     formatted = format_analysis(analysis)
     await update.message.reply_text(formatted, parse_mode="HTML")
+    await _send_agent_briefs(
+        update.message,
+        analysis,
+        user_id,
+        source_text=store_content if store_content is not None else text,
+        source_title=source,
+    )
 
 
 # --- Text & URLs ---
@@ -86,6 +121,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 await message.reply_text(fetch_error_message(e.fetched.get("reason"), url))
                 continue
             await message.reply_text(format_analysis(result.analysis), parse_mode="HTML")
+            await _send_agent_briefs(
+                message,
+                result.analysis,
+                user_id,
+                source_text=result.summary,
+                source_title=result.title,
+                source_url=url,
+            )
     else:
         await message.reply_text("Analyzing...")
         await _analyze_and_reply(update, user_id, text, source_type="note")
