@@ -22,7 +22,7 @@ def pipeline(monkeypatch):
     exercise a specific edge case (empty text, video source_type, etc.)."""
     import bot.pipeline
 
-    async def fake_fetch_url(url):
+    async def fake_fetch_url(url, **kwargs):
         return {
             "text": "Long article body about retrieval-augmented generation.",
             "title": "RAG explained",
@@ -99,7 +99,7 @@ class TestAnalyzeUrlBasics:
 
 class TestErrors:
     def test_fetch_failure_raises_pipeline_error(self, pipeline, monkeypatch):
-        async def boom_fetch(url):
+        async def boom_fetch(url, **kwargs):
             raise RuntimeError("network down")
         monkeypatch.setattr(pipeline, "fetch_url", boom_fetch)
 
@@ -111,7 +111,7 @@ class TestErrors:
     def test_empty_text_for_article_raises_extraction_failed(
         self, pipeline, monkeypatch
     ):
-        async def empty_fetch(url):
+        async def empty_fetch(url, **kwargs):
             return {"text": "", "title": url, "source_type": "article",
                     "image_urls": [], "reason": "no_text"}
         monkeypatch.setattr(pipeline, "fetch_url", empty_fetch)
@@ -125,7 +125,7 @@ class TestErrors:
     def test_empty_text_for_video_raises_no_transcript(
         self, pipeline, monkeypatch
     ):
-        async def empty_video(url):
+        async def empty_video(url, **kwargs):
             return {"text": "", "title": url, "source_type": "youtube",
                     "image_urls": [], "reason": "no_transcript"}
         monkeypatch.setattr(pipeline, "fetch_url", empty_video)
@@ -134,6 +134,38 @@ class TestErrors:
         with pytest.raises(pipeline.PipelineError) as exc_info:
             asyncio.run(pipeline.analyze_url("x", ctx=UsageContext()))
         assert exc_info.value.code == pipeline.ERR_NO_TRANSCRIPT
+
+    def test_thin_stub_with_reason_for_video_raises_no_transcript(
+        self, pipeline, monkeypatch
+    ):
+        # Captionless video, too long for Whisper, empty description: the
+        # fetcher returns a title-only stub *plus* a reason. We must surface
+        # the reason, not analyse the stub.
+        async def thin_video(url, **kwargs):
+            return {"text": "Real Boom? Fake Money?\nBy: THE JACK MALLERS SHOW",
+                    "title": "Real Boom? Fake Money?", "source_type": "youtube",
+                    "image_urls": [], "reason": "video_too_long_for_whisper"}
+        monkeypatch.setattr(pipeline, "fetch_url", thin_video)
+
+        from bot.analyzer import UsageContext
+        with pytest.raises(pipeline.PipelineError) as exc_info:
+            asyncio.run(pipeline.analyze_url("x", ctx=UsageContext()))
+        assert exc_info.value.code == pipeline.ERR_NO_TRANSCRIPT
+        assert exc_info.value.fetched["reason"] == "video_too_long_for_whisper"
+
+    def test_short_description_without_reason_still_analyses(
+        self, pipeline, monkeypatch
+    ):
+        # A successful (unflagged) fetch with short text must NOT be gated —
+        # only degraded fetches carrying a `reason` are subject to the floor.
+        async def short_ok(url, **kwargs):
+            return {"text": "A short but real article.", "title": "t",
+                    "source_type": "article", "image_urls": []}
+        monkeypatch.setattr(pipeline, "fetch_url", short_ok)
+
+        from bot.analyzer import UsageContext
+        result = asyncio.run(pipeline.analyze_url("x", ctx=UsageContext()))
+        assert result.analysis is not None
 
     def test_analyze_crash_raises_analyze_failed(self, pipeline, monkeypatch):
         def boom(_text, **_kwargs):
@@ -157,7 +189,7 @@ class TestImageStrategy:
     def with_images(self, pipeline, monkeypatch):
         """Override fetch to return image_urls; capture analyze input to
         verify image descriptions did/didn't end up there."""
-        async def fetch_with_images(url):
+        async def fetch_with_images(url, **kwargs):
             return {
                 "text": "Article body",
                 "title": "T",
@@ -188,7 +220,7 @@ class TestImageStrategy:
     def test_youtube_excludes_images_by_default(self, with_images, monkeypatch):
         pl, captured = with_images
 
-        async def fetch_youtube(url):
+        async def fetch_youtube(url, **kwargs):
             return {
                 "text": "Transcript here",
                 "title": "T",

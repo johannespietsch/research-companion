@@ -66,6 +66,13 @@ TELEGRAM_TOKEN=your-telegram-bot-token
 ANTHROPIC_API_KEY=your-anthropic-key
 OPENAI_API_KEY=your-openai-key
 
+# Optional -- hosted transcription for captionless videos. Required to
+# transcribe long videos (anon 30 min / signed-in 2 h caps); without it the bot
+# falls back to a local faster-whisper CPU model that only keeps up with short
+# clips. Provider preference: GROQ_API_KEY (whisper-large-v3-turbo, ~$0.04/h)
+# first, else the OPENAI_API_KEY above is reused (whisper-1, ~$0.36/h).
+GROQ_API_KEY=your-groq-key
+
 # Optional -- set for production webhook mode
 WEBHOOK_URL=https://your-domain.com
 

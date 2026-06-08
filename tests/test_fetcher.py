@@ -166,7 +166,32 @@ class TestYouTubeFallbackChain:
         assert "spoken words" in result["text"]
         assert result["source_type"] == "youtube"  # corrected back to youtube
 
-    def test_skips_whisper_for_long_video(self):
+    def test_skips_whisper_when_duration_exceeds_cap(self):
+        from bot import fetcher, fetch_errors
+
+        with patch("youtube_transcript_api.YouTubeTranscriptApi") as TranscriptApi, \
+             patch.object(fetcher, "_yt_dlp_extract") as extract, \
+             patch.object(fetcher, "_yt_dlp_transcribe") as transcribe:
+            TranscriptApi.return_value.list.side_effect = Exception("blocked")
+            extract.return_value = {
+                "text": "Title\nBy: ch\n\nlong description",
+                "title": "Title",
+                "source_type": "youtube",
+                "has_transcript": False,
+                "duration": 1200,  # 20 min
+            }
+
+            # Explicit 10-min cap → the 20-min video is over it.
+            result = fetcher._youtube_transcript(
+                YOUTUBE_URL, max_whisper_duration=10 * 60
+            )
+
+        transcribe.assert_not_called()
+        assert "long description" in result["text"]
+        assert result["reason"] == fetch_errors.VIDEO_TOO_LONG_FOR_WHISPER
+
+    def test_transcribes_long_video_under_signed_in_cap(self):
+        """20 min is within the 2-hour signed-in cap → Whisper is attempted."""
         from bot import fetcher
 
         with patch("youtube_transcript_api.YouTubeTranscriptApi") as TranscriptApi, \
@@ -178,13 +203,20 @@ class TestYouTubeFallbackChain:
                 "title": "Title",
                 "source_type": "youtube",
                 "has_transcript": False,
-                "duration": 1200,  # 20 min — would time out
+                "duration": 1200,
+            }
+            transcribe.return_value = {
+                "text": "Title\nBy: ch\n\nTranscript:\nspoken words",
+                "title": "Title",
+                "source_type": "video",
             }
 
-            result = fetcher._youtube_transcript(YOUTUBE_URL)
+            result = fetcher._youtube_transcript(
+                YOUTUBE_URL, max_whisper_duration=fetcher.WHISPER_MAX_DURATION_SIGNED_IN_S
+            )
 
-        transcribe.assert_not_called()
-        assert "long description" in result["text"]
+        transcribe.assert_called_once()
+        assert "spoken words" in result["text"]
 
     def test_returns_description_when_whisper_fallback_fails(self):
         from bot import fetcher
@@ -302,13 +334,31 @@ class TestUrlCacheLayer:
 
         assert inner.call_count == 2, "failed fetch shouldn't poison the cache"
 
+    def test_too_long_for_whisper_is_not_cached(self):
+        """The one tier-dependent degraded outcome must not be cached, or a
+        stricter (anon) tier would poison a more generous (signed-in) one."""
+        from bot import fetcher, fetch_errors
+
+        with patch.object(fetcher, "_fetch_url_uncached", new_callable=AsyncMock) as inner:
+            inner.return_value = {
+                "text": "Title\nBy: ch",  # title-only stub
+                "title": "Title",
+                "source_type": "youtube",
+                "reason": fetch_errors.VIDEO_TOO_LONG_FOR_WHISPER,
+            }
+
+            asyncio.run(fetcher.fetch_url("https://youtube.com/watch?v=zzzzzzzzzzz"))
+            asyncio.run(fetcher.fetch_url("https://youtube.com/watch?v=zzzzzzzzzzz"))
+
+        assert inner.call_count == 2, "too-long result must not be cached"
+
     def test_different_urls_get_separate_entries(self):
         from bot import fetcher
 
         with patch.object(fetcher, "_fetch_url_uncached", new_callable=AsyncMock) as inner:
-            def by_url(url):
+            def by_url(url, **kwargs):
                 return {"text": f"body for {url}", "title": "", "source_type": "article"}
-            inner.side_effect = lambda u: by_url(u)
+            inner.side_effect = lambda u, **kw: by_url(u, **kw)
 
             asyncio.run(fetcher.fetch_url("https://example.com/a"))
             asyncio.run(fetcher.fetch_url("https://example.com/b"))

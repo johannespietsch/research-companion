@@ -442,7 +442,7 @@ class TestJobFlow:
         import bot.api
         import bot.pipeline
 
-        async def empty_fetch(url):
+        async def empty_fetch(url, **kwargs):
             return {"text": "", "title": url, "source_type": "article", "reason": "no_text"}
 
         monkeypatch.setattr(bot.pipeline, "fetch_url", empty_fetch)
@@ -462,7 +462,7 @@ class TestJobFlow:
         import bot.pipeline
         from bot import fetch_errors
 
-        async def paywalled_fetch(url):
+        async def paywalled_fetch(url, **kwargs):
             return {"text": "", "title": url, "source_type": "article", "reason": fetch_errors.PAYWALLED}
 
         monkeypatch.setattr(bot.pipeline, "fetch_url", paywalled_fetch)
@@ -489,7 +489,7 @@ class TestJobFlow:
         import bot.api
         import bot.pipeline
 
-        async def empty_video_fetch(url):
+        async def empty_video_fetch(url, **kwargs):
             return {"text": "", "title": url, "source_type": "youtube", "reason": "no_transcript"}
 
         monkeypatch.setattr(bot.pipeline, "fetch_url", empty_video_fetch)

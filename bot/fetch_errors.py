@@ -31,8 +31,9 @@ _USER_MESSAGES: dict[str, str] = {
         "to analyse. Try sharing a video with captions enabled."
     ),
     VIDEO_TOO_LONG_FOR_WHISPER: (
-        "This video has no subtitles and is too long for automatic transcription. "
-        "Try a shorter video (under 3 minutes) or one with captions."
+        "This video has no subtitles and is too long for us to transcribe "
+        "automatically. Try a video with captions, or a shorter one. Signing in "
+        "raises the length limit."
     ),
     WHISPER_FAILED: (
         "Couldn't transcribe this video's audio. The source may be blocking "

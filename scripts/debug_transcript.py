@@ -63,8 +63,14 @@ def main() -> int:
     parser.add_argument("url")
     args = parser.parse_args()
 
+    from bot.fetcher import WHISPER_MAX_DURATION_SIGNED_IN_S
+
     raw_len = _raw_youtube_transcript_len(args.url)
-    fetched = asyncio.run(fetch_url(args.url))
+    # Debug at the most generous (signed-in) cap so the script reflects the
+    # full transcription capability, not the stricter anonymous default.
+    fetched = asyncio.run(
+        fetch_url(args.url, max_whisper_duration=WHISPER_MAX_DURATION_SIGNED_IN_S)
+    )
 
     text = fetched.get("text") or ""
     print()

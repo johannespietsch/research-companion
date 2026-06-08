@@ -41,7 +41,7 @@ from bot.analyzer import (
     to_json_str,
 )
 from bot.db import save_item
-from bot.fetcher import fetch_url
+from bot.fetcher import fetch_url, whisper_cap_for
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +63,14 @@ ERR_NO_TRANSCRIPT = "no-transcript"          # video-with-no-transcript variant 
 ERR_ANALYZE_FAILED = "analyze-failed"        # LLM call failed mid-chain
 
 _VIDEO_SOURCE_TYPES: frozenset[str] = frozenset({"youtube", "video"})
+
+# A degraded fetch (no transcript, too long for Whisper, etc.) flags itself
+# with `reason` but may still carry a thin fallback — e.g. a captionless video
+# with an empty description leaves just "Title\nBy: Channel" (~50 chars).
+# Below this, there's no real content to analyse, so we surface the `reason`
+# instead of fabricating an analysis from a title-only stub. Only applied when
+# `reason` is set, so successful (unflagged) fetches are never gated.
+_MIN_ANALYZABLE_CHARS = 200
 
 
 class PipelineError(Exception):
@@ -104,6 +112,7 @@ async def analyze_url(
     save_for_user_id: int | None = None,
     user_note: str = "",
     include_images: bool | None = None,
+    max_whisper_duration: int | None = None,
     on_step: Optional[Callable[[str], None]] = None,
 ) -> PipelineResult:
     """Run the full URL → analysis chain.
@@ -117,6 +126,11 @@ async def analyze_url(
     `include_images=None` (default) picks based on `source_type` — see
     `_INCLUDE_IMAGES_BY_DEFAULT`. Pass `True`/`False` to override.
 
+    `max_whisper_duration=None` (default) derives the captionless-video
+    transcription ceiling from the caller's tier (signed-in → 2 h, anon →
+    30 min). Every web request runs through the async job path, so the full
+    tier cap applies; the override exists only for tests / future callers.
+
     `on_step` is an optional sync callback invoked with stable labels
     ("fetching" | "describing-images" | "summarizing" | "analyzing") so
     callers like the async job runner can surface progress to the UI.
@@ -128,17 +142,25 @@ async def analyze_url(
             except Exception:
                 logger.exception("pipeline on_step callback raised; ignoring")
 
+    if max_whisper_duration is None:
+        max_whisper_duration = whisper_cap_for(signed_in=ctx.user_id is not None)
+
     _step("fetching")
     try:
-        fetched = await fetch_url(url)
+        fetched = await fetch_url(url, max_whisper_duration=max_whisper_duration)
     except Exception as e:
         logger.exception("pipeline: fetch_url crashed for %s", url)
         raise PipelineError(ERR_FETCH_FAILED, message=str(e))
 
     text = (fetched.get("text") or "").strip()
     source_type = fetched.get("source_type") or "article"
+    reason = fetched.get("reason")
 
-    if not text:
+    # Bail before analysing when there's nothing usable: either no text at all,
+    # or a degraded fetch (`reason` set) whose fallback is just a title-only
+    # stub. Both surface the fetch `reason` to the caller rather than running
+    # the analyser on a thin snippet — see _MIN_ANALYZABLE_CHARS.
+    if not text or (reason and len(text) < _MIN_ANALYZABLE_CHARS):
         # Distinguish video-with-no-transcript from generic extraction
         # failure so callers can surface the right UX.
         code = ERR_NO_TRANSCRIPT if source_type in _VIDEO_SOURCE_TYPES else ERR_NO_TEXT
