@@ -451,6 +451,38 @@ class TestJobFlow:
         rec = db.get_job_record("job-4")
         assert rec["status"] == "error"
         assert rec["error"] == "extraction-failed"
+        # A user-facing explanation is persisted alongside the code so the
+        # Worker can show *why* it failed, not just a generic line.
+        assert rec["message"]
+
+    def test_run_job_persists_specific_reason_message(self, client, db, monkeypatch):
+        """A known fetch reason (e.g. paywall) surfaces its friendly message."""
+        import asyncio
+        import bot.api
+        import bot.pipeline
+        from bot import fetch_errors
+
+        async def paywalled_fetch(url):
+            return {"text": "", "title": url, "source_type": "article", "reason": fetch_errors.PAYWALLED}
+
+        monkeypatch.setattr(bot.pipeline, "fetch_url", paywalled_fetch)
+        db.create_job("job-pw")
+        asyncio.run(bot.api._run_job("job-pw", "https://example.com/x", None, ""))
+        rec = db.get_job_record("job-pw")
+        assert rec["status"] == "error"
+        assert rec["message"] == fetch_errors.user_message(fetch_errors.PAYWALLED, "https://example.com/x")
+        assert "paywall" in rec["message"].lower()
+
+    def test_get_job_status_returns_error_message(self, client, db):
+        """The poll endpoint exposes the persisted message to the Worker."""
+        db.create_job("job-st")
+        db.set_job_error("job-st", "extraction-failed", "This looks paywalled.")
+        resp = client.get("/api/job/job-st", headers={"x-filter-fyi-secret": "test-secret"})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["status"] == "error"
+        assert body["error"] == "extraction-failed"
+        assert body["message"] == "This looks paywalled."
 
     def test_run_job_video_no_text_sets_no_transcript(self, client, db, monkeypatch):
         import asyncio
