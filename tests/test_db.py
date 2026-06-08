@@ -111,6 +111,43 @@ class TestMigration:
         names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         assert {"users", "items", "link_codes"}.issubset(names)
 
+    def test_init_adds_jobs_message_column_to_old_db(self, monkeypatch):
+        """A jobs table predating the `message` column gets it via _ensure_column."""
+        data_dir = os.environ["DATA_DIR"]
+        c = sqlite3.connect(os.path.join(data_dir, "research.db"))
+        c.executescript(
+            """
+            CREATE TABLE jobs (
+                id TEXT PRIMARY KEY,
+                status TEXT NOT NULL DEFAULT 'pending',
+                result TEXT NOT NULL DEFAULT '',
+                error TEXT NOT NULL DEFAULT '',
+                created_at TEXT,
+                updated_at TEXT
+            );
+            INSERT INTO jobs (id, status, error) VALUES ('old', 'error', 'extraction-failed');
+            """
+        )
+        c.commit()
+        c.close()
+
+        import bot.db as db
+
+        cols = {r["name"] for r in db._get_conn().execute("PRAGMA table_info(jobs)")}
+        assert "message" in cols
+        # The pre-existing row survives and defaults to an empty message.
+        rec = db.get_job_record("old")
+        assert rec["error"] == "extraction-failed"
+        assert rec["message"] == ""
+
+    def test_set_job_error_roundtrips_message(self, db):
+        db.create_job("j1")
+        db.set_job_error("j1", "extraction-failed", "This looks paywalled.")
+        rec = db.get_job_record("j1")
+        assert rec["status"] == "error"
+        assert rec["error"] == "extraction-failed"
+        assert rec["message"] == "This looks paywalled."
+
 
 # ---------------------------------------------------------------------------
 # User helpers

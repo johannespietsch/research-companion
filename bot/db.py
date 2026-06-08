@@ -148,6 +148,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     status     TEXT NOT NULL DEFAULT 'pending',
     result     TEXT NOT NULL DEFAULT '',
     error      TEXT NOT NULL DEFAULT '',
+    message    TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S', 'now')),
     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S', 'now'))
 )"""
@@ -265,6 +266,14 @@ def _has_table(conn: sqlite3.Connection, name: str) -> bool:
     return row is not None
 
 
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
+    """Idempotently add a column to an existing table (CREATE TABLE IF NOT
+    EXISTS won't alter a table that already exists on the Fly disk)."""
+    cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+
+
 def _migrate_from_profiles(conn: sqlite3.Connection) -> None:
     """One-time migration: profiles + items(user_id TEXT) -> users + items(user_id INT).
 
@@ -331,6 +340,9 @@ def _init() -> None:
         conn.execute(_CREATE_ERROR_LOG_SQL)
         conn.execute(_CREATE_FEEDBACK_SQL)
         conn.execute(_CREATE_JOBS_SQL)
+        # Added after jobs shipped: carries the user-facing failure message so
+        # the Worker can show *why* a job failed instead of a generic string.
+        _ensure_column(conn, "jobs", "message", "message TEXT NOT NULL DEFAULT ''")
         conn.execute(_CREATE_LLM_CALLS_SQL)
         conn.execute(_CREATE_ANALYZE_TRACES_SQL)
         conn.execute(_CREATE_PROCESSED_UPDATES_SQL)
@@ -731,18 +743,20 @@ def set_job_done(job_id: str, result: dict) -> None:
         )
 
 
-def set_job_error(job_id: str, error: str) -> None:
+def set_job_error(job_id: str, error: str, message: str = "") -> None:
+    """Mark a job failed. `error` is the machine code (the Worker may key on
+    it); `message` is the user-facing explanation surfaced in the browser."""
     with _get_conn() as conn:
         conn.execute(
-            "UPDATE jobs SET status = 'error', error = ?, updated_at = ? WHERE id = ?",
-            (error, _utcnow_iso(), job_id),
+            "UPDATE jobs SET status = 'error', error = ?, message = ?, updated_at = ? WHERE id = ?",
+            (error, message, _utcnow_iso(), job_id),
         )
 
 
 def get_job_record(job_id: str) -> sqlite3.Row | None:
     with _get_conn() as conn:
         return conn.execute(
-            "SELECT id, status, result, error FROM jobs WHERE id = ?",
+            "SELECT id, status, result, error, message FROM jobs WHERE id = ?",
             (job_id,),
         ).fetchone()
 

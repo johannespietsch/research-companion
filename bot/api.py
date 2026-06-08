@@ -635,7 +635,7 @@ async def _run_job(
                 on_step=_on_step,
             )
         except PipelineError as e:
-            set_job_error(job_id, e.code)
+            set_job_error(job_id, e.code, fetch_error_message(e.fetched.get("reason"), url))
             return
 
         analysis = result.analysis
@@ -684,7 +684,7 @@ async def get_job_status(job_id: str, _: None = Depends(_require_try_secret)):
             result = None
         return {"status": "done", "result": result}
     if job["status"] == "error":
-        return {"status": "error", "error": job["error"]}
+        return {"status": "error", "error": job["error"], "message": job["message"]}
     return {"status": "pending", "step": _job_steps.get(job_id, "fetching")}
 
 
