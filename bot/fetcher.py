@@ -1,15 +1,16 @@
 import asyncio
+import html
 import logging
 import re
 from functools import lru_cache
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import quote, unquote, urlparse
 
 import httpx
 import requests
 
 from bot import fetch_errors
-from bot.config import MAX_CONTENT_CHARS
+from bot.config import CONTACT_EMAIL, MAX_CONTENT_CHARS
 from bot.ssrf import BlockedURLError, assert_public_url
 
 logger = logging.getLogger(__name__)
@@ -637,6 +638,138 @@ async def fetch_url(url: str) -> dict:
     return result
 
 
+# --- Academic / scholarly fallback ------------------------------------------
+# Many publisher article pages (Springer, Wiley, Elsevier, …) JS- or login-wall
+# the HTML, so a plain fetch gets a "please enable JavaScript" stub. But the
+# same articles are addressable by DOI through free, no-key scholarly APIs that
+# return a clean abstract (Crossref) or an open-access copy (Unpaywall). That's
+# a single on-behalf-of-user lookup keyed by an identifier in the URL — not
+# crawling — and it turns a dead-end wall into something analysable.
+
+# A DOI is "10." + a 4–9 digit registrant + "/" + a liberal suffix. In a URL the
+# suffix runs until a query/fragment; we then trim path tails that clearly
+# aren't part of the DOI (e.g. /fulltext, .pdf) that publishers append.
+_DOI_RE = re.compile(r"10\.\d{4,9}/[^\s\"'<>?#]+", re.IGNORECASE)
+_DOI_TRAILING = re.compile(
+    r"(?:/(?:full|fulltext|abstract|pdf|epdf|meta|references|citations))+$|"
+    r"\.(?:pdf|html?|full|abstract)$",
+    re.IGNORECASE,
+)
+
+
+def _extract_doi(url: str) -> str | None:
+    """Pull a DOI out of an article URL, or None. Path-only (ignores query)."""
+    m = _DOI_RE.search(unquote(urlparse(url).path))
+    if not m:
+        return None
+    doi = m.group(0).rstrip(").,;'\"")
+    doi = _DOI_TRAILING.sub("", doi)
+    return doi or None
+
+
+def _strip_jats(s: str) -> str:
+    """Crossref abstracts come as JATS/XML (<jats:p>…</jats:p>). Reduce to plain
+    text and drop a redundant leading 'Abstract' heading."""
+    if not s:
+        return ""
+    text = html.unescape(re.sub(r"<[^>]+>", " ", s))
+    text = re.sub(r"\s+", " ", text).strip()
+    return re.sub(r"^abstract[:\s]+", "", text, flags=re.IGNORECASE).strip()
+
+
+def _format_authors(authors) -> str:
+    if not isinstance(authors, list):
+        return ""
+    names = []
+    for a in authors[:8]:
+        if isinstance(a, dict):
+            name = " ".join(p for p in (a.get("given"), a.get("family")) if p).strip()
+            if name:
+                names.append(name)
+    return ", ".join(names)
+
+
+def _crossref_fetch(doi: str) -> dict | None:
+    """Title + abstract + authors for a DOI from Crossref (free, no key)."""
+    try:
+        resp = requests.get(
+            f"https://api.crossref.org/works/{quote(doi, safe='/')}",
+            headers={"User-Agent": f"filter-fyi/1.0 (mailto:{CONTACT_EMAIL})"},
+            timeout=10,
+        )
+    except Exception as e:
+        logger.info("Crossref fetch failed for %s: %s", doi, e)
+        return None
+    if resp.status_code != 200:
+        return None
+    try:
+        msg = resp.json().get("message", {})
+    except Exception:
+        return None
+    title = " ".join(t for t in (msg.get("title") or []) if t).strip() or None
+    return {
+        "title": title,
+        "abstract": _strip_jats(msg.get("abstract", "")) or None,
+        "authors": _format_authors(msg.get("author")),
+    }
+
+
+def _unpaywall_oa_url(doi: str) -> str | None:
+    """Open-access full-text URL for a DOI from Unpaywall, or None."""
+    try:
+        resp = requests.get(
+            f"https://api.unpaywall.org/v2/{quote(doi, safe='/')}",
+            params={"email": CONTACT_EMAIL},
+            timeout=10,
+        )
+    except Exception as e:
+        logger.info("Unpaywall fetch failed for %s: %s", doi, e)
+        return None
+    if resp.status_code != 200:
+        return None
+    try:
+        loc = (resp.json() or {}).get("best_oa_location") or {}
+    except Exception:
+        return None
+    return loc.get("url_for_pdf") or loc.get("url") or None
+
+
+async def _academic_fetch(url: str, doi: str) -> dict | None:
+    """Best-effort content for a walled academic article via scholarly APIs.
+    Prefers Unpaywall open-access full text, falls back to the Crossref
+    abstract. Returns None when neither yields text (caller keeps the wall)."""
+    loop = asyncio.get_running_loop()
+
+    # 1. Open-access full text (PubMed Central, repositories, publisher OA).
+    oa_url = await loop.run_in_executor(None, _unpaywall_oa_url, doi)
+    if oa_url:
+        try:
+            assert_public_url(oa_url)  # OA URL is attacker-influenceable via the API
+            is_pdf = oa_url.split("?")[0].lower().endswith(".pdf")
+            oa = await (_pdf_fetch(oa_url) if is_pdf else _generic_fetch(oa_url))
+            if oa.get("text", "").strip():
+                oa["source_type"] = "academic"
+                logger.info("Academic OA full text recovered for DOI %s via %s", doi, oa_url)
+                return oa
+        except BlockedURLError as e:
+            logger.info("Unpaywall OA URL blocked for %s: %s", doi, e)
+        except Exception as e:
+            logger.info("Unpaywall OA fetch failed for %s (%s): %s", doi, oa_url, e)
+
+    # 2. Crossref abstract — thin, but real content and enough for a verdict.
+    meta = await loop.run_in_executor(None, _crossref_fetch, doi)
+    if meta and meta.get("abstract"):
+        title = meta.get("title") or url
+        header = title if not meta.get("authors") else f"{title}\nBy: {meta['authors']}"
+        logger.info("Academic abstract recovered for DOI %s via Crossref", doi)
+        return {
+            "text": f"{header}\n\nAbstract:\n{meta['abstract']}"[:MAX_CONTENT_CHARS],
+            "title": title,
+            "source_type": "academic",
+        }
+    return None
+
+
 async def _fetch_url_uncached(url: str) -> dict:
     """The actual routing logic — keep this as the only place that knows the
     source-specific fetchers. `fetch_url` is the cache layer in front."""
@@ -679,4 +812,21 @@ async def _fetch_url_uncached(url: str) -> dict:
     # not a crawler indexing the site. (Same distinction Google draws for its
     # user-triggered fetchers.) SSRF guard, rate limits and summary-only
     # retention still apply.
-    return await _generic_fetch(url)
+    result = await _generic_fetch(url)
+
+    # If the page walled us (Springer/Wiley/… JS- or login-gate) and the URL
+    # carries a DOI, try open scholarly APIs for an abstract or open-access
+    # copy before surfacing the wall. Only on failure modes — a good extract
+    # is left untouched so non-walled sites keep their full text.
+    if result.get("reason") in (
+        fetch_errors.JS_REQUIRED,
+        fetch_errors.PAYWALLED,
+        fetch_errors.NO_TEXT_EXTRACTED,
+    ):
+        doi = _extract_doi(url)
+        if doi:
+            logger.info("Article walled (%s); trying scholarly APIs for DOI %s", result["reason"], doi)
+            academic = await _academic_fetch(url, doi)
+            if academic:
+                return academic
+    return result

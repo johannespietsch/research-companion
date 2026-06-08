@@ -314,3 +314,183 @@ class TestRobots:
         assert not hasattr(fetcher, "_robots_allows")
         assert not hasattr(fetcher, "_robots_parser_for")
         assert not hasattr(fetch_errors, "BLOCKED_BY_ROBOTS")
+
+
+class TestDOIExtraction:
+    def test_springer_article_url(self):
+        from bot import fetcher
+        assert fetcher._extract_doi(
+            "https://link.springer.com/article/10.1007/s00146-026-03095-6"
+        ) == "10.1007/s00146-026-03095-6"
+
+    def test_doi_org_url(self):
+        from bot import fetcher
+        assert fetcher._extract_doi("https://doi.org/10.1086/681238") == "10.1086/681238"
+
+    def test_trailing_page_suffix_is_trimmed(self):
+        from bot import fetcher
+        assert fetcher._extract_doi(
+            "https://onlinelibrary.wiley.com/doi/10.1111/jne.12345/full"
+        ) == "10.1111/jne.12345"
+
+    def test_query_string_is_ignored(self):
+        from bot import fetcher
+        assert fetcher._extract_doi(
+            "https://example.com/article/10.1007/abc123?utm_source=x"
+        ) == "10.1007/abc123"
+
+    def test_non_academic_url_returns_none(self):
+        from bot import fetcher
+        assert fetcher._extract_doi("https://example.com/blog/some-post") is None
+
+
+class TestJatsAndAuthors:
+    def test_strip_jats_removes_tags_and_heading(self):
+        from bot import fetcher
+        raw = "<jats:title>Abstract</jats:title><jats:p>Hello &amp; welcome.</jats:p>"
+        assert fetcher._strip_jats(raw) == "Hello & welcome."
+
+    def test_strip_jats_empty(self):
+        from bot import fetcher
+        assert fetcher._strip_jats("") == ""
+
+    def test_format_authors(self):
+        from bot import fetcher
+        authors = [{"given": "Ada", "family": "Lovelace"}, {"family": "Turing"}]
+        assert fetcher._format_authors(authors) == "Ada Lovelace, Turing"
+
+    def test_format_authors_non_list(self):
+        from bot import fetcher
+        assert fetcher._format_authors(None) == ""
+
+
+class TestCrossref:
+    def _resp(self, status, payload):
+        r = MagicMock()
+        r.status_code = status
+        r.json.return_value = payload
+        return r
+
+    def test_returns_title_abstract_authors(self, monkeypatch):
+        from bot import fetcher
+        payload = {
+            "message": {
+                "title": ["On Computable Numbers"],
+                "abstract": "<jats:p>A study of decidability.</jats:p>",
+                "author": [{"given": "Alan", "family": "Turing"}],
+            }
+        }
+        monkeypatch.setattr(fetcher.requests, "get", lambda *a, **k: self._resp(200, payload))
+        meta = fetcher._crossref_fetch("10.1112/plms/s2-42.1.230")
+        assert meta["title"] == "On Computable Numbers"
+        assert meta["abstract"] == "A study of decidability."
+        assert meta["authors"] == "Alan Turing"
+
+    def test_non_200_returns_none(self, monkeypatch):
+        from bot import fetcher
+        monkeypatch.setattr(fetcher.requests, "get", lambda *a, **k: self._resp(404, {}))
+        assert fetcher._crossref_fetch("10.0/nope") is None
+
+
+class TestAcademicFetch:
+    def test_prefers_unpaywall_oa_full_text(self, monkeypatch):
+        from bot import fetcher
+
+        monkeypatch.setattr(fetcher, "_unpaywall_oa_url", lambda doi: "https://repo.org/paper.pdf")
+        monkeypatch.setattr(fetcher, "assert_public_url", lambda u: None)
+
+        async def _pdf(u):
+            return {"text": "full open-access body", "title": "Paper", "source_type": "pdf"}
+
+        monkeypatch.setattr(fetcher, "_pdf_fetch", _pdf)
+        # Crossref shouldn't be needed when OA full text is found.
+        monkeypatch.setattr(fetcher, "_crossref_fetch", lambda doi: (_ for _ in ()).throw(AssertionError("should not call")))
+
+        result = asyncio.run(fetcher._academic_fetch("https://pub/10.1/x", "10.1/x"))
+        assert result["text"] == "full open-access body"
+        assert result["source_type"] == "academic"
+
+    def test_falls_back_to_crossref_abstract(self, monkeypatch):
+        from bot import fetcher
+
+        monkeypatch.setattr(fetcher, "_unpaywall_oa_url", lambda doi: None)
+        monkeypatch.setattr(
+            fetcher, "_crossref_fetch",
+            lambda doi: {"title": "Walled Paper", "abstract": "The abstract.", "authors": "A. Author"},
+        )
+        result = asyncio.run(fetcher._academic_fetch("https://pub/10.1/x", "10.1/x"))
+        assert result["source_type"] == "academic"
+        assert result["title"] == "Walled Paper"
+        assert "The abstract." in result["text"]
+        assert "By: A. Author" in result["text"]
+
+    def test_returns_none_when_nothing_found(self, monkeypatch):
+        from bot import fetcher
+        monkeypatch.setattr(fetcher, "_unpaywall_oa_url", lambda doi: None)
+        monkeypatch.setattr(fetcher, "_crossref_fetch", lambda doi: None)
+        assert asyncio.run(fetcher._academic_fetch("https://pub/10.1/x", "10.1/x")) is None
+
+    def test_oa_url_blocked_falls_through_to_abstract(self, monkeypatch):
+        from bot import fetcher
+        from bot.ssrf import BlockedURLError
+
+        monkeypatch.setattr(fetcher, "_unpaywall_oa_url", lambda doi: "http://169.254.169.254/x")
+
+        def _block(u):
+            raise BlockedURLError("private")
+
+        monkeypatch.setattr(fetcher, "assert_public_url", _block)
+        monkeypatch.setattr(fetcher, "_crossref_fetch", lambda doi: {"title": "P", "abstract": "Safe abstract.", "authors": ""})
+        result = asyncio.run(fetcher._academic_fetch("https://pub/10.1/x", "10.1/x"))
+        assert "Safe abstract." in result["text"]
+
+
+class TestArticleAcademicWiring:
+    def test_walled_article_with_doi_uses_academic_fallback(self, monkeypatch):
+        from bot import fetcher
+
+        monkeypatch.setattr(fetcher, "assert_public_url", lambda u: None)
+
+        async def _walled(u):
+            return {"text": "", "title": u, "source_type": "article", "reason": fetcher.fetch_errors.JS_REQUIRED}
+
+        async def _academic(url, doi):
+            return {"text": "abstract body", "title": "T", "source_type": "academic"}
+
+        monkeypatch.setattr(fetcher, "_generic_fetch", _walled)
+        monkeypatch.setattr(fetcher, "_academic_fetch", _academic)
+        result = asyncio.run(
+            fetcher._fetch_url_uncached("https://link.springer.com/article/10.1007/s00146-026-03095-6")
+        )
+        assert result["source_type"] == "academic"
+        assert result["text"] == "abstract body"
+
+    def test_good_extract_does_not_trigger_academic(self, monkeypatch):
+        from bot import fetcher
+
+        monkeypatch.setattr(fetcher, "assert_public_url", lambda u: None)
+
+        async def _good(u):
+            return {"text": "a real full article body", "title": "T", "source_type": "article"}
+
+        monkeypatch.setattr(fetcher, "_generic_fetch", _good)
+        monkeypatch.setattr(
+            fetcher, "_academic_fetch",
+            lambda url, doi: (_ for _ in ()).throw(AssertionError("must not call academic on good extract")),
+        )
+        result = asyncio.run(
+            fetcher._fetch_url_uncached("https://link.springer.com/article/10.1007/s00146-026-03095-6")
+        )
+        assert result["text"] == "a real full article body"
+
+    def test_walled_article_without_doi_keeps_wall(self, monkeypatch):
+        from bot import fetcher
+
+        monkeypatch.setattr(fetcher, "assert_public_url", lambda u: None)
+
+        async def _walled(u):
+            return {"text": "", "title": u, "source_type": "article", "reason": fetcher.fetch_errors.PAYWALLED}
+
+        monkeypatch.setattr(fetcher, "_generic_fetch", _walled)
+        result = asyncio.run(fetcher._fetch_url_uncached("https://nytimes.com/2026/some-story"))
+        assert result["reason"] == fetcher.fetch_errors.PAYWALLED
