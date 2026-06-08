@@ -65,3 +65,24 @@ def test_hosted_upload_compresses_and_cleans_up(tmp_path):
     # The compressed temp upload is removed; the original is left to its caller.
     assert not compressed.exists()
     assert src.exists()
+
+
+def test_hosted_rejects_oversize_upload_and_cleans_up(tmp_path):
+    src = tmp_path / "audio.mp3"
+    src.write_bytes(b"fake-audio")
+    compressed = tmp_path / "big.ogg"
+    compressed.write_bytes(b"x" * (transcriber._MAX_UPLOAD_BYTES + 1))
+
+    fake_client = MagicMock()
+
+    with patch.object(transcriber, "_get_hosted_client", return_value=fake_client), \
+         patch.object(transcriber, "_compress_for_upload", return_value=str(compressed)):
+        try:
+            transcriber._transcribe_hosted(str(src))
+            assert False, "expected oversize upload to raise"
+        except ValueError:
+            pass
+
+    # We bail before hitting the provider, and still clean up the temp upload.
+    fake_client.audio.transcriptions.create.assert_not_called()
+    assert not compressed.exists()

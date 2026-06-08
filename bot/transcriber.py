@@ -39,6 +39,10 @@ else:
 # with no meaningful accuracy loss on speech.
 _UPLOAD_TARGET_HZ = 16_000
 _UPLOAD_OPUS_BITRATE = "16k"
+# Hard ceiling checked before upload. At 16 kbps Opus this is ~3.4 h of audio —
+# beyond the 2 h signed-in cap — so it never trips in normal use; it just turns
+# a pathological case into a clean WHISPER_FAILED instead of a provider 413.
+_MAX_UPLOAD_BYTES = 24 * 1024 * 1024
 
 _model = None
 _hosted_client = None
@@ -95,6 +99,12 @@ def _transcribe_hosted(file_path: str) -> str:
     client = _get_hosted_client()
     upload_path = _compress_for_upload(file_path)
     try:
+        size = os.path.getsize(upload_path)
+        if size > _MAX_UPLOAD_BYTES:
+            raise ValueError(
+                f"compressed audio {size / 1e6:.1f} MB exceeds the "
+                f"{_MAX_UPLOAD_BYTES / 1e6:.0f} MB upload limit"
+            )
         with open(upload_path, "rb") as f:
             resp = client.audio.transcriptions.create(
                 model=_HOSTED_MODEL,
