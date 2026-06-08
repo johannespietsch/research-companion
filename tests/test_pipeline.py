@@ -135,6 +135,38 @@ class TestErrors:
             asyncio.run(pipeline.analyze_url("x", ctx=UsageContext()))
         assert exc_info.value.code == pipeline.ERR_NO_TRANSCRIPT
 
+    def test_thin_stub_with_reason_for_video_raises_no_transcript(
+        self, pipeline, monkeypatch
+    ):
+        # Captionless video, too long for Whisper, empty description: the
+        # fetcher returns a title-only stub *plus* a reason. We must surface
+        # the reason, not analyse the stub.
+        async def thin_video(url):
+            return {"text": "Real Boom? Fake Money?\nBy: THE JACK MALLERS SHOW",
+                    "title": "Real Boom? Fake Money?", "source_type": "youtube",
+                    "image_urls": [], "reason": "video_too_long_for_whisper"}
+        monkeypatch.setattr(pipeline, "fetch_url", thin_video)
+
+        from bot.analyzer import UsageContext
+        with pytest.raises(pipeline.PipelineError) as exc_info:
+            asyncio.run(pipeline.analyze_url("x", ctx=UsageContext()))
+        assert exc_info.value.code == pipeline.ERR_NO_TRANSCRIPT
+        assert exc_info.value.fetched["reason"] == "video_too_long_for_whisper"
+
+    def test_short_description_without_reason_still_analyses(
+        self, pipeline, monkeypatch
+    ):
+        # A successful (unflagged) fetch with short text must NOT be gated —
+        # only degraded fetches carrying a `reason` are subject to the floor.
+        async def short_ok(url):
+            return {"text": "A short but real article.", "title": "t",
+                    "source_type": "article", "image_urls": []}
+        monkeypatch.setattr(pipeline, "fetch_url", short_ok)
+
+        from bot.analyzer import UsageContext
+        result = asyncio.run(pipeline.analyze_url("x", ctx=UsageContext()))
+        assert result.analysis is not None
+
     def test_analyze_crash_raises_analyze_failed(self, pipeline, monkeypatch):
         def boom(_text, **_kwargs):
             raise RuntimeError("rate limited")

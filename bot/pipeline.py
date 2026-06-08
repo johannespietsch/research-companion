@@ -64,6 +64,14 @@ ERR_ANALYZE_FAILED = "analyze-failed"        # LLM call failed mid-chain
 
 _VIDEO_SOURCE_TYPES: frozenset[str] = frozenset({"youtube", "video"})
 
+# A degraded fetch (no transcript, too long for Whisper, etc.) flags itself
+# with `reason` but may still carry a thin fallback — e.g. a captionless video
+# with an empty description leaves just "Title\nBy: Channel" (~50 chars).
+# Below this, there's no real content to analyse, so we surface the `reason`
+# instead of fabricating an analysis from a title-only stub. Only applied when
+# `reason` is set, so successful (unflagged) fetches are never gated.
+_MIN_ANALYZABLE_CHARS = 200
+
 
 class PipelineError(Exception):
     """Raised for any failure inside `analyze_url`. Carries an `error_code`
@@ -137,8 +145,13 @@ async def analyze_url(
 
     text = (fetched.get("text") or "").strip()
     source_type = fetched.get("source_type") or "article"
+    reason = fetched.get("reason")
 
-    if not text:
+    # Bail before analysing when there's nothing usable: either no text at all,
+    # or a degraded fetch (`reason` set) whose fallback is just a title-only
+    # stub. Both surface the fetch `reason` to the caller rather than running
+    # the analyser on a thin snippet — see _MIN_ANALYZABLE_CHARS.
+    if not text or (reason and len(text) < _MIN_ANALYZABLE_CHARS):
         # Distinguish video-with-no-transcript from generic extraction
         # failure so callers can surface the right UX.
         code = ERR_NO_TRANSCRIPT if source_type in _VIDEO_SOURCE_TYPES else ERR_NO_TEXT
