@@ -2,7 +2,14 @@ import os
 import logging
 
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, TypeHandler, filters
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    MessageHandler,
+    TypeHandler,
+    filters,
+)
 
 from bot.commands import (
     cmd_delete,
@@ -21,6 +28,7 @@ from bot.handlers import (
     handle_text,
     handle_video,
     handle_voice,
+    on_try_callback,
 )
 
 logger = logging.getLogger(__name__)
@@ -71,6 +79,9 @@ def build_application(token: str) -> Application:
     app.add_handler(CommandHandler("search", cmd_search))
     app.add_handler(CommandHandler("delete", cmd_delete))
     app.add_handler(CommandHandler("profile", cmd_profile))
+
+    # "try it" suggestion buttons → send that suggestion's brief on demand
+    app.add_handler(CallbackQueryHandler(on_try_callback, pattern=r"^try:"))
 
     # Content ingestion
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
