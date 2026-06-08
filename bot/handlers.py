@@ -3,13 +3,13 @@ import logging
 import tempfile
 from pathlib import Path
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
 from bot.agent_brief import build_actions
-from bot.analyzer import UsageContext, analyze, analyze_image, to_json_str
+from bot.analyzer import UsageContext, analyze, analyze_image, parse_stored, to_json_str
 from bot.config import MAX_CONTENT_CHARS
-from bot.db import get_or_create_user_by_telegram, get_user_profile, save_item
+from bot.db import get_item, get_or_create_user_by_telegram, get_user_profile, save_item
 from bot.fetch_errors import user_message as fetch_error_message
 from bot.formatting import format_agent_brief, format_analysis
 from bot.pipeline import PipelineError, analyze_url
@@ -19,31 +19,59 @@ from bot.transcriber import transcribe
 logger = logging.getLogger(__name__)
 
 
-async def _send_agent_briefs(
-    message,
-    analysis: dict,
-    user_id: int,
-    *,
-    source_text: str = "",
-    source_title: str = "",
-    source_url: str = "",
-) -> None:
-    """Send a copyable 'try this' brief per action, after the analysis.
+def _suggestions_keyboard(analysis: dict, item_id: int | None) -> InlineKeyboardMarkup | None:
+    """One '🔧 <title>' button per suggestion. Tapping sends that suggestion's
+    full copy-to-AI brief on demand — keeps the analysis reply short instead of
+    dumping every brief inline (issue #49). Needs a saved item_id to reference."""
+    suggestions = analysis.get("suggestions") or []
+    if not item_id or not suggestions:
+        return None
+    rows = []
+    for i, s in enumerate(suggestions):
+        title = (s.get("title") or f"Suggestion {i + 1}").strip()
+        effort = (s.get("effort") or "").strip()
+        label = f"🔧 {title}" + (f" · {effort}" if effort else "")
+        rows.append([InlineKeyboardButton(label[:60], callback_data=f"try:{item_id}:{i}")])
+    return InlineKeyboardMarkup(rows)
 
-    Sent as separate messages so each stays within Telegram's length limit and
-    each <pre> block is independently tap-to-copy.
-    """
+
+async def _reply_analysis(message, analysis: dict, item_id: int | None) -> None:
+    """Send the analysis with a 'try it' button per suggestion (brief on demand)."""
+    await message.reply_text(
+        format_analysis(analysis),
+        parse_mode="HTML",
+        reply_markup=_suggestions_keyboard(analysis, item_id),
+    )
+
+
+async def on_try_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle a 'try it' button tap: rebuild and send the one suggestion's brief."""
+    query = update.callback_query
+    if query is None:
+        return
+    await query.answer()
+    try:
+        _, item_id_s, index_s = (query.data or "").split(":")
+        item_id, index = int(item_id_s), int(index_s)
+    except ValueError:
+        return
+    user_id = get_or_create_user_by_telegram(update.effective_user.id)
+    row = get_item(item_id, user_id)
+    if not row:
+        await query.answer("That suggestion isn't available anymore.", show_alert=True)
+        return
+    analysis = parse_stored(row["analysis"]) or {}
     actions = build_actions(
         analysis,
         profile=get_user_profile(user_id) or "",
-        source_title=source_title,
-        source_url=source_url,
-        summary_excerpt=source_text,
+        source_url=row["source"] or "",
+        summary_excerpt=row["content"] or "",
     )
-    for action in actions:
-        block = format_agent_brief(action)
-        if block:
-            await message.reply_text(block, parse_mode="HTML")
+    if not (0 <= index < len(actions)):
+        return
+    block = format_agent_brief(actions[index])
+    if block:
+        await query.message.reply_text(block, parse_mode="HTML")
 
 
 async def _analyze_and_reply(
@@ -62,7 +90,7 @@ async def _analyze_and_reply(
         logger.exception("Analysis failed")
         await update.message.reply_text(f"Analysis failed: {e}\n\nThe content was not saved.")
         return
-    save_item(
+    item_id = save_item(
         user_id=user_id,
         source_type=source_type,
         source=source,
@@ -74,15 +102,7 @@ async def _analyze_and_reply(
         user_note=user_note,
         file_path=file_path,
     )
-    formatted = format_analysis(analysis)
-    await update.message.reply_text(formatted, parse_mode="HTML")
-    await _send_agent_briefs(
-        update.message,
-        analysis,
-        user_id,
-        source_text=store_content if store_content is not None else text,
-        source_title=source,
-    )
+    await _reply_analysis(update.message, analysis, item_id)
 
 
 # --- Text & URLs ---
@@ -120,15 +140,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             except PipelineError as e:
                 await message.reply_text(fetch_error_message(e.fetched.get("reason"), url))
                 continue
-            await message.reply_text(format_analysis(result.analysis), parse_mode="HTML")
-            await _send_agent_briefs(
-                message,
-                result.analysis,
-                user_id,
-                source_text=result.summary,
-                source_title=result.title,
-                source_url=url,
-            )
+            await _reply_analysis(message, result.analysis, result.saved_id)
     else:
         await message.reply_text("Analyzing...")
         await _analyze_and_reply(update, user_id, text, source_type="note")
