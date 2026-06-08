@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import re
-import urllib.robotparser
 from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlparse
@@ -16,46 +15,6 @@ from bot.ssrf import BlockedURLError, assert_public_url
 logger = logging.getLogger(__name__)
 
 _YT_PATTERNS = re.compile(r"(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})")
-
-# Crawler token we present to robots.txt. We honour an explicit Disallow for
-# this agent (or `*`) on the generic article/blog path only — platform
-# fetchers (YouTube/X/Vimeo) use their own endpoints, not generic crawling.
-_ROBOTS_UA = "filter-fyi"
-
-
-@lru_cache(maxsize=512)
-def _robots_parser_for(scheme: str, netloc: str) -> urllib.robotparser.RobotFileParser | None:
-    """Fetch and parse a host's robots.txt. Cached per host for the process.
-
-    Returns None when robots.txt is absent/unreadable (→ treat as allowed).
-    """
-    robots_url = f"{scheme}://{netloc}/robots.txt"
-    try:
-        resp = requests.get(robots_url, timeout=10, headers={"User-Agent": _ROBOTS_UA})
-    except Exception as e:
-        logger.info("robots.txt fetch failed for %s (allowing): %s", netloc, e)
-        return None
-    if resp.status_code >= 400:
-        return None  # no robots.txt → nothing disallowed
-    rp = urllib.robotparser.RobotFileParser()
-    rp.parse(resp.text.splitlines())
-    return rp
-
-
-def _robots_allows(url: str) -> bool:
-    """True unless the site's robots.txt explicitly disallows our agent.
-
-    Fail-open: if robots.txt is missing or unreadable, allow the (single,
-    user-initiated) fetch rather than blocking the user.
-    """
-    parsed = urlparse(url)
-    rp = _robots_parser_for(parsed.scheme, parsed.netloc)
-    if rp is None:
-        return True
-    try:
-        return rp.can_fetch(_ROBOTS_UA, url)
-    except Exception:
-        return True
 
 
 def _youtube_thumbnail(video_id: str) -> str:
@@ -714,10 +673,10 @@ async def _fetch_url_uncached(url: str) -> dict:
     if urlparse(url).path.lower().endswith(".pdf"):
         return await _pdf_fetch(url)
 
-    # Generic article/blog fetch: honour robots.txt for this path only. (The
-    # platform fetchers above use their own endpoints, not generic crawling.)
-    loop = asyncio.get_running_loop()
-    if not await loop.run_in_executor(None, _robots_allows, url):
-        logger.info("robots.txt disallows %s", url)
-        return {"text": "", "title": url, "source_type": "article", "reason": fetch_errors.BLOCKED_BY_ROBOTS}
+    # Generic article/blog fetch. We deliberately do NOT consult robots.txt
+    # here: every fetch is a single, user-initiated request for a page the
+    # person already intends to read — a user agent acting on their behalf,
+    # not a crawler indexing the site. (Same distinction Google draws for its
+    # user-triggered fetchers.) SSRF guard, rate limits and summary-only
+    # retention still apply.
     return await _generic_fetch(url)
