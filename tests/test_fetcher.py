@@ -287,35 +287,30 @@ class TestUrlCacheLayer:
 
 
 class TestRobots:
-    """Generic article/blog fetches honour robots.txt; fail open when absent."""
+    """robots.txt is deliberately NOT consulted: a generic fetch is a single
+    user-initiated request (a user agent acting for the person), not crawling.
+    The page is fetched regardless of what robots.txt would say."""
 
-    def test_allows_when_no_robots(self, monkeypatch):
-        from bot import fetcher
-        monkeypatch.setattr(fetcher, "_robots_parser_for", lambda scheme, netloc: None)
-        assert fetcher._robots_allows("https://example.com/post") is True
-
-    def test_blocks_when_disallowed(self, monkeypatch):
-        from bot import fetcher
-
-        class _RP:
-            def can_fetch(self, ua, url):
-                return False
-
-        monkeypatch.setattr(fetcher, "_robots_parser_for", lambda scheme, netloc: _RP())
-        assert fetcher._robots_allows("https://example.com/post") is False
-
-    def test_generic_path_short_circuits_when_disallowed(self, monkeypatch):
+    def test_generic_path_does_not_consult_robots(self, monkeypatch):
         from bot import fetcher
 
         monkeypatch.setattr(fetcher, "assert_public_url", lambda u: None)  # skip DNS
-        monkeypatch.setattr(fetcher, "_robots_allows", lambda u: False)
         called = {"generic": False}
 
-        async def _no_generic(u):
+        async def _generic(u):
             called["generic"] = True
-            return {"text": "should not happen"}
+            return {"text": "article body", "title": "T", "source_type": "article"}
 
-        monkeypatch.setattr(fetcher, "_generic_fetch", _no_generic)
+        monkeypatch.setattr(fetcher, "_generic_fetch", _generic)
         result = asyncio.run(fetcher._fetch_url_uncached("https://example.com/post"))
-        assert result["reason"] == fetcher.fetch_errors.BLOCKED_BY_ROBOTS
-        assert called["generic"] is False, "must not fetch a disallowed page"
+        assert called["generic"] is True, "user-initiated fetch must proceed"
+        assert result["text"] == "article body"
+        assert "reason" not in result
+
+    def test_robots_machinery_is_gone(self):
+        """No leftover robots gate that a future change could re-wire."""
+        from bot import fetch_errors, fetcher
+
+        assert not hasattr(fetcher, "_robots_allows")
+        assert not hasattr(fetcher, "_robots_parser_for")
+        assert not hasattr(fetch_errors, "BLOCKED_BY_ROBOTS")

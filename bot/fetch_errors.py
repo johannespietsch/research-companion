@@ -23,7 +23,6 @@ VIDEO_UNAVAILABLE = "video_unavailable"
 JS_REQUIRED = "js_required"
 PAYWALLED = "paywalled"
 BLOCKED_URL = "blocked_url"
-BLOCKED_BY_ROBOTS = "blocked_by_robots"
 
 
 _USER_MESSAGES: dict[str, str] = {
@@ -83,11 +82,6 @@ _USER_MESSAGES: dict[str, str] = {
     BLOCKED_URL: (
         "That URL can't be fetched — only public web addresses are supported. "
         "Private, local, or internal-network addresses are blocked."
-    ),
-    BLOCKED_BY_ROBOTS: (
-        "This site's robots.txt asks automated tools not to fetch this page, so "
-        "we didn't. If you can open it yourself, paste the text directly and "
-        "I'll analyse it."
     ),
 }
 
