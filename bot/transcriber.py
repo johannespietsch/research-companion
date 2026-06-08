@@ -8,24 +8,40 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# Hosted transcription (Groq's whisper-large-v3-turbo) is the primary path:
-# it transcribes hours of audio in seconds, which is what makes the longer
-# per-tier video caps feasible on our small box. When GROQ_API_KEY is unset
-# (local dev / tests) we fall back to self-hosted faster-whisper, which is
-# fine for the short clips that path still handles.
+# Hosted transcription is the primary path: it transcribes hours of audio in
+# seconds, which is what makes the longer per-tier video caps feasible on our
+# small box. Both providers speak the OpenAI audio API, so the only difference
+# is base_url + model. Preference: Groq first (whisper-large-v3-turbo is far
+# cheaper — ~$0.04/h vs OpenAI whisper-1's $0.36/h — and faster), then OpenAI,
+# then self-hosted faster-whisper for local dev / tests (short clips only).
 _GROQ_KEY = os.getenv("GROQ_API_KEY")
-_GROQ_BASE_URL = "https://api.groq.com/openai/v1"
-_GROQ_MODEL = "whisper-large-v3-turbo"
+_OPENAI_KEY = os.getenv("OPENAI_API_KEY")
 
-# Groq caps upload size (25 MB free tier). We always transcode to 16 kHz mono
-# Opus first — Whisper resamples to 16 kHz internally anyway, and Opus at a low
-# bitrate keeps even a 2-hour show well under the limit (~15 MB) with no
-# meaningful accuracy loss on speech.
+if _GROQ_KEY:
+    _PROVIDER = "groq"
+    _HOSTED_KEY = _GROQ_KEY
+    _HOSTED_BASE_URL = "https://api.groq.com/openai/v1"
+    _HOSTED_MODEL = "whisper-large-v3-turbo"
+elif _OPENAI_KEY:
+    _PROVIDER = "openai"
+    _HOSTED_KEY = _OPENAI_KEY
+    _HOSTED_BASE_URL = None  # default OpenAI endpoint
+    _HOSTED_MODEL = "whisper-1"
+else:
+    _PROVIDER = "local"
+    _HOSTED_KEY = None
+    _HOSTED_BASE_URL = None
+    _HOSTED_MODEL = None
+
+# Both Groq and OpenAI cap audio uploads at 25 MB. We always transcode to
+# 16 kHz mono Opus first — Whisper resamples to 16 kHz internally anyway, and
+# Opus at a low bitrate keeps even a 2-hour show well under the limit (~15 MB)
+# with no meaningful accuracy loss on speech.
 _UPLOAD_TARGET_HZ = 16_000
 _UPLOAD_OPUS_BITRATE = "16k"
 
 _model = None
-_groq_client = None
+_hosted_client = None
 
 
 def _get_model():
@@ -37,16 +53,16 @@ def _get_model():
     return _model
 
 
-def _get_groq_client():
-    global _groq_client
-    if _groq_client is None:
+def _get_hosted_client():
+    global _hosted_client
+    if _hosted_client is None:
         from openai import OpenAI  # Groq exposes an OpenAI-compatible API
-        _groq_client = OpenAI(api_key=_GROQ_KEY, base_url=_GROQ_BASE_URL)
-    return _groq_client
+        _hosted_client = OpenAI(api_key=_HOSTED_KEY, base_url=_HOSTED_BASE_URL)
+    return _hosted_client
 
 
 def _compress_for_upload(file_path: str) -> str:
-    """Transcode to 16 kHz mono Opus so even long audio fits Groq's size cap.
+    """Transcode to 16 kHz mono Opus so even long audio fits the 25 MB cap.
 
     Returns a path to a new temp file on success, or the original path when
     ffmpeg is unavailable / the transcode fails (caller still tries to upload
@@ -75,13 +91,13 @@ def _compress_for_upload(file_path: str) -> str:
         return file_path
 
 
-def _transcribe_groq(file_path: str) -> str:
-    client = _get_groq_client()
+def _transcribe_hosted(file_path: str) -> str:
+    client = _get_hosted_client()
     upload_path = _compress_for_upload(file_path)
     try:
         with open(upload_path, "rb") as f:
             resp = client.audio.transcriptions.create(
-                model=_GROQ_MODEL,
+                model=_HOSTED_MODEL,
                 file=f,
                 response_format="text",
             )
@@ -105,14 +121,14 @@ def _transcribe_local(file_path: str) -> str:
 def _transcribe_sync(file_path: str) -> str:
     """Transcribe an audio/video file to text.
 
-    Uses Groq when GROQ_API_KEY is set (the only path that can keep up with
-    the longer per-tier video caps); a Groq failure raises so the caller
-    surfaces WHISPER_FAILED rather than silently dropping to the local CPU
-    model, which can't realistically finish a long file on our box. Without a
-    key we use the local model (dev / tests; short clips only).
+    Uses the hosted provider (Groq, else OpenAI) when a key is set — the only
+    path that can keep up with the longer per-tier video caps. A hosted failure
+    raises so the caller surfaces WHISPER_FAILED rather than silently dropping
+    to the local CPU model, which can't realistically finish a long file on our
+    box. Without a key we use the local model (dev / tests; short clips only).
     """
-    if _GROQ_KEY:
-        return _transcribe_groq(file_path)
+    if _PROVIDER != "local":
+        return _transcribe_hosted(file_path)
     return _transcribe_local(file_path)
 
 
