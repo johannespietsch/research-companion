@@ -388,8 +388,13 @@ def _yt_dlp_transcribe(url: str) -> dict:
 
     ydl_opts = {
         "quiet": True,
-        "format": "bestaudio/best",
-        "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3"}],
+        # Prefer a low-bitrate audio stream (YouTube's ~50 kbps Opus) over the
+        # 160 kbps default: Whisper only needs 16 kHz speech, so the high
+        # bitrate buys nothing and a 2 h best-quality download is 100 MB+ of
+        # transient disk on the 1 GB box. We also drop the FFmpegExtractAudio
+        # re-encode — the transcriber does a single transcode to the compact
+        # upload format, so a second high-quality intermediate is pure waste.
+        "format": "ba[abr<=64]/ba/b",
         "outtmpl": "audio.%(ext)s",
     }
     try:
@@ -400,8 +405,10 @@ def _yt_dlp_transcribe(url: str) -> dict:
             if not info:
                 raise ValueError("yt-dlp returned no info")
 
+            # We didn't re-encode, so the file keeps its native extension
+            # (.webm/.m4a/.opus). Grab whatever single media file landed.
             audio_file = next(
-                (os.path.join(tmpdir, f) for f in os.listdir(tmpdir) if f.endswith(".mp3")),
+                (os.path.join(tmpdir, f) for f in sorted(os.listdir(tmpdir)) if f.startswith("audio.")),
                 None,
             )
             if not audio_file:
