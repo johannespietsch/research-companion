@@ -44,11 +44,11 @@ class TestYouTubeFallbackChain:
         assert result["language"] == "en"
 
     def test_prefers_manual_over_auto_generated_transcript(self):
-        """When both manual and auto-generated transcripts exist, the manually
-        created one wins — it's usually higher fidelity (real captions vs. ASR)."""
+        """When manual and auto-generated transcripts exist *in the spoken
+        language*, the manually created one wins — higher fidelity than ASR."""
         from bot import fetcher
 
-        manual = self._mock_transcript(language_code="de", is_generated=False, snippets=("manual",))
+        manual = self._mock_transcript(language_code="en", is_generated=False, snippets=("manual",))
         auto = self._mock_transcript(language_code="en", is_generated=True, snippets=("auto",))
         with patch("youtube_transcript_api.YouTubeTranscriptApi") as TranscriptApi, \
              patch.object(fetcher, "_youtube_oembed_title", return_value="t"):
@@ -58,7 +58,42 @@ class TestYouTubeFallbackChain:
 
         assert "manual" in result["text"]
         assert "auto" not in result["text"]
-        assert result["language"] == "de"
+        assert result["language"] == "en"
+
+    def test_picks_spoken_language_not_first_listed_manual(self):
+        """Issue #57: a video with many manual *translation* tracks (Arabic
+        first, alphabetically) plus an English ASR track is English-spoken — we
+        must summarise the English manual track, not the first-listed Arabic."""
+        from bot import fetcher
+
+        ar = self._mock_transcript(language_code="ar", is_generated=False, snippets=("arabic",))
+        en = self._mock_transcript(language_code="en", is_generated=False, snippets=("english",))
+        fr = self._mock_transcript(language_code="fr", is_generated=False, snippets=("french",))
+        en_auto = self._mock_transcript(language_code="en", is_generated=True, snippets=("asr",))
+        with patch("youtube_transcript_api.YouTubeTranscriptApi") as TranscriptApi, \
+             patch.object(fetcher, "_youtube_oembed_title", return_value="t"):
+            TranscriptApi.return_value.list.return_value = [ar, fr, en, en_auto]
+            result = fetcher._youtube_transcript(YOUTUBE_URL)
+
+        assert "english" in result["text"]
+        assert "arabic" not in result["text"]
+        assert result["language"] == "en"
+
+    def test_anchors_on_asr_language_for_non_english_video(self):
+        """A French-spoken video (French ASR) with Arabic + French manual tracks
+        picks the French manual — not the first-listed Arabic, not English."""
+        from bot import fetcher
+
+        ar = self._mock_transcript(language_code="ar", is_generated=False, snippets=("arabic",))
+        fr = self._mock_transcript(language_code="fr", is_generated=False, snippets=("francais",))
+        fr_auto = self._mock_transcript(language_code="fr", is_generated=True, snippets=("asr",))
+        with patch("youtube_transcript_api.YouTubeTranscriptApi") as TranscriptApi, \
+             patch.object(fetcher, "_youtube_oembed_title", return_value="t"):
+            TranscriptApi.return_value.list.return_value = [ar, fr, fr_auto]
+            result = fetcher._youtube_transcript(YOUTUBE_URL)
+
+        assert "francais" in result["text"]
+        assert result["language"] == "fr"
 
     def test_uses_non_english_auto_generated_when_thats_all_there_is(self):
         """A German-only auto-generated transcript should be picked up (regression
