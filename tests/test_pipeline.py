@@ -240,6 +240,97 @@ class TestImageStrategy:
         assert "IMAGE DESCRIPTIONS" not in captured["summary_input"]
 
 
+class TestProcessedUrlAudit:
+    """analyze_url writes one row to `processed_urls` per call — success or
+    failure — so the admin dashboard's Usage tile reflects every URL that
+    went through the pipeline. This is the basis for the Whisper-vs-YouTube
+    transcript-source breakdown."""
+
+    def _all_rows(self, db):
+        with db._get_conn() as conn:
+            return conn.execute(
+                "SELECT * FROM processed_urls ORDER BY id"
+            ).fetchall()
+
+    def test_success_writes_audit_row(self, pipeline, db):
+        from bot.analyzer import UsageContext
+        asyncio.run(pipeline.analyze_url(
+            "https://example.com/post",
+            ctx=UsageContext(user_id=42),
+        ))
+        rows = self._all_rows(db)
+        assert len(rows) == 1
+        r = rows[0]
+        assert r["url"] == "https://example.com/post"
+        assert r["title"] == "RAG explained"
+        assert r["source_type"] == "article"
+        assert r["user_id"] == 42
+        assert r["status"] == "ok"
+        assert r["error_code"] == ""
+        assert r["latency_ms"] >= 0
+
+    def test_fetch_failure_still_writes_row(self, pipeline, db, monkeypatch):
+        """We don't have title/source_type when fetch itself crashes, but
+        the URL + status + error_code are useful — operators can see what
+        URLs are breaking."""
+        async def boom(url, **_kw):
+            raise RuntimeError("network down")
+        monkeypatch.setattr(pipeline, "fetch_url", boom)
+
+        from bot.analyzer import UsageContext
+        with pytest.raises(pipeline.PipelineError):
+            asyncio.run(pipeline.analyze_url(
+                "https://broken.example.com", ctx=UsageContext()
+            ))
+
+        rows = self._all_rows(db)
+        assert len(rows) == 1
+        assert rows[0]["url"] == "https://broken.example.com"
+        assert rows[0]["status"] == "error"
+        assert rows[0]["error_code"] == "fetch-failed"
+        assert rows[0]["title"] == ""  # no fetched payload available
+
+    def test_no_text_failure_keeps_title_from_fetched(
+        self, pipeline, db, monkeypatch
+    ):
+        async def empty_with_title(url, **_kw):
+            return {"text": "", "title": "Empty page",
+                    "source_type": "article", "image_urls": []}
+        monkeypatch.setattr(pipeline, "fetch_url", empty_with_title)
+
+        from bot.analyzer import UsageContext
+        with pytest.raises(pipeline.PipelineError):
+            asyncio.run(pipeline.analyze_url("x", ctx=UsageContext()))
+
+        rows = self._all_rows(db)
+        assert len(rows) == 1
+        assert rows[0]["status"] == "error"
+        assert rows[0]["error_code"] == "extraction-failed"
+        # Title preserved from the fetched payload so the dashboard shows
+        # something more useful than just the URL on failure rows.
+        assert rows[0]["title"] == "Empty page"
+
+    def test_transcript_source_propagates(self, pipeline, db, monkeypatch):
+        """The whole point of the audit log is the Whisper-vs-YouTube split.
+        Pin that fetcher → row write preserves the tag."""
+        async def whisper_yt(url, **_kw):
+            return {
+                "text": "Whisper transcript of a longer-form video about RAG.",
+                "title": "T",
+                "source_type": "youtube",
+                "image_urls": [],
+                "transcript_source": "whisper",
+            }
+        monkeypatch.setattr(pipeline, "fetch_url", whisper_yt)
+
+        from bot.analyzer import UsageContext
+        asyncio.run(pipeline.analyze_url("x", ctx=UsageContext()))
+        rows = self._all_rows(db)
+        assert len(rows) == 1
+        assert rows[0]["transcript_source"] == "whisper"
+        assert rows[0]["source_type"] == "youtube"
+
+
 class TestProgressCallback:
     def test_on_step_called_with_known_labels(self, pipeline):
         steps: list[str] = []

@@ -112,6 +112,9 @@ _CREATE_INDEXES_SQL = [
     "CREATE INDEX IF NOT EXISTS idx_llm_cache_created_at ON llm_cache(created_at)",
     "CREATE INDEX IF NOT EXISTS idx_llm_cache_hits_ts ON llm_cache_hits(ts DESC)",
     "CREATE INDEX IF NOT EXISTS idx_llm_cache_hits_purpose ON llm_cache_hits(purpose, ts DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_processed_urls_ts ON processed_urls(ts DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_processed_urls_user ON processed_urls(user_id, ts DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_processed_urls_status ON processed_urls(status, ts DESC)",
 ]
 
 # Per-call LLM usage log. One row per upstream API call (analyze, summary,
@@ -239,6 +242,34 @@ CREATE TABLE IF NOT EXISTS llm_cache_hits (
 # dashboard's longest window.
 LLM_CACHE_HITS_RETENTION_SECONDS = 30 * 24 * 3_600
 
+# Audit log of every URL that went through `bot.pipeline.analyze_url`.
+# Populated on success and on failure — the failure rows let the dashboard
+# show "URLs we tried, why we couldn't" without joining `error_log`. The
+# `transcript_source` column captures whether a video used the YouTube-
+# provided captions vs Whisper vs description fallback, which is the main
+# driver of cost variability on video traffic. Metadata-only — full content
+# stays in `items` / `llm_cache`.
+_CREATE_PROCESSED_URLS_SQL = """\
+CREATE TABLE IF NOT EXISTS processed_urls (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts                 TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S', 'now')),
+    url                TEXT    NOT NULL,
+    title              TEXT    NOT NULL DEFAULT '',
+    source_type        TEXT    NOT NULL DEFAULT '',
+    user_id            INTEGER,
+    anon_id            TEXT,
+    job_id             TEXT,
+    status             TEXT    NOT NULL DEFAULT 'ok',
+    error_code         TEXT    NOT NULL DEFAULT '',
+    transcript_source  TEXT    NOT NULL DEFAULT '',
+    latency_ms         INTEGER NOT NULL DEFAULT 0
+)"""
+
+# 90 days — longer than other audit tables because this one drives the
+# Usage pillar's headline counts and we want a quarterly-ish window
+# available without re-collecting.
+PROCESSED_URLS_RETENTION_SECONDS = 90 * 24 * 3_600
+
 # Allowed feedback signals. Explicit taps + cheap implicit proxies. Kept as an
 # allowlist so the data stays clean enough to learn from.
 FEEDBACK_SIGNALS = frozenset({
@@ -348,6 +379,7 @@ def _init() -> None:
         conn.execute(_CREATE_PROCESSED_UPDATES_SQL)
         conn.execute(_CREATE_LLM_CACHE_SQL)
         conn.execute(_CREATE_LLM_CACHE_HITS_SQL)
+        conn.execute(_CREATE_PROCESSED_URLS_SQL)
         for stmt in _CREATE_INDEXES_SQL:
             conn.execute(stmt)
 
@@ -696,6 +728,7 @@ def prune_maintenance(now=None) -> dict:
     updates_cutoff = _ts(now - timedelta(seconds=PROCESSED_UPDATES_RETENTION_SECONDS))
     llm_cache_cutoff = _ts(now - timedelta(seconds=LLM_CACHE_TTL_SECONDS))
     llm_cache_hits_cutoff = _ts(now - timedelta(seconds=LLM_CACHE_HITS_RETENTION_SECONDS))
+    processed_urls_cutoff = _ts(now - timedelta(seconds=PROCESSED_URLS_RETENTION_SECONDS))
     with _get_conn() as conn:
         errors = conn.execute("DELETE FROM error_log WHERE ts < ?", (err_cutoff,)).rowcount or 0
         cache = conn.execute(
@@ -718,10 +751,13 @@ def prune_maintenance(now=None) -> dict:
         llm_cache_hits = conn.execute(
             "DELETE FROM llm_cache_hits WHERE ts < ?", (llm_cache_hits_cutoff,)
         ).rowcount or 0
+        processed_urls = conn.execute(
+            "DELETE FROM processed_urls WHERE ts < ?", (processed_urls_cutoff,)
+        ).rowcount or 0
     return {
         "error_log": errors, "url_cache": cache, "link_codes": codes,
         "jobs": jobs, "processed_updates": updates, "llm_cache": llm_cache,
-        "llm_cache_hits": llm_cache_hits,
+        "llm_cache_hits": llm_cache_hits, "processed_urls": processed_urls,
     }
 
 
@@ -862,6 +898,43 @@ def estimate_avg_cost_per_call(purpose: str, lookback_days: int = 7) -> float:
         return float(row["avg_cost"] or 0.0)
     except Exception:
         return 0.0
+
+
+# ---------------------------------------------------------------------------
+# Processed URLs audit log
+# ---------------------------------------------------------------------------
+
+def record_processed_url(
+    *,
+    url: str,
+    title: str = "",
+    source_type: str = "",
+    user_id: int | None = None,
+    anon_id: str | None = None,
+    job_id: str | None = None,
+    status: str = "ok",
+    error_code: str = "",
+    transcript_source: str = "",
+    latency_ms: int = 0,
+) -> None:
+    """Log one URL that went through the pipeline. Best-effort — a DB blip
+    here must NEVER break the analyse path, the audit log is observability,
+    not correctness."""
+    try:
+        with _get_conn() as conn:
+            conn.execute(
+                "INSERT INTO processed_urls "
+                "(url, title, source_type, user_id, anon_id, job_id, "
+                "status, error_code, transcript_source, latency_ms) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    url, title, source_type, user_id, anon_id, job_id,
+                    status, error_code, transcript_source, int(latency_ms),
+                ),
+            )
+    except Exception:
+        import logging as _logging
+        _logging.getLogger(__name__).exception("record_processed_url failed")
 
 
 # ---------------------------------------------------------------------------

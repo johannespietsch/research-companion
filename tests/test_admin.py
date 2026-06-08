@@ -291,6 +291,165 @@ class TestCacheStats:
         assert abs(by["analyze"]["cost_saved_usd"] - 0.004) < 1e-9
 
 
+def _stamp_url(db, *, days_ago: int = 0, **overrides) -> None:
+    """Insert one processed_urls row with `ts` set N days ago. Defaults to a
+    successful article fetch — tests pass `status='error'`, `error_code=`,
+    `transcript_source=`, etc. when they need to exercise specific cases."""
+    ts = (datetime.now(timezone.utc) - timedelta(days=days_ago)).strftime(
+        "%Y-%m-%dT%H:%M:%S"
+    )
+    row = {
+        "url": "https://example.com/post",
+        "title": "A title",
+        "source_type": "article",
+        "user_id": None,
+        "anon_id": None,
+        "job_id": None,
+        "status": "ok",
+        "error_code": "",
+        "transcript_source": "",
+        "latency_ms": 500,
+    }
+    row.update(overrides)
+    with db._get_conn() as conn:
+        conn.execute(
+            "INSERT INTO processed_urls (ts, url, title, source_type, "
+            "user_id, anon_id, job_id, status, error_code, transcript_source, "
+            "latency_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                ts, row["url"], row["title"], row["source_type"],
+                row["user_id"], row["anon_id"], row["job_id"], row["status"],
+                row["error_code"], row["transcript_source"], row["latency_ms"],
+            ),
+        )
+
+
+class TestUsageOverviewEmpty:
+    def test_empty_table_returns_zero_kpis_and_empty_lists(
+        self, admin_client, admin_headers
+    ):
+        body = admin_client.get(
+            "/api/admin/usage-overview?days=7", headers=admin_headers
+        ).json()
+        assert body["range_days"] == 7
+        assert body["kpis"] == {
+            "total": 0, "ok": 0, "errors": 0, "error_rate": 0.0,
+        }
+        assert body["by_source_type"] == []
+        assert body["by_error_code"] == []
+        assert body["transcript_sources"] == []
+        assert body["rows"] == []
+        assert body["total_rows"] == 0
+
+
+class TestUsageOverviewWithData:
+    def test_kpis_count_ok_and_errors(self, db, admin_client, admin_headers):
+        _stamp_url(db, status="ok")
+        _stamp_url(db, status="ok")
+        _stamp_url(db, status="error", error_code="fetch-failed")
+
+        body = admin_client.get(
+            "/api/admin/usage-overview", headers=admin_headers
+        ).json()
+        assert body["kpis"]["total"] == 3
+        assert body["kpis"]["ok"] == 2
+        assert body["kpis"]["errors"] == 1
+        assert body["kpis"]["error_rate"] == round(1 / 3, 4)
+
+    def test_by_source_type_breakdown(self, db, admin_client, admin_headers):
+        _stamp_url(db, source_type="article", status="ok")
+        _stamp_url(db, source_type="article", status="error", error_code="x")
+        _stamp_url(db, source_type="youtube", status="ok")
+
+        rows = admin_client.get(
+            "/api/admin/usage-overview", headers=admin_headers
+        ).json()["by_source_type"]
+        by_kind = {r["source_type"]: r for r in rows}
+        assert by_kind["article"]["total"] == 2
+        assert by_kind["article"]["ok"] == 1
+        assert by_kind["article"]["errors"] == 1
+        assert by_kind["youtube"]["ok"] == 1
+
+    def test_by_error_code_sorted_by_frequency(self, db, admin_client, admin_headers):
+        for _ in range(3):
+            _stamp_url(db, status="error", error_code="fetch-failed")
+        for _ in range(2):
+            _stamp_url(db, status="error", error_code="no-transcript")
+        # Success rows don't appear in the error breakdown.
+        _stamp_url(db, status="ok")
+
+        rows = admin_client.get(
+            "/api/admin/usage-overview", headers=admin_headers
+        ).json()["by_error_code"]
+        assert [r["error_code"] for r in rows] == ["fetch-failed", "no-transcript"]
+        assert rows[0]["count"] == 3
+        assert rows[1]["count"] == 2
+
+    def test_transcript_sources_only_count_video_rows(
+        self, db, admin_client, admin_headers
+    ):
+        # Articles have no meaningful transcript_source — must not appear.
+        _stamp_url(db, source_type="article", transcript_source="")
+        # 3 YouTube videos: 2 used YT captions, 1 used Whisper.
+        _stamp_url(db, source_type="youtube", transcript_source="youtube")
+        _stamp_url(db, source_type="youtube", transcript_source="youtube")
+        _stamp_url(db, source_type="youtube", transcript_source="whisper")
+        # Plus one description-only fallback.
+        _stamp_url(db, source_type="youtube", transcript_source="description")
+
+        rows = admin_client.get(
+            "/api/admin/usage-overview", headers=admin_headers
+        ).json()["transcript_sources"]
+        by_source = {r["source"]: r["count"] for r in rows}
+        assert by_source == {"youtube": 2, "whisper": 1, "description": 1}
+
+    def test_rows_paginate_and_total_matches_window(
+        self, db, admin_client, admin_headers
+    ):
+        for i in range(5):
+            _stamp_url(db, url=f"https://example.com/p{i}")
+
+        page1 = admin_client.get(
+            "/api/admin/usage-overview?limit=2&offset=0", headers=admin_headers
+        ).json()
+        page2 = admin_client.get(
+            "/api/admin/usage-overview?limit=2&offset=2", headers=admin_headers
+        ).json()
+
+        assert page1["total_rows"] == 5
+        assert page2["total_rows"] == 5
+        assert len(page1["rows"]) == 2
+        assert len(page2["rows"]) == 2
+        # Pages don't overlap.
+        ids_page1 = {r["id"] for r in page1["rows"]}
+        ids_page2 = {r["id"] for r in page2["rows"]}
+        assert ids_page1.isdisjoint(ids_page2)
+
+    def test_rows_ordered_newest_first(self, db, admin_client, admin_headers):
+        _stamp_url(db, url="https://old", days_ago=2)
+        _stamp_url(db, url="https://new", days_ago=0)
+
+        rows = admin_client.get(
+            "/api/admin/usage-overview", headers=admin_headers
+        ).json()["rows"]
+        assert rows[0]["url"] == "https://new"
+        assert rows[1]["url"] == "https://old"
+
+
+class TestUsageRangeFiltering:
+    def test_rows_outside_window_excluded(
+        self, db, admin_client, admin_headers
+    ):
+        _stamp_url(db, url="https://inside", days_ago=2)
+        _stamp_url(db, url="https://outside", days_ago=10)
+
+        body = admin_client.get(
+            "/api/admin/usage-overview?days=7", headers=admin_headers
+        ).json()
+        assert body["kpis"]["total"] == 1
+        assert [r["url"] for r in body["rows"]] == ["https://inside"]
+
+
 class TestRangeFiltering:
     def test_rows_older_than_window_excluded(
         self, db, admin_client, admin_headers

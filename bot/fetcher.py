@@ -126,6 +126,7 @@ def _youtube_transcript(url: str, max_whisper_duration: int = WHISPER_MAX_DURATI
                 "source_type": "youtube",
                 "image_urls": [thumb],
                 "language": transcript.language_code,
+                "transcript_source": "youtube",
             }
     except Exception:
         logger.info(f"No transcript for {video_id}, falling back to yt-dlp")
@@ -136,7 +137,13 @@ def _youtube_transcript(url: str, max_whisper_duration: int = WHISPER_MAX_DURATI
     # If yt-dlp also got us a transcript (or extraction died entirely), use what
     # we have. The Whisper branch only kicks in when we're left with a
     # description-only answer AND the video is short enough.
-    if extract.get("has_transcript") or not extract.get("text"):
+    if extract.get("has_transcript"):
+        extract.setdefault("transcript_source", "youtube")
+        return extract
+    if not extract.get("text"):
+        # Genuine extraction failure (no description either) — pipeline will
+        # surface ERR_NO_TRANSCRIPT. Tag for the audit log.
+        extract.setdefault("transcript_source", "none")
         return extract
 
     duration = extract.get("duration") or 0
@@ -149,14 +156,18 @@ def _youtube_transcript(url: str, max_whisper_duration: int = WHISPER_MAX_DURATI
         if whisper.get("text"):
             whisper["source_type"] = "youtube"
             whisper.setdefault("image_urls", []).append(thumb)
+            whisper["transcript_source"] = "whisper"
             return whisper
         logger.info(f"YouTube {video_id}: Whisper fallback also failed, returning description")
         # Description-only answer: still useful, but mark the limitation.
         extract["reason"] = fetch_errors.WHISPER_FAILED
+        extract["transcript_source"] = "description"
     elif duration > max_whisper_duration:
         extract["reason"] = fetch_errors.VIDEO_TOO_LONG_FOR_WHISPER
+        extract["transcript_source"] = "description"
     else:
         extract["reason"] = fetch_errors.NO_TRANSCRIPT
+        extract["transcript_source"] = "description"
 
     return extract
 
