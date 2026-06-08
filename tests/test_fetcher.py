@@ -181,9 +181,9 @@ class TestYouTubeFallbackChain:
                 "duration": 1200,  # 20 min
             }
 
-            # Explicit 8-min cap (the sync-endpoint ceiling) → 20 min is over it.
+            # Explicit 10-min cap → the 20-min video is over it.
             result = fetcher._youtube_transcript(
-                YOUTUBE_URL, max_whisper_duration=fetcher.WHISPER_MAX_DURATION_SYNC_S
+                YOUTUBE_URL, max_whisper_duration=10 * 60
             )
 
         transcribe.assert_not_called()

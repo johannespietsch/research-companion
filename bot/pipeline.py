@@ -128,7 +128,8 @@ async def analyze_url(
 
     `max_whisper_duration=None` (default) derives the captionless-video
     transcription ceiling from the caller's tier (signed-in → 2 h, anon →
-    30 min). Time-bound sync endpoints pass a lower explicit cap.
+    30 min). Every web request runs through the async job path, so the full
+    tier cap applies; the override exists only for tests / future callers.
 
     `on_step` is an optional sync callback invoked with stable labels
     ("fetching" | "describing-images" | "summarizing" | "analyzing") so

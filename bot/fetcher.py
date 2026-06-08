@@ -50,14 +50,11 @@ def _youtube_oembed_title(url: str) -> str | None:
 # Per-tier ceilings on how long a captionless video may be before we attempt
 # audio download + transcription (Groq, see bot.transcriber). Hosted
 # transcription is fast enough that the real cost is the audio download, so
-# these are policy/cost levers rather than compute limits.
+# these are policy/cost levers rather than compute limits. Every web request
+# runs through the async job path (`/api/job`), which has no Worker-side
+# analysis timeout, so both tiers use their full cap everywhere.
 WHISPER_MAX_DURATION_ANON_S = 30 * 60        # 30 min — anonymous web tries
 WHISPER_MAX_DURATION_SIGNED_IN_S = 2 * 60 * 60  # 2 h — signed-in users
-# Synchronous HTTP endpoints (`/api/try`, `/api/library/add`) are bound by the
-# Worker's ~25 s timeout: even with fast hosted transcription, the audio
-# download for a long video blows that budget. They pass this lower cap
-# explicitly; the async job path and Telegram use the full per-tier cap.
-WHISPER_MAX_DURATION_SYNC_S = 8 * 60         # 8 min
 
 
 def whisper_cap_for(*, signed_in: bool) -> int:

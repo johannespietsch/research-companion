@@ -27,7 +27,6 @@ from bot.pipeline import (
 )
 from bot.auth import require_token
 from bot.config import MAX_CONTENT_CHARS
-from bot.fetcher import WHISPER_MAX_DURATION_SYNC_S
 from bot.fetch_errors import user_message as fetch_error_message
 from bot.db import (
     FEEDBACK_SIGNALS,
@@ -162,7 +161,6 @@ async def submit_url(
             ctx=UsageContext(user_id=user_id),
             save_for_user_id=user_id,
             user_note=user_note,
-            max_whisper_duration=WHISPER_MAX_DURATION_SYNC_S,
         )
     except PipelineError as e:
         raise _pipeline_error_to_http(e, url)
@@ -313,11 +311,7 @@ async def try_url(req: TryRequest, _: None = Depends(_require_try_secret)):
         raise HTTPException(status_code=400, detail={"error": "invalid-url"})
 
     try:
-        result = await analyze_url(
-            url,
-            ctx=UsageContext(anon_id=req.anon_id),
-            max_whisper_duration=WHISPER_MAX_DURATION_SYNC_S,
-        )
+        result = await analyze_url(url, ctx=UsageContext(anon_id=req.anon_id))
     except PipelineError as e:
         raise _pipeline_error_to_http(e, url)
 
@@ -503,7 +497,6 @@ async def library_add(req: _LibraryAddRequest, _: None = Depends(_require_try_se
             ctx=UsageContext(user_id=req.user_id),
             save_for_user_id=req.user_id,
             user_note=req.user_note,
-            max_whisper_duration=WHISPER_MAX_DURATION_SYNC_S,
         )
     except PipelineError as e:
         raise _pipeline_error_to_http(e, url)
