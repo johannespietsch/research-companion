@@ -41,7 +41,7 @@ from bot.analyzer import (
     to_json_str,
 )
 from bot.db import save_item
-from bot.fetcher import fetch_url
+from bot.fetcher import fetch_url, whisper_cap_for
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +112,7 @@ async def analyze_url(
     save_for_user_id: int | None = None,
     user_note: str = "",
     include_images: bool | None = None,
+    max_whisper_duration: int | None = None,
     on_step: Optional[Callable[[str], None]] = None,
 ) -> PipelineResult:
     """Run the full URL → analysis chain.
@@ -125,6 +126,10 @@ async def analyze_url(
     `include_images=None` (default) picks based on `source_type` — see
     `_INCLUDE_IMAGES_BY_DEFAULT`. Pass `True`/`False` to override.
 
+    `max_whisper_duration=None` (default) derives the captionless-video
+    transcription ceiling from the caller's tier (signed-in → 2 h, anon →
+    30 min). Time-bound sync endpoints pass a lower explicit cap.
+
     `on_step` is an optional sync callback invoked with stable labels
     ("fetching" | "describing-images" | "summarizing" | "analyzing") so
     callers like the async job runner can surface progress to the UI.
@@ -136,9 +141,12 @@ async def analyze_url(
             except Exception:
                 logger.exception("pipeline on_step callback raised; ignoring")
 
+    if max_whisper_duration is None:
+        max_whisper_duration = whisper_cap_for(signed_in=ctx.user_id is not None)
+
     _step("fetching")
     try:
-        fetched = await fetch_url(url)
+        fetched = await fetch_url(url, max_whisper_duration=max_whisper_duration)
     except Exception as e:
         logger.exception("pipeline: fetch_url crashed for %s", url)
         raise PipelineError(ERR_FETCH_FAILED, message=str(e))

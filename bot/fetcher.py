@@ -47,11 +47,22 @@ def _youtube_oembed_title(url: str) -> str | None:
         return None
 
 
-# Whisper fallback is only attempted for videos short enough that the
-# audio download + transcription has a real chance of completing within the
-# Worker's 25 s timeout on `/api/try` / `/api/library/add`. Long videos fall
-# back to title + uploader + description.
-_WHISPER_FALLBACK_MAX_DURATION_S = 180
+# Per-tier ceilings on how long a captionless video may be before we attempt
+# audio download + transcription (Groq, see bot.transcriber). Hosted
+# transcription is fast enough that the real cost is the audio download, so
+# these are policy/cost levers rather than compute limits.
+WHISPER_MAX_DURATION_ANON_S = 30 * 60        # 30 min — anonymous web tries
+WHISPER_MAX_DURATION_SIGNED_IN_S = 2 * 60 * 60  # 2 h — signed-in users
+# Synchronous HTTP endpoints (`/api/try`, `/api/library/add`) are bound by the
+# Worker's ~25 s timeout: even with fast hosted transcription, the audio
+# download for a long video blows that budget. They pass this lower cap
+# explicitly; the async job path and Telegram use the full per-tier cap.
+WHISPER_MAX_DURATION_SYNC_S = 8 * 60         # 8 min
+
+
+def whisper_cap_for(*, signed_in: bool) -> int:
+    """Default per-tier transcription duration ceiling (seconds)."""
+    return WHISPER_MAX_DURATION_SIGNED_IN_S if signed_in else WHISPER_MAX_DURATION_ANON_S
 
 
 def _lang_base(code: str) -> str:
@@ -89,7 +100,7 @@ def _select_transcript(transcripts: list):
     return english_manual or (manuals[0] if manuals else None) or generated
 
 
-def _youtube_transcript(url: str) -> dict:
+def _youtube_transcript(url: str, max_whisper_duration: int = WHISPER_MAX_DURATION_ANON_S) -> dict:
     from youtube_transcript_api import YouTubeTranscriptApi
 
     match = _YT_PATTERNS.search(url)
@@ -132,10 +143,10 @@ def _youtube_transcript(url: str) -> dict:
         return extract
 
     duration = extract.get("duration") or 0
-    if duration and duration <= _WHISPER_FALLBACK_MAX_DURATION_S:
+    if duration and duration <= max_whisper_duration:
         logger.info(
             f"YouTube {video_id}: no subtitles, trying audio + Whisper "
-            f"(duration {duration}s)"
+            f"(duration {duration}s, cap {max_whisper_duration}s)"
         )
         whisper = _yt_dlp_transcribe(url)
         if whisper.get("text"):
@@ -145,7 +156,7 @@ def _youtube_transcript(url: str) -> dict:
         logger.info(f"YouTube {video_id}: Whisper fallback also failed, returning description")
         # Description-only answer: still useful, but mark the limitation.
         extract["reason"] = fetch_errors.WHISPER_FAILED
-    elif duration > _WHISPER_FALLBACK_MAX_DURATION_S:
+    elif duration > max_whisper_duration:
         extract["reason"] = fetch_errors.VIDEO_TOO_LONG_FOR_WHISPER
     else:
         extract["reason"] = fetch_errors.NO_TRANSCRIPT
@@ -649,11 +660,20 @@ def _domain_matches(domain: str, *targets: str) -> bool:
     return any(domain == t or domain.endswith(f".{t}") for t in targets)
 
 
-async def fetch_url(url: str) -> dict:
+async def fetch_url(
+    url: str, *, max_whisper_duration: int = WHISPER_MAX_DURATION_ANON_S
+) -> dict:
     """Public entry point. Wraps `_fetch_url_uncached` with a per-URL cache so
     repeat submissions, retries, and concurrent fetches of the same URL don't
     each hit upstream. Failed fetches (empty `text`) are NOT cached so the
-    next attempt is fresh."""
+    next attempt is fresh.
+
+    `max_whisper_duration` is the captionless-video transcription ceiling for
+    this caller's tier (see `whisper_cap_for`). It only changes *whether* we
+    transcribe, never the transcript itself, so the cache stays keyed by URL —
+    except the one tier-dependent degraded outcome (`video_too_long_for_whisper`)
+    which we never cache, so a stricter tier can't poison a more generous one.
+    """
     from bot.db import get_cached_fetch, set_cached_fetch
 
     cached = get_cached_fetch(url)
@@ -661,9 +681,13 @@ async def fetch_url(url: str) -> dict:
         logger.info(f"url_cache hit for {url}")
         return cached
 
-    result = await _fetch_url_uncached(url)
+    result = await _fetch_url_uncached(url, max_whisper_duration=max_whisper_duration)
 
-    if (result.get("text") or "").strip():
+    cacheable = (
+        (result.get("text") or "").strip()
+        and result.get("reason") != fetch_errors.VIDEO_TOO_LONG_FOR_WHISPER
+    )
+    if cacheable:
         try:
             set_cached_fetch(url, result)
         except Exception as e:
@@ -804,7 +828,9 @@ async def _academic_fetch(url: str, doi: str) -> dict | None:
     return None
 
 
-async def _fetch_url_uncached(url: str) -> dict:
+async def _fetch_url_uncached(
+    url: str, *, max_whisper_duration: int = WHISPER_MAX_DURATION_ANON_S
+) -> dict:
     """The actual routing logic — keep this as the only place that knows the
     source-specific fetchers. `fetch_url` is the cache layer in front."""
     # SSRF guard: refuse anything that resolves to a non-public address before
@@ -820,7 +846,9 @@ async def _fetch_url_uncached(url: str) -> dict:
 
     if _domain_matches(domain, "youtube.com", "youtu.be"):
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, _youtube_transcript, url)
+        return await loop.run_in_executor(
+            None, _youtube_transcript, url, max_whisper_duration
+        )
 
     if _domain_matches(domain, "streamyard.com"):
         return await _streamyard_fetch(url)
@@ -829,6 +857,11 @@ async def _fetch_url_uncached(url: str) -> dict:
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(None, _yt_dlp_extract, url)
         if result["text"].strip():
+            return result
+        duration = result.get("duration") or 0
+        if duration and duration > max_whisper_duration:
+            logger.info(f"Vimeo {url}: {duration}s exceeds cap {max_whisper_duration}s")
+            result["reason"] = fetch_errors.VIDEO_TOO_LONG_FOR_WHISPER
             return result
         logger.info(f"No subtitles for {url}, falling back to Whisper transcription")
         return await loop.run_in_executor(None, _yt_dlp_transcribe, url)

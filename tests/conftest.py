@@ -54,7 +54,7 @@ def client(monkeypatch):
     import bot.api
     import bot.pipeline
 
-    async def fake_fetch_url(url):
+    async def fake_fetch_url(url, **kwargs):
         return {
             "text": "Sample article body about retrieval-augmented generation.",
             "title": "Hello RAG",
