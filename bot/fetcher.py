@@ -54,6 +54,41 @@ def _youtube_oembed_title(url: str) -> str | None:
 _WHISPER_FALLBACK_MAX_DURATION_S = 180
 
 
+def _lang_base(code: str) -> str:
+    """Bare language subtag, e.g. 'en-US' / 'en-GB' → 'en', 'zh-Hans' → 'zh'."""
+    return (code or "").split("-")[0].lower()
+
+
+def _select_transcript(transcripts: list):
+    """Choose which caption track to summarise from.
+
+    Creators often upload many *manual translation* tracks (this video has 20+:
+    Arabic, Bulgarian, Chinese, …). Naively taking the first manual track picks
+    whichever language YouTube lists first — alphabetically Arabic — so an
+    English video gets summarised in Arabic (issue #57).
+
+    The auto-generated (ASR) track is transcribed from the actual audio, so its
+    language is the video's spoken language. Anchor on it: prefer the manual
+    track in that language (human-authored, cleaner), then the ASR track
+    itself. Only when there's no ASR track to anchor on do we fall back to a
+    manual track — English first (the common original), else whatever's listed
+    first — and finally any generated track.
+    """
+    generated = next((t for t in transcripts if t.is_generated), None)
+    manuals = [t for t in transcripts if not t.is_generated]
+
+    original_lang = generated.language_code if generated else None
+    if original_lang:
+        manual_in_original = next(
+            (t for t in manuals if _lang_base(t.language_code) == _lang_base(original_lang)),
+            None,
+        )
+        return manual_in_original or generated
+
+    english_manual = next((t for t in manuals if _lang_base(t.language_code) == "en"), None)
+    return english_manual or (manuals[0] if manuals else None) or generated
+
+
 def _youtube_transcript(url: str) -> dict:
     from youtube_transcript_api import YouTubeTranscriptApi
 
@@ -65,15 +100,14 @@ def _youtube_transcript(url: str) -> dict:
     thumb = _youtube_thumbnail(video_id)
     try:
         api = YouTubeTranscriptApi()
-        # Enumerate every available transcript instead of forcing 'en'. Prefer
-        # manually-created over auto-generated, but DON'T translate — keep the
-        # source language so the LLM summarises in the speaker's tongue. The
-        # previous `api.fetch(video_id)` defaulted to English and silently
-        # dropped to yt-dlp for every non-English-captioned video.
+        # Enumerate every available transcript and pick the one in the video's
+        # spoken language (see _select_transcript) — never translate, so the LLM
+        # summarises in the speaker's tongue. We don't force 'en' (that silently
+        # dropped non-English-captioned videos to yt-dlp) nor take the first
+        # manual track (that summarised multi-subtitle videos in a random
+        # language — issue #57).
         transcripts = list(api.list(video_id))
-        manual = next((t for t in transcripts if not t.is_generated), None)
-        generated = next((t for t in transcripts if t.is_generated), None)
-        transcript = manual or generated
+        transcript = _select_transcript(transcripts)
         if transcript is not None:
             fetched = transcript.fetch()
             text = " ".join(snippet.text for snippet in fetched)
