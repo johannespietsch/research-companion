@@ -409,11 +409,21 @@ class TestPruneMaintenance:
             conn.execute(
                 "INSERT INTO llm_cache_hits (ts, purpose) VALUES (?, 'analyze')", (NEW,),
             )
+            # Old + new processed_urls rows — old should prune (past 90d TTL).
+            conn.execute(
+                "INSERT INTO processed_urls (ts, url, status) VALUES (?, 'https://old', 'ok')",
+                (OLD,),
+            )
+            conn.execute(
+                "INSERT INTO processed_urls (ts, url, status) VALUES (?, 'https://new', 'ok')",
+                (NEW,),
+            )
 
         counts = db.prune_maintenance(now=datetime(2026, 5, 20, tzinfo=timezone.utc))
         assert counts == {
             "error_log": 1, "url_cache": 1, "link_codes": 1, "jobs": 1,
             "processed_updates": 1, "llm_cache": 1, "llm_cache_hits": 1,
+            "processed_urls": 1,
         }
 
         with db._get_conn() as conn:
@@ -424,6 +434,7 @@ class TestPruneMaintenance:
             assert [r["update_id"] for r in conn.execute("SELECT update_id FROM processed_updates")] == [2]
             assert [r["cache_key"] for r in conn.execute("SELECT cache_key FROM llm_cache")] == ["k_new"]
             assert conn.execute("SELECT COUNT(*) AS n FROM llm_cache_hits").fetchone()["n"] == 1
+            assert [r["url"] for r in conn.execute("SELECT url FROM processed_urls")] == ["https://new"]
 
     def test_idempotent_on_empty(self, db):
         from datetime import datetime, timezone
@@ -432,6 +443,7 @@ class TestPruneMaintenance:
         assert counts == {
             "error_log": 0, "url_cache": 0, "link_codes": 0, "jobs": 0,
             "processed_updates": 0, "llm_cache": 0, "llm_cache_hits": 0,
+            "processed_urls": 0,
         }
 
 

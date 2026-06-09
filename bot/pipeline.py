@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import time
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -40,7 +41,7 @@ from bot.analyzer import (
     summarize_content,
     to_json_str,
 )
-from bot.db import save_item
+from bot.db import record_processed_url, save_item
 from bot.fetcher import fetch_url, whisper_cap_for
 
 logger = logging.getLogger(__name__)
@@ -145,77 +146,109 @@ async def analyze_url(
     if max_whisper_duration is None:
         max_whisper_duration = whisper_cap_for(signed_in=ctx.user_id is not None)
 
-    _step("fetching")
+    # Audit-log bookkeeping. Every successful AND failed call writes one row
+    # to `processed_urls`, so the Usage tile can show "what we tried and how
+    # it went" without joining `error_log`. `fetched` may stay empty (a
+    # fetch failure) or get the partial dict from a downstream error.
+    started = time.monotonic()
+    fetched: dict = {}
+    audit_status = "ok"
+    audit_error_code = ""
+
     try:
-        fetched = await fetch_url(url, max_whisper_duration=max_whisper_duration)
-    except Exception as e:
-        logger.exception("pipeline: fetch_url crashed for %s", url)
-        raise PipelineError(ERR_FETCH_FAILED, message=str(e))
+        _step("fetching")
+        try:
+            fetched = await fetch_url(url, max_whisper_duration=max_whisper_duration)
+        except Exception as e:
+            logger.exception("pipeline: fetch_url crashed for %s", url)
+            raise PipelineError(ERR_FETCH_FAILED, message=str(e))
 
-    text = (fetched.get("text") or "").strip()
-    source_type = fetched.get("source_type") or "article"
-    reason = fetched.get("reason")
+        text = (fetched.get("text") or "").strip()
+        source_type = fetched.get("source_type") or "article"
+        reason = fetched.get("reason")
 
-    # Bail before analysing when there's nothing usable: either no text at all,
-    # or a degraded fetch (`reason` set) whose fallback is just a title-only
-    # stub. Both surface the fetch `reason` to the caller rather than running
-    # the analyser on a thin snippet — see _MIN_ANALYZABLE_CHARS.
-    if not text or (reason and len(text) < _MIN_ANALYZABLE_CHARS):
-        # Distinguish video-with-no-transcript from generic extraction
-        # failure so callers can surface the right UX.
-        code = ERR_NO_TRANSCRIPT if source_type in _VIDEO_SOURCE_TYPES else ERR_NO_TEXT
-        raise PipelineError(code, fetched=fetched)
+        # Bail before analysing when there's nothing usable: either no text at all,
+        # or a degraded fetch (`reason` set) whose fallback is just a title-only
+        # stub. Both surface the fetch `reason` to the caller rather than running
+        # the analyser on a thin snippet — see _MIN_ANALYZABLE_CHARS.
+        if not text or (reason and len(text) < _MIN_ANALYZABLE_CHARS):
+            # Distinguish video-with-no-transcript from generic extraction
+            # failure so callers can surface the right UX.
+            code = ERR_NO_TRANSCRIPT if source_type in _VIDEO_SOURCE_TYPES else ERR_NO_TEXT
+            raise PipelineError(code, fetched=fetched)
 
-    # ctx may not have source_type set when the caller built it before
-    # fetching — fill it in here so downstream rows carry the right tag.
-    if not ctx.source_type:
-        ctx.source_type = source_type
+        # ctx may not have source_type set when the caller built it before
+        # fetching — fill it in here so downstream rows carry the right tag.
+        if not ctx.source_type:
+            ctx.source_type = source_type
 
-    # Inline image descriptions: append to text so they enter the summary
-    # (and therefore the analyze input) deterministically. analyze_image()
-    # is content-addressed-cached, so this is free on repeats.
-    if include_images is None:
-        include_images = source_type in _INCLUDE_IMAGES_BY_DEFAULT
-    if include_images:
-        image_urls = fetched.get("image_urls") or []
-        if image_urls:
-            _step("describing-images")
-            text = text + await _describe_images(image_urls, ctx=ctx)
+        # Inline image descriptions: append to text so they enter the summary
+        # (and therefore the analyze input) deterministically. analyze_image()
+        # is content-addressed-cached, so this is free on repeats.
+        if include_images is None:
+            include_images = source_type in _INCLUDE_IMAGES_BY_DEFAULT
+        if include_images:
+            image_urls = fetched.get("image_urls") or []
+            if image_urls:
+                _step("describing-images")
+                text = text + await _describe_images(image_urls, ctx=ctx)
 
-    # Summarise on a thread so we don't block the event loop on the LLM
-    # call. The async wrapper around a sync call mirrors what _run_job did.
-    # `published_at` (when available from yt-dlp) anchors the model's
-    # interpretation of relative dates in the source — without it, models
-    # silently default to their training-cutoff year.
-    _step("summarizing")
-    published_at = fetched.get("published_at") or ""
-    loop = asyncio.get_running_loop()
-    summary = await loop.run_in_executor(
-        None,
-        lambda: summarize_content(text, ctx=ctx, published_at=published_at),
-    )
-
-    _step("analyzing")
-    try:
-        analysis = await loop.run_in_executor(None, lambda: analyze(summary, ctx=ctx))
-    except Exception as e:
-        logger.exception("pipeline: analyze crashed for %s", url)
-        raise PipelineError(ERR_ANALYZE_FAILED, fetched=fetched, message=str(e))
-
-    saved_id: int | None = None
-    if save_for_user_id is not None:
-        saved_id = save_item(
-            user_id=save_for_user_id,
-            source_type=source_type,
-            source=url,
-            content=summary,
-            analysis=to_json_str(analysis),
-            user_note=user_note,
+        # Summarise on a thread so we don't block the event loop on the LLM
+        # call. The async wrapper around a sync call mirrors what _run_job did.
+        # `published_at` (when available from yt-dlp) anchors the model's
+        # interpretation of relative dates in the source — without it, models
+        # silently default to their training-cutoff year.
+        _step("summarizing")
+        published_at = fetched.get("published_at") or ""
+        loop = asyncio.get_running_loop()
+        summary = await loop.run_in_executor(
+            None,
+            lambda: summarize_content(text, ctx=ctx, published_at=published_at),
         )
 
-    return PipelineResult(
-        fetched=fetched, summary=summary, analysis=analysis, saved_id=saved_id,
-    )
+        _step("analyzing")
+        try:
+            analysis = await loop.run_in_executor(None, lambda: analyze(summary, ctx=ctx))
+        except Exception as e:
+            logger.exception("pipeline: analyze crashed for %s", url)
+            raise PipelineError(ERR_ANALYZE_FAILED, fetched=fetched, message=str(e))
+
+        saved_id: int | None = None
+        if save_for_user_id is not None:
+            saved_id = save_item(
+                user_id=save_for_user_id,
+                source_type=source_type,
+                source=url,
+                content=summary,
+                analysis=to_json_str(analysis),
+                user_note=user_note,
+            )
+
+        return PipelineResult(
+            fetched=fetched, summary=summary, analysis=analysis, saved_id=saved_id,
+        )
+    except PipelineError as e:
+        # Pull whatever the exception carries — for ERR_NO_TEXT / ERR_NO_TRANSCRIPT
+        # / ERR_ANALYZE_FAILED the fetched dict is attached, so the audit row
+        # still shows the title and source_type even on failure.
+        if e.fetched:
+            fetched = e.fetched
+        audit_status = "error"
+        audit_error_code = e.code
+        raise
+    finally:
+        record_processed_url(
+            url=url,
+            title=fetched.get("title") or "",
+            source_type=fetched.get("source_type") or "",
+            user_id=ctx.user_id,
+            anon_id=ctx.anon_id,
+            job_id=ctx.job_id,
+            status=audit_status,
+            error_code=audit_error_code,
+            transcript_source=fetched.get("transcript_source") or "",
+            latency_ms=int((time.monotonic() - started) * 1000),
+        )
 
 
 async def _describe_images(image_urls: list[str], *, ctx: UsageContext) -> str:

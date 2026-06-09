@@ -356,3 +356,175 @@ async def cost_overview_endpoint(
     rendering — see `cost_overview()` for the full shape.
     """
     return cost_overview(days)
+
+
+_USAGE_LIST_DEFAULT_LIMIT = 50
+_USAGE_LIST_MAX_LIMIT = 200
+
+
+def usage_overview(days: int, limit: int, offset: int) -> dict:
+    """Activity rollup from `processed_urls` plus a paginated row list.
+
+    Returned shape:
+
+        {
+          "range_days": int,
+          "as_of": ISO-8601 UTC,
+          "kpis": {
+            "total": int,        # all URLs processed in window
+            "ok": int,
+            "errors": int,
+            "error_rate": float
+          },
+          "by_source_type": [{source_type, total, ok, errors}, ...],
+          "by_error_code":  [{error_code, count}, ...],
+          "transcript_sources": [{source, count}, ...],   # for video URLs
+                                                          # 'youtube' | 'whisper'
+                                                          # | 'description' | 'none'
+          "rows": [{ts, url, title, source_type, user_id, anon_id, status,
+                    error_code, transcript_source, latency_ms}, ...],
+          "total_rows": int,    # for pagination
+          "limit": int, "offset": int
+        }
+    """
+    since = _since_iso(days)
+    with _get_conn() as conn:
+        kpi_row = conn.execute(
+            """
+            SELECT
+                COUNT(*)                                                AS total,
+                SUM(CASE WHEN status='ok'    THEN 1 ELSE 0 END)         AS ok,
+                SUM(CASE WHEN status='error' THEN 1 ELSE 0 END)         AS errors
+            FROM processed_urls
+            WHERE ts >= ?
+            """,
+            (since,),
+        ).fetchone()
+
+        source_rows = conn.execute(
+            """
+            SELECT
+                COALESCE(NULLIF(source_type, ''), '(unknown)') AS source_type,
+                COUNT(*)                                       AS total,
+                SUM(CASE WHEN status='ok'    THEN 1 ELSE 0 END) AS ok,
+                SUM(CASE WHEN status='error' THEN 1 ELSE 0 END) AS errors
+            FROM processed_urls
+            WHERE ts >= ?
+            GROUP BY source_type
+            ORDER BY total DESC
+            """,
+            (since,),
+        ).fetchall()
+
+        # Error codes (non-empty only) — top failure modes.
+        error_rows = conn.execute(
+            """
+            SELECT error_code, COUNT(*) AS count
+            FROM processed_urls
+            WHERE ts >= ? AND status = 'error' AND error_code != ''
+            GROUP BY error_code
+            ORDER BY count DESC
+            """,
+            (since,),
+        ).fetchall()
+
+        # Transcript source split — drives the Whisper-vs-YouTube question.
+        # Filter to video source types so the denominator is meaningful.
+        transcript_rows = conn.execute(
+            """
+            SELECT
+                COALESCE(NULLIF(transcript_source, ''), '(none)') AS source,
+                COUNT(*)                                          AS count
+            FROM processed_urls
+            WHERE ts >= ? AND source_type IN ('youtube', 'video')
+            GROUP BY transcript_source
+            ORDER BY count DESC
+            """,
+            (since,),
+        ).fetchall()
+
+        # Paginated list of recent rows. Total is window-wide for the
+        # "showing X of N" UX in the table.
+        total_rows_row = conn.execute(
+            "SELECT COUNT(*) AS n FROM processed_urls WHERE ts >= ?", (since,),
+        ).fetchone()
+
+        list_rows = conn.execute(
+            """
+            SELECT id, ts, url, title, source_type, user_id, anon_id,
+                   status, error_code, transcript_source, latency_ms
+            FROM processed_urls
+            WHERE ts >= ?
+            ORDER BY ts DESC, id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (since, limit, offset),
+        ).fetchall()
+
+    total = kpi_row["total"] or 0
+    errors = kpi_row["errors"] or 0
+    error_rate = (errors / total) if total > 0 else 0.0
+
+    return {
+        "range_days": days,
+        "as_of": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "kpis": {
+            "total": total,
+            "ok": kpi_row["ok"] or 0,
+            "errors": errors,
+            "error_rate": round(error_rate, 4),
+        },
+        "by_source_type": [
+            {
+                "source_type": r["source_type"],
+                "total": r["total"],
+                "ok": r["ok"] or 0,
+                "errors": r["errors"] or 0,
+            }
+            for r in source_rows
+        ],
+        "by_error_code": [
+            {"error_code": r["error_code"], "count": r["count"]}
+            for r in error_rows
+        ],
+        "transcript_sources": [
+            {"source": r["source"], "count": r["count"]}
+            for r in transcript_rows
+        ],
+        "rows": [
+            {
+                "id": r["id"],
+                "ts": r["ts"],
+                "url": r["url"],
+                "title": r["title"],
+                "source_type": r["source_type"],
+                "user_id": r["user_id"],
+                "anon_id": r["anon_id"],
+                "status": r["status"],
+                "error_code": r["error_code"],
+                "transcript_source": r["transcript_source"],
+                "latency_ms": r["latency_ms"],
+            }
+            for r in list_rows
+        ],
+        "total_rows": total_rows_row["n"] or 0,
+        "limit": limit,
+        "offset": offset,
+    }
+
+
+@router.get("/usage-overview")
+async def usage_overview_endpoint(
+    days: int = Query(default=_DEFAULT_DAYS, ge=1, le=_MAX_DAYS),
+    limit: int = Query(default=_USAGE_LIST_DEFAULT_LIMIT, ge=1, le=_USAGE_LIST_MAX_LIMIT),
+    offset: int = Query(default=0, ge=0),
+    _: None = Depends(_require_admin_secret),
+) -> dict:
+    """Activity rollup + paginated URL list from `processed_urls`.
+
+    Powers the Usage pillar of the admin dashboard. Includes transcript-
+    source split (YouTube captions vs Whisper vs description fallback) so
+    operators can see how much video traffic is going through the expensive
+    Whisper path. See `usage_overview()` for the full response shape.
+    """
+    return usage_overview(days, limit, offset)
