@@ -94,6 +94,35 @@ CREATE TABLE IF NOT EXISTS feedback (
     FOREIGN KEY (item_id) REFERENCES items(id)
 )"""
 
+# Suggestions a user parked for later — the "Shortlist". Unlike the append-only
+# feedback log, this is durable, user-owned state: one row per saved suggestion,
+# carrying a snapshot of the suggestion text (suggestions are regenerated per
+# analysis and aren't stably keyed, so we snapshot rather than re-derive) plus
+# the item_id it came from for the back-link. `status` advances saved → tried →
+# done as the user follows up. UNIQUE(user, item, index) makes "save" idempotent.
+_CREATE_SAVED_SUGGESTIONS_SQL = """\
+CREATE TABLE IF NOT EXISTS saved_suggestions (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id          INTEGER NOT NULL,
+    item_id          INTEGER NOT NULL,
+    suggestion_index INTEGER NOT NULL,
+    title            TEXT NOT NULL DEFAULT '',
+    detail           TEXT NOT NULL DEFAULT '',
+    effort           TEXT NOT NULL DEFAULT '',
+    first_step       TEXT NOT NULL DEFAULT '',
+    grounded_in      TEXT NOT NULL DEFAULT '',
+    status           TEXT NOT NULL DEFAULT 'saved',
+    created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S', 'now')),
+    updated_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S', 'now')),
+    UNIQUE(user_id, item_id, suggestion_index),
+    FOREIGN KEY (user_id) REFERENCES users(id),
+    FOREIGN KEY (item_id) REFERENCES items(id)
+)"""
+
+# Statuses a shortlisted suggestion can hold. 'tried'/'done' mirror the
+# FEEDBACK_SIGNALS taps so the follow-up reads consistently across surfaces.
+SAVED_SUGGESTION_STATUSES = frozenset({"saved", "tried", "done"})
+
 _CREATE_INDEXES_SQL = [
     "CREATE INDEX IF NOT EXISTS idx_items_user ON items(user_id, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_link_codes_expires ON link_codes(expires_at)",
@@ -102,6 +131,8 @@ _CREATE_INDEXES_SQL = [
     "CREATE INDEX IF NOT EXISTS idx_error_log_fingerprint ON error_log(fingerprint)",
     "CREATE INDEX IF NOT EXISTS idx_feedback_user ON feedback(user_id, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_feedback_item ON feedback(item_id)",
+    "CREATE INDEX IF NOT EXISTS idx_saved_suggestions_user ON saved_suggestions(user_id, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_saved_suggestions_item ON saved_suggestions(item_id)",
     "CREATE INDEX IF NOT EXISTS idx_jobs_updated_at ON jobs(updated_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_llm_calls_ts ON llm_calls(ts DESC)",
     "CREATE INDEX IF NOT EXISTS idx_llm_calls_user ON llm_calls(user_id, ts DESC)",
@@ -370,6 +401,7 @@ def _init() -> None:
         conn.execute(_CREATE_URL_CACHE_SQL)
         conn.execute(_CREATE_ERROR_LOG_SQL)
         conn.execute(_CREATE_FEEDBACK_SQL)
+        conn.execute(_CREATE_SAVED_SUGGESTIONS_SQL)
         conn.execute(_CREATE_JOBS_SQL)
         # Added after jobs shipped: carries the user-facing failure message so
         # the Worker can show *why* a job failed instead of a generic string.
@@ -485,6 +517,7 @@ def delete_user(user_id: int) -> dict:
         ).rowcount
         conn.execute("DELETE FROM link_codes WHERE user_id = ?", (user_id,))
         conn.execute("DELETE FROM feedback WHERE user_id = ?", (user_id,))
+        conn.execute("DELETE FROM saved_suggestions WHERE user_id = ?", (user_id,))
         user_deleted = conn.execute(
             "DELETE FROM users WHERE id = ?", (user_id,)
         ).rowcount
@@ -574,8 +607,9 @@ def delete_item(item_id: int, user_id: int | None = None) -> None:
             )
         else:
             conn.execute("DELETE FROM items WHERE id = ?", (item_id,))
-        # Drop any feedback that referenced this item (no orphans).
+        # Drop any feedback / shortlist rows that referenced this item (no orphans).
         conn.execute("DELETE FROM feedback WHERE item_id = ?", (item_id,))
+        conn.execute("DELETE FROM saved_suggestions WHERE item_id = ?", (item_id,))
 
 
 def record_feedback(user_id: int, item_id: int, signal: str) -> None:
@@ -585,6 +619,94 @@ def record_feedback(user_id: int, item_id: int, signal: str) -> None:
             "INSERT INTO feedback (user_id, item_id, signal) VALUES (?, ?, ?)",
             (user_id, item_id, signal),
         )
+
+
+# ---------------------------------------------------------------------------
+# Shortlist (saved suggestions)
+# ---------------------------------------------------------------------------
+
+_SAVED_SUGGESTION_COLS = (
+    "id, item_id, suggestion_index, title, detail, effort, first_step, "
+    "grounded_in, status, created_at, updated_at"
+)
+
+
+def save_suggestion(
+    user_id: int,
+    item_id: int,
+    suggestion_index: int,
+    *,
+    title: str = "",
+    detail: str = "",
+    effort: str = "",
+    first_step: str = "",
+    grounded_in: str = "",
+) -> int:
+    """Add (or refresh) a shortlisted suggestion. Idempotent on
+    (user_id, item_id, suggestion_index): saving the same suggestion again
+    refreshes its snapshot + updated_at and preserves its current status,
+    rather than creating a duplicate row. Returns the row id."""
+    with _get_conn() as conn:
+        existing = conn.execute(
+            "SELECT id FROM saved_suggestions "
+            "WHERE user_id = ? AND item_id = ? AND suggestion_index = ?",
+            (user_id, item_id, suggestion_index),
+        ).fetchone()
+        if existing:
+            conn.execute(
+                "UPDATE saved_suggestions SET title = ?, detail = ?, effort = ?, "
+                "first_step = ?, grounded_in = ?, "
+                "updated_at = strftime('%Y-%m-%dT%H:%M:%S', 'now') WHERE id = ?",
+                (title, detail, effort, first_step, grounded_in, existing["id"]),
+            )
+            return existing["id"]
+        cur = conn.execute(
+            "INSERT INTO saved_suggestions (user_id, item_id, suggestion_index, "
+            "title, detail, effort, first_step, grounded_in) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (user_id, item_id, suggestion_index, title, detail, effort,
+             first_step, grounded_in),
+        )
+        return cur.lastrowid
+
+
+def get_saved_suggestions(user_id: int) -> list[sqlite3.Row]:
+    """All of a user's shortlisted suggestions, newest first. Joins the source
+    item so the caller can render a back-link (source URL + the item's title,
+    which lives inside the item's analysis JSON)."""
+    cols = ", ".join(f"s.{c}" for c in _SAVED_SUGGESTION_COLS.replace(" ", "").split(","))
+    with _get_conn() as conn:
+        return conn.execute(
+            f"SELECT {cols}, "
+            "       i.source AS source, i.analysis AS item_analysis "
+            "FROM saved_suggestions s JOIN items i ON i.id = s.item_id "
+            "WHERE s.user_id = ? ORDER BY s.created_at DESC, s.id DESC",
+            (user_id,),
+        ).fetchall()
+
+
+def update_saved_suggestion_status(saved_id: int, user_id: int, status: str) -> bool:
+    """Advance a shortlisted suggestion's status. Ownership-scoped — returns
+    False if the row doesn't exist or belongs to another user."""
+    with _get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE saved_suggestions SET status = ?, "
+            "updated_at = strftime('%Y-%m-%dT%H:%M:%S', 'now') "
+            "WHERE id = ? AND user_id = ?",
+            (status, saved_id, user_id),
+        )
+        return cur.rowcount > 0
+
+
+def delete_saved_suggestion(saved_id: int, user_id: int) -> bool:
+    """Remove one shortlisted suggestion. Ownership-scoped — returns False if
+    the row doesn't exist or belongs to another user."""
+    with _get_conn() as conn:
+        cur = conn.execute(
+            "DELETE FROM saved_suggestions WHERE id = ? AND user_id = ?",
+            (saved_id, user_id),
+        )
+        return cur.rowcount > 0
 
 
 # ---------------------------------------------------------------------------
