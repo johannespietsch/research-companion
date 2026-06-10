@@ -22,10 +22,14 @@ primary_region = 'fra'
   auto_start_machines = true
   min_machines_running = 1
 
+  # Edge backstop. The app-level bot.concurrency semaphore (default 8) is the
+  # real guard on heavy work; these stop a burst from parking dozens of
+  # connections on a 1 GB box (which previously soaked worker slots → OOM /
+  # 25s timeouts — see OPERATIONS.md runbook). Raise after a VM bump.
   [http_service.concurrency]
     type = 'requests'
-    hard_limit = 40
-    soft_limit = 20
+    hard_limit = 20
+    soft_limit = 10
 
   [[http_service.checks]]
     interval = '30s'
