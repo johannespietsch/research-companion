@@ -85,11 +85,46 @@ monitor disk usage:
 fly volumes list           # check % used
 ```
 
+## Capacity & scaling
+
+The backend is a **single Fly machine** (`min_machines_running = 1`) because the
+canonical SQLite DB lives on one volume that attaches to one machine at a time —
+so **you cannot `fly scale count > 1`** without re-architecting storage. Vertical
+scaling is the lever.
+
+Three guards keep a traffic spike (e.g. a Product Hunt launch) from tipping the
+box into the OOM / 25s-timeout failure mode in the runbook below:
+
+1. **Heavy-work semaphore** (`bot/concurrency.py`) — caps concurrent fetch+LLM
+   requests (`/try`, `/submit/url`, `/submit/file`). Over the cap, callers are
+   shed with a fast `503 {"error":"busy"}` instead of queuing past the Worker's
+   timeout. Tune with `HEAVY_CONCURRENCY` (default 8) / `HEAVY_ACQUIRE_TIMEOUT_S`.
+2. **Thread pool** sized by `EXECUTOR_WORKERS` (default 16) — the IO-bound LLM
+   calls run here; explicit so it doesn't depend on how Fly reports CPUs.
+3. **Fly edge concurrency** (`fly.toml`): `hard_limit = 20` stops a burst from
+   parking dozens of connections on the box.
+
+**Before a launch / expected spike**, scale the VM up — it's reversible:
+
+```sh
+fly scale show -a filter-fyi-backend
+fly scale vm shared-cpu-4x --memory 4096 -a filter-fyi-backend   # 4 CPU / 4 GB
+# then raise the app guards to match the bigger box:
+fly secrets set -a filter-fyi-backend HEAVY_CONCURRENCY=16 EXECUTOR_WORKERS=32
+# and bump hard_limit in fly.toml before `fly deploy`.
+```
+
+Watch `fly logs` for `heavy_slot: shedding request` (you're at the cap → scale
+up) and machine CPU/RAM in the Fly dashboard. The durable fix for long jobs
+(video transcription holding a slot > 25s) is moving them to background jobs —
+see the roadmap; not yet implemented.
+
 ## Required environment / secrets
 
 | Var | Purpose |
 | --- | --- |
 | `FILTER_FYI_TRY_SECRET` | Shared secret with the Cloudflare Worker (must match) |
+| `HEAVY_CONCURRENCY`, `EXECUTOR_WORKERS` | Capacity tuning (see Capacity & scaling) — safe defaults, raise after a VM bump |
 | `FILTER_FYI_ADMIN_SECRET` | Shared secret for `/api/admin/*` — must match the Worker's `BOT_ADMIN_KEY`. Separate from `FILTER_FYI_TRY_SECRET` so the two can rotate independently |
 | `TELEGRAM_TOKEN` | Telegram bot token (omit to run web-only) |
 | `WEBHOOK_URL` | Public base URL for Telegram webhook mode |

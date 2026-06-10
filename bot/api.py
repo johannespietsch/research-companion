@@ -26,6 +26,7 @@ from bot.pipeline import (
     analyze_url,
 )
 from bot.auth import require_token
+from bot.concurrency import CapacityError, heavy
 from bot.config import MAX_CONTENT_CHARS
 from bot.fetch_errors import user_message as fetch_error_message
 from bot.db import (
@@ -59,6 +60,26 @@ from bot.transcriber import transcribe
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api")
+
+
+async def _heavy_slot():
+    """Dependency that holds a heavy-work slot for the request, shedding with a
+    fast 503 (rather than queuing past the Worker's ~25s timeout) when the box
+    is already saturated. Applied to the fetch+LLM endpoints, not the light ones.
+    Defined above the routes because Depends(...) is evaluated at import time."""
+    try:
+        async with heavy.slot():
+            yield
+    except CapacityError:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "busy",
+                "message": "We're handling a burst of requests right now — try again in a few seconds.",
+            },
+            headers={"Retry-After": "5"},
+        )
+
 
 # Keeps references to running background tasks alive until they complete.
 # Without this, Python's GC may collect the task before it finishes.
@@ -159,6 +180,7 @@ async def submit_url(
     url: str = Form(...),
     user_note: str = Form(""),
     user_id: int = Depends(require_token),
+    _slot: None = Depends(_heavy_slot),
 ):
     try:
         result = await analyze_url(
@@ -187,6 +209,7 @@ async def submit_file(
     file: UploadFile = File(...),
     user_note: str = Form(""),
     user_id: int = Depends(require_token),
+    _slot: None = Depends(_heavy_slot),
 ):
     mime = file.content_type or ""
     name = file.filename or "file"
@@ -304,7 +327,11 @@ def _pipeline_error_to_http(e: PipelineError, url: str) -> HTTPException:
 
 
 @router.post("/try")
-async def try_url(req: TryRequest, _: None = Depends(_require_try_secret)):
+async def try_url(
+    req: TryRequest,
+    _secret: None = Depends(_require_try_secret),
+    _slot: None = Depends(_heavy_slot),
+):
     """One-shot analysis for anonymous web users.
 
     Authenticated via a shared `x-filter-fyi-secret` header (the Worker is the

@@ -106,8 +106,26 @@ async def _daily_prune_loop() -> None:
             logger.exception("Daily prune failed; will retry tomorrow")
 
 
+# The heavy request paths offload their blocking fetch/transcode/LLM work via
+# loop.run_in_executor(None, ...). Size that pool explicitly instead of relying
+# on the interpreter default (min(32, cpu_count+4)), which varies with how Fly
+# reports CPUs. Threads here are IO-bound (network LLM calls), so we can afford
+# more than the CPU count; the real ceiling on concurrent heavy work is the
+# bot.concurrency semaphore.
+_EXECUTOR_WORKERS = int(os.getenv("EXECUTOR_WORKERS", "16"))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    import concurrent.futures
+
+    asyncio.get_running_loop().set_default_executor(
+        concurrent.futures.ThreadPoolExecutor(
+            max_workers=_EXECUTOR_WORKERS, thread_name_prefix="heavy"
+        )
+    )
+    logger.info("Default thread pool sized to %d workers", _EXECUTOR_WORKERS)
+
     if telegram_app:
         await telegram_app.initialize()
         if WEBHOOK_URL:
