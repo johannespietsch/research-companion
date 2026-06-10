@@ -26,21 +26,33 @@ giving near-real-time, point-in-time recovery. It's baked into the image but
 **only runs when `LITESTREAM_REPLICA_URL` is set** — otherwise the container
 starts plain uvicorn (see `docker-entrypoint.sh`), so local dev is unaffected.
 
-To enable, provision an S3-compatible bucket (Fly's Tigris, Backblaze B2,
-Cloudflare R2, …) and set Fly secrets:
+To enable, provision an S3-compatible bucket (Cloudflare R2, Fly's Tigris,
+Backblaze B2, …) and set Fly secrets. On **Litestream 0.3.x the endpoint and
+region are config fields, not URL query params** — set them as their own env
+vars (see [`litestream.yml`](../litestream.yml)), or a non-AWS target silently
+resolves to AWS S3 and fails:
 
 ```sh
-fly secrets set \
+fly secrets set -a filter-fyi-backend \
   LITESTREAM_REPLICA_URL="s3://<bucket>/filter-fyi-backend" \
+  LITESTREAM_ENDPOINT="https://<accountid>.r2.cloudflarestorage.com" \
+  LITESTREAM_REGION="auto" \
   LITESTREAM_ACCESS_KEY_ID="<key>" \
   LITESTREAM_SECRET_ACCESS_KEY="<secret>"
-# For non-AWS endpoints also set the endpoint, e.g. Tigris:
-#   LITESTREAM_REPLICA_URL="s3://<bucket>/filter-fyi-backend?endpoint=https://fly.storage.tigris.dev"
+# Tigris: endpoint https://fly.storage.tigris.dev, region auto.
+# Plain AWS S3: omit LITESTREAM_ENDPOINT; set the real region.
 ```
+
+The R2 access key + secret come from an **R2 API token** (R2 → Manage R2 API
+Tokens → Object Read & Write); the secret is shown only once. The endpoint's
+`<accountid>` is the host prefix of the bucket's S3 API URL.
 
 Config: [`litestream.yml`](../litestream.yml) (30-day retention, daily
 snapshots). On boot the entrypoint runs `litestream restore -if-db-not-exists`,
 so a fresh/recovered volume self-heals from the replica.
+
+> Tip: if a restore fails with a host/DNS error against R2, add
+> `force-path-style: true` to the replica in `litestream.yml`.
 
 **Restore manually:**
 ```sh

@@ -4,15 +4,29 @@
 # the app under `litestream replicate` when it is, and plain uvicorn when it
 # isn't (so local dev and un-provisioned environments are unaffected).
 #
-# LITESTREAM_REPLICA_URL example (S3-compatible, e.g. Tigris/Backblaze/R2):
-#   s3://my-bucket/filter-fyi-backend
-# with LITESTREAM_ACCESS_KEY_ID / LITESTREAM_SECRET_ACCESS_KEY in the env.
+# Five env vars drive the replica (all unset locally → backup stays off):
+#   LITESTREAM_REPLICA_URL        s3://<bucket>/<prefix>  (bucket + path)
+#   LITESTREAM_ENDPOINT           S3 endpoint for non-AWS providers
+#   LITESTREAM_REGION             region ("auto" for R2)
+#   LITESTREAM_ACCESS_KEY_ID      \ S3 credentials (Fly secrets, never
+#   LITESTREAM_SECRET_ACCESS_KEY  / committed)
+#
+# Cloudflare R2 example:
+#   LITESTREAM_REPLICA_URL=s3://filter-fyi-backups/filter-fyi-backend
+#   LITESTREAM_ENDPOINT=https://<accountid>.r2.cloudflarestorage.com
+#   LITESTREAM_REGION=auto
+#
+# NOTE: on Litestream 0.3.x the endpoint/region must be config fields — they
+# are NOT read from a "?endpoint=" query string on the URL. Leaving them as
+# separate keys here is what makes a non-AWS (R2/Tigris) target actually work.
 #
 # Docs: https://litestream.io/reference/config/
 dbs:
   - path: ${DATA_DIR}/research.db
     replicas:
       - url: ${LITESTREAM_REPLICA_URL}
+        endpoint: ${LITESTREAM_ENDPOINT}
+        region: ${LITESTREAM_REGION}
         # Keep ~30 days of point-in-time history.
         retention: 720h
         snapshot-interval: 24h
