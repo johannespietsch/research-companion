@@ -351,3 +351,68 @@ class TestProgressCallback:
             "x", ctx=UsageContext(), on_step=bad_callback,
         ))
         assert result.analysis["verdict"] == "watch"  # ran to completion
+
+
+class TestCapacityGuard:
+    """analyze_url is the single chokepoint that bounds heavy work for every
+    entry point (web /try, the async job runner, /library/add, Telegram)."""
+
+    def test_sheds_with_busy_when_no_slot(self, pipeline, monkeypatch):
+        from bot.analyzer import UsageContext
+        from bot.concurrency import HeavyLimiter
+
+        # No free slots → acquire times out → ERR_BUSY, raised before any fetch.
+        monkeypatch.setattr(pipeline, "heavy", HeavyLimiter(limit=0, timeout=0.01))
+        with pytest.raises(pipeline.PipelineError) as ei:
+            asyncio.run(pipeline.analyze_url("https://example.com", ctx=UsageContext()))
+        assert ei.value.code == pipeline.ERR_BUSY
+
+    def test_shed_happens_before_fetch(self, pipeline, monkeypatch):
+        from bot.analyzer import UsageContext
+        from bot.concurrency import HeavyLimiter
+
+        called = {"fetch": False}
+
+        async def tripwire_fetch(url, **kwargs):
+            called["fetch"] = True
+            return {}
+
+        monkeypatch.setattr(pipeline, "fetch_url", tripwire_fetch)
+        monkeypatch.setattr(pipeline, "heavy", HeavyLimiter(limit=0, timeout=0.01))
+        with pytest.raises(pipeline.PipelineError):
+            asyncio.run(pipeline.analyze_url("https://example.com", ctx=UsageContext()))
+        assert called["fetch"] is False  # shed without spending a fetch
+
+    def test_slot_released_across_sequential_calls(self, pipeline, monkeypatch):
+        from bot.analyzer import UsageContext
+        from bot.concurrency import HeavyLimiter
+
+        # Capacity 1: if the slot leaked, the 2nd call would time out as busy.
+        monkeypatch.setattr(pipeline, "heavy", HeavyLimiter(limit=1, timeout=0.3))
+        for _ in range(3):
+            result = asyncio.run(
+                pipeline.analyze_url("https://example.com", ctx=UsageContext())
+            )
+            assert result.analysis["verdict"] == "watch"
+
+    def test_slot_released_even_when_analyze_fails(self, pipeline, monkeypatch):
+        from bot.analyzer import UsageContext
+        from bot.concurrency import HeavyLimiter
+
+        monkeypatch.setattr(pipeline, "heavy", HeavyLimiter(limit=1, timeout=0.3))
+
+        def boom(text, **_kwargs):
+            raise RuntimeError("llm down")
+
+        monkeypatch.setattr(pipeline, "analyze", boom)
+        with pytest.raises(pipeline.PipelineError):
+            asyncio.run(pipeline.analyze_url("https://example.com", ctx=UsageContext()))
+
+        # The slot must be free again — a working call now succeeds.
+        monkeypatch.setattr(
+            pipeline, "analyze", lambda text, **_k: {"verdict": "watch"}
+        )
+        result = asyncio.run(
+            pipeline.analyze_url("https://example.com", ctx=UsageContext())
+        )
+        assert result.analysis["verdict"] == "watch"

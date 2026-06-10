@@ -41,6 +41,7 @@ from bot.analyzer import (
     summarize_content,
     to_json_str,
 )
+from bot.concurrency import CapacityError, heavy
 from bot.db import record_processed_url, save_item
 from bot.fetcher import fetch_url, whisper_cap_for
 
@@ -62,6 +63,7 @@ ERR_FETCH_FAILED = "fetch-failed"            # network / timeout / connector err
 ERR_NO_TEXT = "extraction-failed"            # fetch ok but yielded empty text
 ERR_NO_TRANSCRIPT = "no-transcript"          # video-with-no-transcript variant of NO_TEXT
 ERR_ANALYZE_FAILED = "analyze-failed"        # LLM call failed mid-chain
+ERR_BUSY = "busy"                            # shed: no heavy-work slot free (overload)
 
 _VIDEO_SOURCE_TYPES: frozenset[str] = frozenset({"youtube", "video"})
 
@@ -115,6 +117,7 @@ async def analyze_url(
     include_images: bool | None = None,
     max_whisper_duration: int | None = None,
     on_step: Optional[Callable[[str], None]] = None,
+    capacity_timeout: float | None = None,
 ) -> PipelineResult:
     """Run the full URL → analysis chain.
 
@@ -135,6 +138,11 @@ async def analyze_url(
     `on_step` is an optional sync callback invoked with stable labels
     ("fetching" | "describing-images" | "summarizing" | "analyzing") so
     callers like the async job runner can surface progress to the UI.
+
+    `capacity_timeout` caps how long we wait for a heavy-work slot before
+    shedding with `PipelineError(ERR_BUSY)`. None → the limiter default (short;
+    synchronous web callers shed fast so they don't blow the Worker's ~25s
+    budget); the polling job runner passes a larger value to queue instead.
     """
     def _step(label: str) -> None:
         if on_step is not None:
@@ -145,6 +153,16 @@ async def analyze_url(
 
     if max_whisper_duration is None:
         max_whisper_duration = whisper_cap_for(signed_in=ctx.user_id is not None)
+
+    # Bound total concurrent heavy work across EVERY entry point (web /try, the
+    # async job runner, /library/add, Telegram) by taking a slot before any
+    # fetch/transcribe/LLM work — this is the one chokepoint they all share.
+    # Acquired outside the audit `try` so a shed request isn't recorded as
+    # processed; released in that try's `finally`.
+    try:
+        await heavy.acquire(capacity_timeout)
+    except CapacityError:
+        raise PipelineError(ERR_BUSY, message="Service is busy; please try again in a few seconds.")
 
     # Audit-log bookkeeping. Every successful AND failed call writes one row
     # to `processed_urls`, so the Usage tile can show "what we tried and how
@@ -237,6 +255,8 @@ async def analyze_url(
         audit_error_code = e.code
         raise
     finally:
+        # Free the slot before the audit write so a waiter can start sooner.
+        heavy.release()
         record_processed_url(
             url=url,
             title=fetched.get("title") or "",
