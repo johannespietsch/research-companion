@@ -95,10 +95,15 @@ scaling is the lever.
 Three guards keep a traffic spike (e.g. a Product Hunt launch) from tipping the
 box into the OOM / 25s-timeout failure mode in the runbook below:
 
-1. **Heavy-work semaphore** (`bot/concurrency.py`) — caps concurrent fetch+LLM
-   requests (`/try`, `/submit/url`, `/submit/file`). Over the cap, callers are
-   shed with a fast `503 {"error":"busy"}` instead of queuing past the Worker's
-   timeout. Tune with `HEAVY_CONCURRENCY` (default 8) / `HEAVY_ACQUIRE_TIMEOUT_S`.
+1. **Heavy-work semaphore** (`bot/concurrency.py`) — caps concurrent heavy work
+   at the one chokepoint every URL path shares, `pipeline.analyze_url` (web
+   `/try`, the async job runner `/job`→`_run_job`, `/library/add`, Telegram).
+   Synchronous web callers shed fast with `503 {"error":"busy"}` rather than
+   queuing past the Worker's ~25s budget; the polling **job runner** waits up to
+   `JOB_CAPACITY_WAIT_S` (default 45) so transient bursts queue and still
+   succeed. `/submit/file` (transcribe+analyze, no `analyze_url`) takes the same
+   slot via a route dependency. Tune with `HEAVY_CONCURRENCY` (default 8) /
+   `HEAVY_ACQUIRE_TIMEOUT_S` (default 2, the synchronous shed budget).
 2. **Thread pool** sized by `EXECUTOR_WORKERS` (default 16) — the IO-bound LLM
    calls run here; explicit so it doesn't depend on how Fly reports CPUs.
 3. **Fly edge concurrency** (`fly.toml`): `hard_limit = 20` stops a burst from

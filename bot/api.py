@@ -19,6 +19,7 @@ from bot.analyzer import UsageContext, analyze, analyze_image, to_json_str, to_p
 from bot.agent_brief import build_actions
 from bot.pipeline import (
     ERR_ANALYZE_FAILED,
+    ERR_BUSY,
     ERR_FETCH_FAILED,
     ERR_NO_TEXT,
     ERR_NO_TRANSCRIPT,
@@ -63,10 +64,11 @@ router = APIRouter(prefix="/api")
 
 
 async def _heavy_slot():
-    """Dependency that holds a heavy-work slot for the request, shedding with a
-    fast 503 (rather than queuing past the Worker's ~25s timeout) when the box
-    is already saturated. Applied to the fetch+LLM endpoints, not the light ones.
-    Defined above the routes because Depends(...) is evaluated at import time."""
+    """Holds a heavy-work slot for the request, shedding with a fast 503 when
+    the box is saturated. Used by the direct-analysis endpoints that do NOT go
+    through `analyze_url` (which takes its own slot) — currently `/submit/file`,
+    whose transcribe+analyze work is heavy in its own right. Defined above the
+    routes because Depends(...) is evaluated at import time."""
     try:
         async with heavy.slot():
             yield
@@ -89,6 +91,11 @@ _background_tasks: set[asyncio.Task] = set()
 # can tell the browser what stage it's at. Keyed by job_id; cleaned up in the
 # finally block of _run_job. Safe for the single-process Fly deployment.
 _job_steps: dict[str, str] = {}
+
+# How long a polling job waits for a heavy-work slot before giving up as busy.
+# Generous (the browser is patiently polling) so transient bursts queue and
+# succeed rather than failing fast like the synchronous web callers do.
+_JOB_CAPACITY_WAIT_S = float(os.getenv("JOB_CAPACITY_WAIT_S", "45"))
 
 # Preview length sent to the Worker — keeps the payload compact while still
 # giving the UI something to render. The full extracted text only ever exists
@@ -180,7 +187,6 @@ async def submit_url(
     url: str = Form(...),
     user_note: str = Form(""),
     user_id: int = Depends(require_token),
-    _slot: None = Depends(_heavy_slot),
 ):
     try:
         result = await analyze_url(
@@ -311,6 +317,12 @@ def _pipeline_error_to_http(e: PipelineError, url: str) -> HTTPException:
     URL endpoint returns — kept centralised so the Worker contract stays
     consistent across /api/try, /api/library/add, and /api/job results."""
     reason = e.fetched.get("reason")
+    if e.code == ERR_BUSY:
+        return HTTPException(
+            status_code=503,
+            detail={"error": "busy", "message": str(e)},
+            headers={"Retry-After": "5"},
+        )
     if e.code in (ERR_NO_TEXT, ERR_NO_TRANSCRIPT):
         return HTTPException(
             status_code=422,
@@ -327,11 +339,7 @@ def _pipeline_error_to_http(e: PipelineError, url: str) -> HTTPException:
 
 
 @router.post("/try")
-async def try_url(
-    req: TryRequest,
-    _secret: None = Depends(_require_try_secret),
-    _slot: None = Depends(_heavy_slot),
-):
+async def try_url(req: TryRequest, _: None = Depends(_require_try_secret)):
     """One-shot analysis for anonymous web users.
 
     Authenticated via a shared `x-filter-fyi-secret` header (the Worker is the
@@ -771,6 +779,10 @@ async def _run_job(
                 save_for_user_id=user_id,
                 user_note=user_note,
                 on_step=_on_step,
+                # The browser is polling, not holding a 25s request — so queue
+                # for a slot under load instead of shedding immediately. Only
+                # errors as busy if the backlog is still draining after this.
+                capacity_timeout=_JOB_CAPACITY_WAIT_S,
             )
         except PipelineError as e:
             set_job_error(job_id, e.code, fetch_error_message(e.fetched.get("reason"), url))

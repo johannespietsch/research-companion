@@ -78,3 +78,39 @@ def test_waiter_gets_in_once_a_slot_frees():
             pass
 
     asyncio.run(scenario())
+
+
+def test_acquire_release_pair_frees_the_slot():
+    async def scenario():
+        lim = HeavyLimiter(limit=1, timeout=0.05)
+        await lim.acquire()
+        # No slot left → next acquire sheds.
+        with pytest.raises(CapacityError):
+            await lim.acquire()
+        lim.release()
+        # Freed → acquire succeeds again.
+        await lim.acquire()
+        lim.release()
+
+    asyncio.run(scenario())
+
+
+def test_acquire_timeout_override_beats_the_default():
+    async def scenario():
+        # Default timeout is tiny, but a generous per-call override lets a
+        # caller queue until a slot frees (the job-runner pattern).
+        lim = HeavyLimiter(limit=1, timeout=0.01)
+        await lim.acquire()
+
+        async def release_soon():
+            await asyncio.sleep(0.05)
+            lim.release()
+
+        async def queue_with_override():
+            await lim.acquire(timeout=1.0)  # waits past the 0.01 default
+            lim.release()
+
+        async with asyncio.timeout(0.5):
+            await asyncio.gather(release_soon(), queue_with_override())
+
+    asyncio.run(scenario())

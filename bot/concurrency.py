@@ -34,24 +34,38 @@ class CapacityError(Exception):
 
 class HeavyLimiter:
     """A semaphore + bounded-wait acquire. One process-wide instance (`heavy`)
-    guards the heavy endpoints; constructed directly in tests."""
+    guards every heavy path; constructed directly in tests.
+
+    `acquire`/`release` are used to wrap a long body that has its own
+    try/finally (the URL pipeline); `slot()` is the same thing as a context
+    manager for callers that don't (e.g. file uploads)."""
 
     def __init__(self, limit: int, timeout: float):
         self.limit = limit
         self.timeout = timeout
         self._sem = asyncio.Semaphore(limit)
 
-    @asynccontextmanager
-    async def slot(self):
+    async def acquire(self, timeout: float | None = None) -> None:
+        """Wait up to `timeout` (default `self.timeout`) for a slot; raise
+        CapacityError if none frees up. A larger timeout lets a caller queue
+        (e.g. the polling job runner) rather than shed (synchronous web)."""
+        wait = self.timeout if timeout is None else timeout
         try:
-            await asyncio.wait_for(self._sem.acquire(), timeout=self.timeout)
+            await asyncio.wait_for(self._sem.acquire(), timeout=wait)
         except asyncio.TimeoutError:
-            logger.warning("heavy_slot: shedding request — all %d slots busy", self.limit)
+            logger.warning("heavy: shedding work — all %d slots busy", self.limit)
             raise CapacityError
+
+    def release(self) -> None:
+        self._sem.release()
+
+    @asynccontextmanager
+    async def slot(self, timeout: float | None = None):
+        await self.acquire(timeout)
         try:
             yield
         finally:
-            self._sem.release()
+            self.release()
 
 
 heavy = HeavyLimiter(HEAVY_CONCURRENCY, HEAVY_ACQUIRE_TIMEOUT_S)
