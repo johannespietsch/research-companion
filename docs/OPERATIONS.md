@@ -74,8 +74,13 @@ Run it daily — either a scheduled Fly machine or cron:
 python -m scripts.prune
 ```
 
-Stored media (transcribed mp4s under `data/files/`) is the other growth vector;
-files for deleted users are removed by account erasure, but monitor disk usage:
+The other growth vector is **user-uploaded files** (PDFs, images, audio a user
+submits directly), saved under the file store and referenced by
+`items.file_path`. Note this is *not* scraped third-party media: URL / YouTube /
+StreamYard content is downloaded to a temp dir, transcribed, and deleted — only
+the derived brief is persisted (`items.content`), never the source media or its
+full text. Uploaded files for deleted users are removed by account erasure, but
+monitor disk usage:
 ```sh
 fly volumes list           # check % used
 ```
