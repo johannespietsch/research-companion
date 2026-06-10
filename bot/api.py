@@ -31,21 +31,26 @@ from bot.fetch_errors import user_message as fetch_error_message
 from bot.db import (
     FEEDBACK_SIGNALS,
     LINK_CODE_TTL_SECONDS,
+    SAVED_SUGGESTION_STATUSES,
     create_job,
     create_link_code,
     delete_item,
+    delete_saved_suggestion,
     delete_user,
     get_all_items,
     get_item,
     get_job_record,
+    get_saved_suggestions,
     get_user,
     get_user_profile,
     record_feedback,
     save_item,
+    save_suggestion,
     search_items,
     set_job_done,
     set_job_error,
     set_user_profile,
+    update_saved_suggestion_status,
     upsert_user_by_email,
 )
 from bot.storage import full_path, save_file
@@ -407,6 +412,22 @@ async def user_export(user_id: int, _: None = Depends(_require_try_secret)):
             }
             for i in items
         ],
+        "saved_suggestions": [
+            {
+                "id": s["id"],
+                "item_id": s["item_id"],
+                "suggestion_index": s["suggestion_index"],
+                "title": s["title"],
+                "detail": s["detail"],
+                "effort": s["effort"],
+                "first_step": s["first_step"],
+                "grounded_in": s["grounded_in"],
+                "status": s["status"],
+                "created_at": s["created_at"],
+                "updated_at": s["updated_at"],
+            }
+            for s in get_saved_suggestions(user_id)
+        ],
     }
 
 
@@ -471,6 +492,96 @@ async def feedback(req: _FeedbackRequest, _: None = Depends(_require_try_secret)
     if not get_item(req.item_id, req.user_id):
         raise HTTPException(status_code=404, detail={"error": "not-found"})
     record_feedback(req.user_id, req.item_id, req.signal)
+
+
+# ---------------------------------------------------------------------------
+# Shortlist (saved suggestions) — "later" parks a suggestion here; the Worker
+# proxies these as /api/v1/saved-suggestions and injects the session's user_id.
+# ---------------------------------------------------------------------------
+
+class _SaveSuggestionRequest(BaseModel):
+    user_id: int
+    item_id: int
+    suggestion_index: int
+    title: str = ""
+    detail: str = ""
+    effort: str = ""
+    first_step: str = ""
+    grounded_in: str = ""
+
+
+class _SuggestionStatusRequest(BaseModel):
+    user_id: int
+    status: str
+
+
+@router.post("/saved-suggestions", status_code=201)
+async def saved_suggestion_create(
+    req: _SaveSuggestionRequest, _: None = Depends(_require_try_secret)
+):
+    """Park ("later") a suggestion on the user's Shortlist. Idempotent on
+    (user, item, suggestion_index). Ownership-scoped: the item must belong to
+    the user (404 otherwise), so you can't pin against someone else's read."""
+    if not get_item(req.item_id, req.user_id):
+        raise HTTPException(status_code=404, detail={"error": "not-found"})
+    saved_id = save_suggestion(
+        req.user_id,
+        req.item_id,
+        req.suggestion_index,
+        title=req.title,
+        detail=req.detail,
+        effort=req.effort,
+        first_step=req.first_step,
+        grounded_in=req.grounded_in,
+    )
+    return {"id": saved_id, "status": "saved"}
+
+
+@router.get("/saved-suggestions")
+async def saved_suggestions_list(user_id: int, _: None = Depends(_require_try_secret)):
+    """The user's Shortlist, newest first. Each row carries its source URL and
+    the source item's title (for the back-link) alongside the snapshot."""
+    out = []
+    for r in get_saved_suggestions(user_id):
+        _, item_title = _extract_verdict_and_title(r["item_analysis"])
+        out.append({
+            "id": r["id"],
+            "item_id": r["item_id"],
+            "suggestion_index": r["suggestion_index"],
+            "title": r["title"],
+            "detail": r["detail"],
+            "effort": r["effort"],
+            "first_step": r["first_step"],
+            "grounded_in": r["grounded_in"],
+            "status": r["status"],
+            "created_at": r["created_at"],
+            "updated_at": r["updated_at"],
+            "source": r["source"],
+            "item_title": item_title,
+        })
+    return out
+
+
+@router.patch("/saved-suggestions/{saved_id}")
+async def saved_suggestion_update(
+    saved_id: int, req: _SuggestionStatusRequest, _: None = Depends(_require_try_secret)
+):
+    """Advance a shortlisted suggestion's status (saved → tried → done)."""
+    if req.status not in SAVED_SUGGESTION_STATUSES:
+        raise HTTPException(status_code=400, detail={"error": "invalid-status"})
+    if not update_saved_suggestion_status(saved_id, req.user_id, req.status):
+        raise HTTPException(status_code=404, detail={"error": "not-found"})
+    return {"id": saved_id, "status": req.status}
+
+
+@router.delete("/saved-suggestions/{saved_id}", status_code=204)
+async def saved_suggestion_delete(
+    saved_id: int, user_id: int, _: None = Depends(_require_try_secret)
+):
+    """Remove a suggestion from the Shortlist. Ownership-scoped (404 for
+    someone else's id, mirroring the library delete)."""
+    if not delete_saved_suggestion(saved_id, user_id):
+        raise HTTPException(status_code=404, detail={"error": "not-found"})
 
 
 class _LibraryAddRequest(BaseModel):

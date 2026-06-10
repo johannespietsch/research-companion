@@ -498,3 +498,132 @@ class TestJobFlow:
         rec = db.get_job_record("job-5")
         assert rec["status"] == "error"
         assert rec["error"] == "no-transcript"
+
+
+# ---------------------------------------------------------------------------
+# Shortlist (saved suggestions) — /api/saved-suggestions
+# ---------------------------------------------------------------------------
+
+class TestShortlist:
+    def _user_with_one_item(self, client, auth_headers, email="s@b.com"):
+        uid = client.post(
+            "/api/users/upsert", json={"email": email}, headers=auth_headers
+        ).json()["user_id"]
+        item_id = client.post(
+            "/api/library/add",
+            json={"user_id": uid, "url": "https://example.com/x"},
+            headers=auth_headers,
+        ).json()["id"]
+        return uid, item_id
+
+    def _save(self, client, auth_headers, uid, item_id, index=0, **extra):
+        body = {"user_id": uid, "item_id": item_id, "suggestion_index": index,
+                "title": "Wire up a RAG demo", "detail": "Stand up a demo."}
+        body.update(extra)
+        return client.post("/api/saved-suggestions", json=body, headers=auth_headers)
+
+    def test_save_creates_and_lists(self, client, auth_headers):
+        uid, item_id = self._user_with_one_item(client, auth_headers)
+        r = self._save(client, auth_headers, uid, item_id)
+        assert r.status_code == 201
+        assert r.json()["status"] == "saved"
+
+        rows = client.get(f"/api/saved-suggestions?user_id={uid}", headers=auth_headers).json()
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["item_id"] == item_id
+        assert row["suggestion_index"] == 0
+        assert row["status"] == "saved"
+        assert row["title"] == "Wire up a RAG demo"
+        # Back-link fields from the joined item.
+        assert row["source"] == "https://example.com/x"
+        assert "RAG" in row["item_title"]
+
+    def test_save_is_idempotent(self, client, auth_headers):
+        uid, item_id = self._user_with_one_item(client, auth_headers)
+        first = self._save(client, auth_headers, uid, item_id).json()["id"]
+        # Saving the same (item, index) again refreshes rather than duplicates.
+        second = self._save(client, auth_headers, uid, item_id, detail="Refreshed.").json()["id"]
+        assert first == second
+        rows = client.get(f"/api/saved-suggestions?user_id={uid}", headers=auth_headers).json()
+        assert len(rows) == 1
+        assert rows[0]["detail"] == "Refreshed."
+
+    def test_distinct_indexes_are_separate_rows(self, client, auth_headers):
+        uid, item_id = self._user_with_one_item(client, auth_headers)
+        self._save(client, auth_headers, uid, item_id, index=0)
+        self._save(client, auth_headers, uid, item_id, index=1)
+        rows = client.get(f"/api/saved-suggestions?user_id={uid}", headers=auth_headers).json()
+        assert {r["suggestion_index"] for r in rows} == {0, 1}
+
+    def test_save_against_other_users_item_404(self, client, auth_headers):
+        uid, item_id = self._user_with_one_item(client, auth_headers)
+        r = client.post(
+            "/api/saved-suggestions",
+            json={"user_id": 99999, "item_id": item_id, "suggestion_index": 0},
+            headers=auth_headers,
+        )
+        assert r.status_code == 404
+
+    def test_status_advances(self, client, auth_headers):
+        uid, item_id = self._user_with_one_item(client, auth_headers)
+        saved_id = self._save(client, auth_headers, uid, item_id).json()["id"]
+        r = client.patch(
+            f"/api/saved-suggestions/{saved_id}",
+            json={"user_id": uid, "status": "tried"},
+            headers=auth_headers,
+        )
+        assert r.status_code == 200
+        rows = client.get(f"/api/saved-suggestions?user_id={uid}", headers=auth_headers).json()
+        assert rows[0]["status"] == "tried"
+
+    def test_invalid_status_rejected(self, client, auth_headers):
+        uid, item_id = self._user_with_one_item(client, auth_headers)
+        saved_id = self._save(client, auth_headers, uid, item_id).json()["id"]
+        r = client.patch(
+            f"/api/saved-suggestions/{saved_id}",
+            json={"user_id": uid, "status": "bogus"},
+            headers=auth_headers,
+        )
+        assert r.status_code == 400
+
+    def test_status_update_wrong_user_404(self, client, auth_headers):
+        uid, item_id = self._user_with_one_item(client, auth_headers)
+        saved_id = self._save(client, auth_headers, uid, item_id).json()["id"]
+        r = client.patch(
+            f"/api/saved-suggestions/{saved_id}",
+            json={"user_id": 99999, "status": "done"},
+            headers=auth_headers,
+        )
+        assert r.status_code == 404
+
+    def test_delete_removes(self, client, auth_headers):
+        uid, item_id = self._user_with_one_item(client, auth_headers)
+        saved_id = self._save(client, auth_headers, uid, item_id).json()["id"]
+        r = client.delete(f"/api/saved-suggestions/{saved_id}?user_id={uid}", headers=auth_headers)
+        assert r.status_code == 204
+        assert client.get(f"/api/saved-suggestions?user_id={uid}", headers=auth_headers).json() == []
+
+    def test_delete_wrong_user_404(self, client, auth_headers):
+        uid, item_id = self._user_with_one_item(client, auth_headers)
+        saved_id = self._save(client, auth_headers, uid, item_id).json()["id"]
+        r = client.delete(f"/api/saved-suggestions/{saved_id}?user_id=99999", headers=auth_headers)
+        assert r.status_code == 404
+        assert len(client.get(f"/api/saved-suggestions?user_id={uid}", headers=auth_headers).json()) == 1
+
+    def test_deleting_item_cascades_shortlist(self, client, auth_headers):
+        uid, item_id = self._user_with_one_item(client, auth_headers)
+        self._save(client, auth_headers, uid, item_id)
+        client.delete(f"/api/library/{item_id}?user_id={uid}", headers=auth_headers)
+        assert client.get(f"/api/saved-suggestions?user_id={uid}", headers=auth_headers).json() == []
+
+    def test_export_includes_shortlist(self, client, auth_headers):
+        uid, item_id = self._user_with_one_item(client, auth_headers)
+        self._save(client, auth_headers, uid, item_id)
+        export = client.get(f"/api/users/{uid}/export", headers=auth_headers).json()
+        assert len(export["saved_suggestions"]) == 1
+        assert export["saved_suggestions"][0]["item_id"] == item_id
+
+    def test_requires_secret(self, client):
+        r = client.get("/api/saved-suggestions?user_id=1")
+        assert r.status_code == 401
