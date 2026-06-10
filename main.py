@@ -15,7 +15,7 @@ import logging
 import os
 import secrets
 from contextlib import asynccontextmanager
-from datetime import datetime, time as dtime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -51,12 +51,22 @@ if TOKEN:
     telegram_app = build_application(TOKEN)
 
 
-# Daily error scan: runs once a day inside the bot process because the Fly
-# volume holding the SQLite DB can only be attached to one machine at a time.
-# Disabled when SCAN_ERRORS_ENABLED is unset/false so local dev doesn't file
-# issues by accident.
+# Daily maintenance loops run once a day inside the bot process because the Fly
+# volume holding the SQLite DB can only be attached to one machine at a time —
+# a separate scheduled machine couldn't open the same database.
+from bot.scheduling import next_daily_run  # noqa: E402
+
+# Error scan: disabled when SCAN_ERRORS_ENABLED is unset/false so local dev
+# doesn't file GH issues by accident.
 _SCAN_ERRORS_ENABLED = os.getenv("SCAN_ERRORS_ENABLED", "").lower() in ("1", "true", "yes")
 _SCAN_HOUR_UTC = int(os.getenv("SCAN_ERRORS_HOUR_UTC", "3"))
+
+# Prune: bounds disk growth (old error_log, expired caches/jobs/link codes).
+# Defaults ON — it's idempotent and side-effect-free (only deletes already-
+# expired rows), so it should just run in prod without a manual flag. Offset an
+# hour from the scan so the two don't fire together. Opt out with PRUNE_ENABLED=false.
+_PRUNE_ENABLED = os.getenv("PRUNE_ENABLED", "true").lower() in ("1", "true", "yes")
+_PRUNE_HOUR_UTC = int(os.getenv("PRUNE_HOUR_UTC", "4"))
 
 
 async def _daily_error_scan_loop() -> None:
@@ -65,9 +75,7 @@ async def _daily_error_scan_loop() -> None:
 
     while True:
         now = datetime.now(timezone.utc)
-        next_run = datetime.combine(now.date(), dtime(_SCAN_HOUR_UTC, 0), tzinfo=timezone.utc)
-        if next_run <= now:
-            next_run += timedelta(days=1)
+        next_run = next_daily_run(now, _SCAN_HOUR_UTC)
         sleep_s = (next_run - now).total_seconds()
         logger.info("Next error scan at %s UTC (%.0fs)", next_run.isoformat(), sleep_s)
         try:
@@ -77,6 +85,25 @@ async def _daily_error_scan_loop() -> None:
             raise
         except Exception:
             logger.exception("Daily error scan failed; will retry tomorrow")
+
+
+async def _daily_prune_loop() -> None:
+    """Wake once a day at PRUNE_HOUR_UTC and run bot.db.prune_maintenance."""
+    from bot.db import prune_maintenance
+
+    while True:
+        now = datetime.now(timezone.utc)
+        next_run = next_daily_run(now, _PRUNE_HOUR_UTC)
+        sleep_s = (next_run - now).total_seconds()
+        logger.info("Next prune at %s UTC (%.0fs)", next_run.isoformat(), sleep_s)
+        try:
+            await asyncio.sleep(sleep_s)
+            counts = await asyncio.to_thread(prune_maintenance)
+            logger.info("prune: %s", counts)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Daily prune failed; will retry tomorrow")
 
 
 @asynccontextmanager
@@ -104,17 +131,20 @@ async def lifespan(app: FastAPI):
             logger.info("Telegram polling started")
         await telegram_app.start()
 
-    scan_task: asyncio.Task | None = None
+    maintenance_tasks: list[asyncio.Task] = []
     if _SCAN_ERRORS_ENABLED:
-        scan_task = asyncio.create_task(_daily_error_scan_loop())
+        maintenance_tasks.append(asyncio.create_task(_daily_error_scan_loop()))
         logger.info("Daily error scan enabled (hour=%d UTC)", _SCAN_HOUR_UTC)
+    if _PRUNE_ENABLED:
+        maintenance_tasks.append(asyncio.create_task(_daily_prune_loop()))
+        logger.info("Daily prune enabled (hour=%d UTC)", _PRUNE_HOUR_UTC)
 
     yield
 
-    if scan_task:
-        scan_task.cancel()
+    for task in maintenance_tasks:
+        task.cancel()
         try:
-            await scan_task
+            await task
         except asyncio.CancelledError:
             pass
 
