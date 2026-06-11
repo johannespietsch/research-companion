@@ -23,7 +23,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from fastapi import FastAPI, Request, Response
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from telegram import Update
 
 logging.basicConfig(
@@ -54,7 +54,7 @@ if TOKEN:
 # Daily maintenance loops run once a day inside the bot process because the Fly
 # volume holding the SQLite DB can only be attached to one machine at a time —
 # a separate scheduled machine couldn't open the same database.
-from bot.scheduling import next_daily_run  # noqa: E402
+from bot.scheduling import next_daily_run, next_weekly_run  # noqa: E402
 
 # Error scan: disabled when SCAN_ERRORS_ENABLED is unset/false so local dev
 # doesn't file GH issues by accident.
@@ -67,6 +67,14 @@ _SCAN_HOUR_UTC = int(os.getenv("SCAN_ERRORS_HOUR_UTC", "3"))
 # hour from the scan so the two don't fire together. Opt out with PRUNE_ENABLED=false.
 _PRUNE_ENABLED = os.getenv("PRUNE_ENABLED", "true").lower() in ("1", "true", "yes")
 _PRUNE_HOUR_UTC = int(os.getenv("PRUNE_HOUR_UTC", "4"))
+
+# Weekly digest (#67): Friday-morning actions-first email. Opt-in via
+# DIGEST_ENABLED, and bot.digest additionally fails closed unless Resend key,
+# From address and unsubscribe secret are all configured — we never send mail
+# without a working unsubscribe link.
+_DIGEST_ENABLED = os.getenv("DIGEST_ENABLED", "").lower() in ("1", "true", "yes")
+_DIGEST_WEEKDAY = int(os.getenv("DIGEST_WEEKDAY", "4"))  # Mon=0 … Fri=4
+_DIGEST_HOUR_UTC = int(os.getenv("DIGEST_HOUR_UTC", "6"))
 
 
 async def _daily_error_scan_loop() -> None:
@@ -104,6 +112,25 @@ async def _daily_prune_loop() -> None:
             raise
         except Exception:
             logger.exception("Daily prune failed; will retry tomorrow")
+
+
+async def _weekly_digest_loop() -> None:
+    """Wake every DIGEST_WEEKDAY at DIGEST_HOUR_UTC and run the digest send."""
+    from bot.digest import run_weekly_digest
+
+    while True:
+        now = datetime.now(timezone.utc)
+        next_run = next_weekly_run(now, _DIGEST_WEEKDAY, _DIGEST_HOUR_UTC)
+        sleep_s = (next_run - now).total_seconds()
+        logger.info("Next weekly digest at %s UTC (%.0fs)", next_run.isoformat(), sleep_s)
+        try:
+            await asyncio.sleep(sleep_s)
+            stats = await asyncio.to_thread(run_weekly_digest)
+            logger.info("weekly digest: %s", stats)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Weekly digest run failed; will retry next week")
 
 
 # The heavy request paths offload their blocking fetch/transcode/LLM work via
@@ -156,6 +183,12 @@ async def lifespan(app: FastAPI):
     if _PRUNE_ENABLED:
         maintenance_tasks.append(asyncio.create_task(_daily_prune_loop()))
         logger.info("Daily prune enabled (hour=%d UTC)", _PRUNE_HOUR_UTC)
+    if _DIGEST_ENABLED:
+        maintenance_tasks.append(asyncio.create_task(_weekly_digest_loop()))
+        logger.info(
+            "Weekly digest enabled (weekday=%d, hour=%d UTC)",
+            _DIGEST_WEEKDAY, _DIGEST_HOUR_UTC,
+        )
 
     yield
 
@@ -187,6 +220,63 @@ _STATIC_DIR = Path(__file__).parent / "bot" / "static"
 @app.get("/")
 async def serve_ui():
     return FileResponse(_STATIC_DIR / "index.html")
+
+
+# --- Digest unsubscribe (public, HMAC-token-gated) -------------------------
+# GET renders a confirm page and POST flips the flag, so a mail client
+# prefetching the link can't unsubscribe anyone by accident.
+
+def _unsub_page(body_html: str) -> str:
+    return (
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        "<title>filter.fyi — weekly digest</title></head>"
+        "<body style='font-family:ui-monospace,Menlo,monospace;background:#efece4;"
+        "color:#1c1c1a;max-width:480px;margin:48px auto;padding:0 20px;font-size:14px;"
+        "line-height:1.6;'>"
+        "<p style='font-weight:700;'>filter.fyi</p>"
+        f"{body_html}"
+        "</body></html>"
+    )
+
+
+@app.get("/digest/unsubscribe")
+async def digest_unsubscribe_confirm(uid: int, tok: str = ""):
+    from bot.digest import verify_unsubscribe_token
+
+    if not verify_unsubscribe_token(uid, tok):
+        return HTMLResponse(
+            _unsub_page("<p>This unsubscribe link isn't valid.</p>"), status_code=400
+        )
+    return HTMLResponse(_unsub_page(
+        "<p>Stop receiving the weekly digest email?</p>"
+        f"<form method='post' action='/digest/unsubscribe?uid={uid}&tok={tok}'>"
+        "<button type='submit' style='font:inherit;font-weight:700;padding:8px 16px;"
+        "border:1px solid #1c1c1a;background:#1c1c1a;color:#f7f4ec;cursor:pointer;'>"
+        "unsubscribe</button></form>"
+        "<p style='font-size:12px;color:#5e5e58;'>Your account and library are not "
+        "affected — this only stops the Friday email.</p>"
+    ))
+
+
+@app.post("/digest/unsubscribe")
+async def digest_unsubscribe(uid: int, tok: str = ""):
+    from bot.db import set_digest_opt_out
+    from bot.digest import verify_unsubscribe_token
+
+    if not verify_unsubscribe_token(uid, tok):
+        return HTMLResponse(
+            _unsub_page("<p>This unsubscribe link isn't valid.</p>"), status_code=400
+        )
+    if not set_digest_opt_out(uid, True):
+        return HTMLResponse(
+            _unsub_page("<p>This unsubscribe link isn't valid.</p>"), status_code=400
+        )
+    return HTMLResponse(_unsub_page(
+        "<p>Done — no more weekly digest emails.</p>"
+        "<p style='font-size:12px;color:#5e5e58;'>Changed your mind? "
+        "Just reply to any earlier digest and we'll switch it back on.</p>"
+    ))
 
 
 def _webhook_secret_ok(provided: str | None) -> bool:

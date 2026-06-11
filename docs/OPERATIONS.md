@@ -137,6 +137,12 @@ see the roadmap; not yet implemented.
 | `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` | LLM provider (Anthropic preferred) |
 | `LITESTREAM_REPLICA_URL` (+ keys) | Enables continuous backup (optional but recommended) |
 | `SCAN_ERRORS_ENABLED`, `GH_APP_*` | Daily error-log → GitHub-issue scanner |
+| `DIGEST_ENABLED` | Turns on the Friday weekly-digest email loop (off by default) |
+| `RESEND_API_KEY` | Resend key for digest sending — backend-owned, separate from the Worker's magic-link key |
+| `DIGEST_FROM_EMAIL` | From address for the digest, e.g. `filter.fyi <digest@filter.fyi>` (domain must be verified in Resend) |
+| `DIGEST_UNSUBSCRIBE_SECRET` | HMAC secret for unsubscribe links — sending fails closed without it |
+| `DIGEST_REPLY_TO_EMAIL` | Reply-To for the digest — point at a monitored address (e.g. Cloudflare Email Routing → private inbox) so user replies actually land somewhere |
+| `DIGEST_WEEKDAY`, `DIGEST_HOUR_UTC`, `DIGEST_BASE_URL` | Optional digest tuning (defaults: Friday, 06:00 UTC, base = `WEBHOOK_URL`) |
 
 ## Runbook — Fly is wedged / dashboard unreachable
 

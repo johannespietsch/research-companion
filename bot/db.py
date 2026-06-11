@@ -406,6 +406,13 @@ def _init() -> None:
         # Added after jobs shipped: carries the user-facing failure message so
         # the Worker can show *why* a job failed instead of a generic string.
         _ensure_column(conn, "jobs", "message", "message TEXT NOT NULL DEFAULT ''")
+        # Weekly digest (#67): per-user opt-out + last-send stamp. The stamp
+        # makes the Friday send idempotent across process restarts — a redeploy
+        # right after the send must not re-mail everyone.
+        _ensure_column(conn, "users", "digest_opt_out",
+                       "digest_opt_out INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "users", "digest_last_sent_at",
+                       "digest_last_sent_at TEXT NOT NULL DEFAULT ''")
         conn.execute(_CREATE_LLM_CALLS_SQL)
         conn.execute(_CREATE_ANALYZE_TRACES_SQL)
         conn.execute(_CREATE_PROCESSED_UPDATES_SQL)
@@ -457,7 +464,8 @@ def upsert_user_by_email(email: str) -> int:
 def get_user(user_id: int) -> sqlite3.Row | None:
     with _get_conn() as conn:
         return conn.execute(
-            "SELECT id, telegram_chat_id, email, api_token, profile, created_at "
+            "SELECT id, telegram_chat_id, email, api_token, profile, created_at, "
+            "digest_opt_out, digest_last_sent_at "
             "FROM users WHERE id = ?",
             (user_id,),
         ).fetchone()
@@ -494,6 +502,34 @@ def set_user_field(user_id: int, **fields) -> None:
         conn.execute(
             f"UPDATE users SET {set_clause} WHERE id = ?",
             list(fields.values()) + [user_id],
+        )
+
+
+def get_digest_recipients() -> list[sqlite3.Row]:
+    """Users eligible for the weekly digest: have an email, not opted out."""
+    with _get_conn() as conn:
+        return conn.execute(
+            "SELECT id, email, digest_last_sent_at FROM users "
+            "WHERE email IS NOT NULL AND email != '' AND digest_opt_out = 0 "
+            "ORDER BY id"
+        ).fetchall()
+
+
+def set_digest_opt_out(user_id: int, opt_out: bool) -> bool:
+    """Flip the digest opt-out flag. Returns False for unknown user ids."""
+    with _get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE users SET digest_opt_out = ? WHERE id = ?",
+            (1 if opt_out else 0, user_id),
+        )
+        return cur.rowcount > 0
+
+
+def mark_digest_sent(user_id: int) -> None:
+    with _get_conn() as conn:
+        conn.execute(
+            "UPDATE users SET digest_last_sent_at = ? WHERE id = ?",
+            (_utcnow_iso(), user_id),
         )
 
 
@@ -566,6 +602,28 @@ def get_all_items(user_id: int | None = None) -> list[sqlite3.Row]:
         return conn.execute(
             f"SELECT {_ITEM_COLS} FROM items ORDER BY id DESC"
         ).fetchall()
+
+
+def get_items_since(user_id: int, since_iso: str) -> list[sqlite3.Row]:
+    """A user's items created at/after ``since_iso`` (ISO UTC), oldest first.
+    Drives the weekly digest window."""
+    with _get_conn() as conn:
+        return conn.execute(
+            f"SELECT {_ITEM_COLS} FROM items "
+            "WHERE user_id = ? AND created_at >= ? ORDER BY id",
+            (user_id, since_iso),
+        ).fetchall()
+
+
+def count_saved_suggestions_pending(user_id: int) -> int:
+    """How many shortlisted suggestions are still parked (status='saved')."""
+    with _get_conn() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM saved_suggestions "
+            "WHERE user_id = ? AND status = 'saved'",
+            (user_id,),
+        ).fetchone()
+        return int(row["n"])
 
 
 def get_item(item_id: int, user_id: int | None = None) -> sqlite3.Row | None:
