@@ -1,4 +1,4 @@
-"""Helpers for the in-process daily maintenance loops (error scan, prune).
+"""Helpers for the in-process maintenance loops (error scan, prune, digest).
 
 These jobs run *inside* the bot process rather than as separate Fly scheduled
 machines because the Fly volume holding the SQLite DB attaches to only one
@@ -20,4 +20,19 @@ def next_daily_run(now: datetime, hour_utc: int) -> datetime:
     candidate = datetime.combine(now.date(), dtime(hour_utc, 0), tzinfo=timezone.utc)
     if candidate <= now:
         candidate += timedelta(days=1)
+    return candidate
+
+
+def next_weekly_run(now: datetime, weekday: int, hour_utc: int) -> datetime:
+    """Return the next UTC datetime on ``weekday`` (Mon=0 … Sun=6) at
+    ``hour_utc``:00 strictly after ``now``.
+
+    Same strictly-after contract as next_daily_run, so a tick landing exactly
+    on the slot rolls a full week rather than firing twice. Used by the weekly
+    digest loop in main.py.
+    """
+    candidate = datetime.combine(now.date(), dtime(hour_utc, 0), tzinfo=timezone.utc)
+    candidate += timedelta(days=(weekday - candidate.weekday()) % 7)
+    if candidate <= now:
+        candidate += timedelta(days=7)
     return candidate

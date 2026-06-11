@@ -434,6 +434,7 @@ async def user_export(user_id: int, _: None = Depends(_require_try_secret)):
             "telegram_linked": user["telegram_chat_id"] is not None,
             "profile": user["profile"],
             "created_at": user["created_at"],
+            "digest_opt_out": bool(user["digest_opt_out"]),
         },
         "items": [
             {
