@@ -141,7 +141,8 @@ see the roadmap; not yet implemented.
 | `RESEND_API_KEY` | Resend key for digest sending — backend-owned, separate from the Worker's magic-link key |
 | `DIGEST_FROM_EMAIL` | From address for the digest, e.g. `filter.fyi <digest@filter.fyi>` (domain must be verified in Resend) |
 | `DIGEST_UNSUBSCRIBE_SECRET` | HMAC secret for unsubscribe links — sending fails closed without it |
-| `DIGEST_WEEKDAY`, `DIGEST_HOUR_UTC`, `DIGEST_REPLY_TO`, `DIGEST_BASE_URL` | Optional digest tuning (defaults: Friday, 06:00 UTC, no reply-to, base = `WEBHOOK_URL`) |
+| `DIGEST_REPLY_TO_EMAIL` | Reply-To for the digest — point at a monitored address (e.g. Cloudflare Email Routing → private inbox) so user replies actually land somewhere |
+| `DIGEST_WEEKDAY`, `DIGEST_HOUR_UTC`, `DIGEST_BASE_URL` | Optional digest tuning (defaults: Friday, 06:00 UTC, base = `WEBHOOK_URL`) |
 
 ## Runbook — Fly is wedged / dashboard unreachable
 

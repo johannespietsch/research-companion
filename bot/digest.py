@@ -290,7 +290,10 @@ def send_digest_email(*, to: str, subject: str, text: str, html: str, user_id: i
         "html": html,
         "headers": {"List-Unsubscribe": f"<{unsubscribe_url(user_id)}>"},
     }
-    reply_to = _env("DIGEST_REPLY_TO")
+    # Route replies to a real, monitored inbox (e.g. a Cloudflare Email
+    # Routing address that forwards privately). The unsubscribe page and the
+    # digest footer both invite replies, so set this in prod.
+    reply_to = _env("DIGEST_REPLY_TO_EMAIL")
     if reply_to:
         payload["reply_to"] = reply_to
     resp = httpx.post(

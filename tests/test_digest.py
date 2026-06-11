@@ -233,3 +233,41 @@ class TestUnsubscribeEndpoints:
         r = client.post(f"/digest/unsubscribe?uid={uid}&tok=deadbeef")
         assert r.status_code == 400
         assert db.get_user(uid)["digest_opt_out"] == 0
+
+
+class TestSendPayload:
+    @pytest.fixture
+    def captured_post(self, digest_env, monkeypatch):
+        """Capture the Resend API call instead of hitting the network."""
+        from bot import digest
+        calls = []
+
+        class _Resp:
+            def raise_for_status(self):
+                pass
+
+        def fake_post(url, *, json, headers, timeout):
+            calls.append({"url": url, "json": json, "headers": headers})
+            return _Resp()
+
+        monkeypatch.setattr(digest.httpx, "post", fake_post)
+        return calls
+
+    def _send(self):
+        from bot.digest import send_digest_email
+        send_digest_email(to="u@example.com", subject="s", text="t", html="<p>h</p>", user_id=7)
+
+    def test_reply_to_email_is_set_when_configured(self, captured_post, monkeypatch):
+        # Replies must route somewhere monitored (e.g. Cloudflare Email
+        # Routing → private inbox), so the env var has to reach the payload.
+        monkeypatch.setenv("DIGEST_REPLY_TO_EMAIL", "hello@filter.fyi")
+        self._send()
+        payload = captured_post[0]["json"]
+        assert payload["reply_to"] == "hello@filter.fyi"
+        assert payload["from"] == "digest@filter.fyi"
+        assert "List-Unsubscribe" in payload["headers"]
+
+    def test_reply_to_omitted_when_unset(self, captured_post, monkeypatch):
+        monkeypatch.delenv("DIGEST_REPLY_TO_EMAIL", raising=False)
+        self._send()
+        assert "reply_to" not in captured_post[0]["json"]
