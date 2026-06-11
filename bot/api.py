@@ -34,6 +34,7 @@ from bot.db import (
     FEEDBACK_SIGNALS,
     LINK_CODE_TTL_SECONDS,
     SAVED_SUGGESTION_STATUSES,
+    SUGGESTION_SIGNAL_EVENTS,
     create_job,
     create_link_code,
     delete_item,
@@ -43,9 +44,11 @@ from bot.db import (
     get_item,
     get_job_record,
     get_saved_suggestions,
+    get_suggestion_signals,
     get_user,
     get_user_profile,
     record_feedback,
+    record_suggestion_signal,
     save_item,
     save_suggestion,
     search_items,
@@ -463,6 +466,17 @@ async def user_export(user_id: int, _: None = Depends(_require_try_secret)):
             }
             for s in get_saved_suggestions(user_id)
         ],
+        "suggestion_signals": [
+            {
+                "url": r["url"],
+                "event": r["event"],
+                "suggestion_index": r["suggestion_index"],
+                "suggestion_text": r["suggestion_text"],
+                "reason": r["reason"],
+                "created_at": r["created_at"],
+            }
+            for r in get_suggestion_signals(user_id, limit=10_000)
+        ],
     }
 
 
@@ -527,6 +541,40 @@ async def feedback(req: _FeedbackRequest, _: None = Depends(_require_try_secret)
     if not get_item(req.item_id, req.user_id):
         raise HTTPException(status_code=404, detail={"error": "not-found"})
     record_feedback(req.user_id, req.item_id, req.signal)
+
+
+class _SuggestionSignalRequest(BaseModel):
+    user_id: int
+    event: str
+    url: str = ""
+    suggestion_index: int | None = None
+    suggestion_text: str = ""
+    reason: str = ""
+
+
+@router.post("/suggestion-signals", status_code=201)
+async def suggestion_signal(
+    req: _SuggestionSignalRequest, _: None = Depends(_require_try_secret)
+):
+    """Record one suggestion interaction event for a signed-in user (#69).
+
+    Forwarded by the Worker alongside its D1 write — D1 keeps the canonical
+    stream (incl. anonymous traffic) for product analytics; this copy is what
+    the analyzer's behaviour-signal digest reads (bot/signals.py). Signed-in
+    only by design: anon events can't personalize anything.
+    """
+    if req.event not in SUGGESTION_SIGNAL_EVENTS:
+        raise HTTPException(status_code=400, detail={"error": "invalid-event"})
+    if not get_user(req.user_id):
+        raise HTTPException(status_code=404, detail={"error": "not-found"})
+    record_suggestion_signal(
+        req.user_id,
+        req.event,
+        url=req.url,
+        suggestion_index=req.suggestion_index,
+        suggestion_text=req.suggestion_text,
+        reason=req.reason,
+    )
 
 
 # ---------------------------------------------------------------------------
