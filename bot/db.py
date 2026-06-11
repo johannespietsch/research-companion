@@ -133,6 +133,7 @@ _CREATE_INDEXES_SQL = [
     "CREATE INDEX IF NOT EXISTS idx_feedback_item ON feedback(item_id)",
     "CREATE INDEX IF NOT EXISTS idx_saved_suggestions_user ON saved_suggestions(user_id, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_saved_suggestions_item ON saved_suggestions(item_id)",
+    "CREATE INDEX IF NOT EXISTS idx_suggestion_signals_user ON suggestion_signals(user_id, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_jobs_updated_at ON jobs(updated_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_llm_calls_ts ON llm_calls(ts DESC)",
     "CREATE INDEX IF NOT EXISTS idx_llm_calls_user ON llm_calls(user_id, ts DESC)",
@@ -301,6 +302,33 @@ CREATE TABLE IF NOT EXISTS processed_urls (
 # available without re-collecting.
 PROCESSED_URLS_RETENTION_SECONDS = 90 * 24 * 3_600
 
+# Suggestion-level interaction signals for signed-in users, forwarded by the
+# Worker (the canonical event stream incl. anonymous traffic stays in D1 —
+# this copy exists so the analyzer can learn from dismiss reasons and
+# tried/done outcomes; see bot/signals.py). Mirrors the Worker's
+# SUGGESTION_EVENTS vocabulary.
+_CREATE_SUGGESTION_SIGNALS_SQL = """\
+CREATE TABLE IF NOT EXISTS suggestion_signals (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id          INTEGER NOT NULL,
+    url              TEXT NOT NULL DEFAULT '',
+    event            TEXT NOT NULL,
+    suggestion_index INTEGER,
+    suggestion_text  TEXT NOT NULL DEFAULT '',
+    reason           TEXT NOT NULL DEFAULT '',
+    created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S', 'now')),
+    FOREIGN KEY (user_id) REFERENCES users(id)
+)"""
+
+SUGGESTION_SIGNAL_EVENTS = frozenset({
+    "shown", "open", "copy", "open_chatgpt", "open_claude", "dismiss",
+    "save", "tried", "done",
+})
+
+# Long enough to learn stable preferences, short enough to forget stale ones
+# (and to bound disk growth — pruned daily with the other audit tables).
+SUGGESTION_SIGNALS_RETENTION_SECONDS = 180 * 24 * 3_600
+
 # Allowed feedback signals. Explicit taps + cheap implicit proxies. Kept as an
 # allowlist so the data stays clean enough to learn from.
 FEEDBACK_SIGNALS = frozenset({
@@ -419,6 +447,7 @@ def _init() -> None:
         conn.execute(_CREATE_LLM_CACHE_SQL)
         conn.execute(_CREATE_LLM_CACHE_HITS_SQL)
         conn.execute(_CREATE_PROCESSED_URLS_SQL)
+        conn.execute(_CREATE_SUGGESTION_SIGNALS_SQL)
         for stmt in _CREATE_INDEXES_SQL:
             conn.execute(stmt)
 
@@ -554,6 +583,7 @@ def delete_user(user_id: int) -> dict:
         conn.execute("DELETE FROM link_codes WHERE user_id = ?", (user_id,))
         conn.execute("DELETE FROM feedback WHERE user_id = ?", (user_id,))
         conn.execute("DELETE FROM saved_suggestions WHERE user_id = ?", (user_id,))
+        conn.execute("DELETE FROM suggestion_signals WHERE user_id = ?", (user_id,))
         user_deleted = conn.execute(
             "DELETE FROM users WHERE id = ?", (user_id,)
         ).rowcount
@@ -768,6 +798,61 @@ def delete_saved_suggestion(saved_id: int, user_id: int) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Suggestion signals (forwarded by the Worker for signed-in users)
+# ---------------------------------------------------------------------------
+
+def record_suggestion_signal(
+    user_id: int,
+    event: str,
+    *,
+    url: str = "",
+    suggestion_index: int | None = None,
+    suggestion_text: str = "",
+    reason: str = "",
+) -> int:
+    """Store one suggestion interaction event. Caller validates the event
+    against SUGGESTION_SIGNAL_EVENTS; values are clipped here so a misbehaving
+    caller can't bloat the table."""
+    with _get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO suggestion_signals "
+            "(user_id, url, event, suggestion_index, suggestion_text, reason) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (user_id, (url or "")[:2048], event, suggestion_index,
+             (suggestion_text or "")[:2048], (reason or "")[:2048]),
+        )
+        return cur.lastrowid
+
+
+def get_suggestion_signals(
+    user_id: int,
+    *,
+    events: tuple[str, ...] | None = None,
+    before_iso: str | None = None,
+    since_iso: str | None = None,
+    limit: int = 50,
+) -> list[sqlite3.Row]:
+    """A user's signals, newest first. ``before_iso``/``since_iso`` bound the
+    window (the signal digest uses ``before`` for day-stable cache keys)."""
+    q = ("SELECT id, url, event, suggestion_index, suggestion_text, reason, "
+         "created_at FROM suggestion_signals WHERE user_id = ?")
+    args: list = [user_id]
+    if events:
+        q += f" AND event IN ({','.join('?' * len(events))})"
+        args.extend(events)
+    if before_iso:
+        q += " AND created_at < ?"
+        args.append(before_iso)
+    if since_iso:
+        q += " AND created_at >= ?"
+        args.append(since_iso)
+    q += " ORDER BY id DESC LIMIT ?"
+    args.append(limit)
+    with _get_conn() as conn:
+        return conn.execute(q, args).fetchall()
+
+
+# ---------------------------------------------------------------------------
 # Account linking (web ↔ Telegram)
 # ---------------------------------------------------------------------------
 
@@ -934,10 +1019,15 @@ def prune_maintenance(now=None) -> dict:
         processed_urls = conn.execute(
             "DELETE FROM processed_urls WHERE ts < ?", (processed_urls_cutoff,)
         ).rowcount or 0
+        suggestion_signals = conn.execute(
+            "DELETE FROM suggestion_signals WHERE created_at < ?",
+            (_ts(now - timedelta(seconds=SUGGESTION_SIGNALS_RETENTION_SECONDS)),),
+        ).rowcount or 0
     return {
         "error_log": errors, "url_cache": cache, "link_codes": codes,
         "jobs": jobs, "processed_updates": updates, "llm_cache": llm_cache,
         "llm_cache_hits": llm_cache_hits, "processed_urls": processed_urls,
+        "suggestion_signals": suggestion_signals,
     }
 
 

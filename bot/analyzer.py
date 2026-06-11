@@ -268,7 +268,7 @@ DEFAULT_PROFILE = (
 
 
 _PROMPT = """You are my personal AI research analyst.
-{profile_block}
+{profile_block}{signals_block}
 Analyze the following content and produce a structured analysis covering the required fields. Be concrete and specific to this person — `why_it_matters` should speak to their situation, not give generic advice.
 
 The suggestions are the point of this analysis — make them the strongest part:
@@ -295,6 +295,20 @@ def _load_profile(user_id: int | None) -> str:
         return DEFAULT_PROFILE
     from bot.db import get_user_profile
     return get_user_profile(user_id) or DEFAULT_PROFILE
+
+
+def _load_signals(user_id: int | None) -> str:
+    """Behaviour-signal digest for signed-in users (see bot/signals.py).
+    Empty for anon users and on any failure — signals are an enhancement and
+    must never break analysis."""
+    if user_id is None:
+        return ""
+    try:
+        from bot.signals import build_signal_digest
+        return build_signal_digest(user_id)
+    except Exception:
+        logger.exception("signal digest failed; analysing without signals")
+        return ""
 
 
 def _normalize(raw: dict) -> dict:
@@ -366,7 +380,7 @@ def _legacy_suggestions(raw: dict) -> list[dict]:
 # hit-rate tile to the admin dashboard separately once we have a feel for
 # how often this fires.
 
-def _cache_key_analyze(text: str, profile: str, model: str) -> str:
+def _cache_key_analyze(text: str, profile: str, model: str, signals: str = "") -> str:
     h = hashlib.sha256()
     h.update(b"analyze\x00")
     h.update(_PROVIDER.encode()); h.update(b"\x00")
@@ -374,6 +388,9 @@ def _cache_key_analyze(text: str, profile: str, model: str) -> str:
     h.update(_PROMPT.encode()); h.update(b"\x00")
     h.update(json.dumps(_TOOL_SCHEMA, sort_keys=True).encode()); h.update(b"\x00")
     h.update((profile or "").encode()); h.update(b"\x00")
+    # Behaviour-signal digest (#69). Day-coarsened upstream (bot/signals.py),
+    # so the key is stable within a UTC day rather than churning per click.
+    h.update((signals or "").encode()); h.update(b"\x00")
     h.update(text.encode())
     return h.hexdigest()
 
@@ -458,13 +475,14 @@ def analyze(text: str, user_id: int | None = None, *, ctx: UsageContext | None =
         ctx = UsageContext(user_id=user_id, anon_id=ctx.anon_id, job_id=ctx.job_id, source_type=ctx.source_type)
 
     profile = _load_profile(ctx.user_id)
+    signals = _load_signals(ctx.user_id)
     model = _resolve_model("analyze", ctx)
 
     # Content-addressed cache lookup. Key spans every input that affects the
     # output, so a prompt/model/schema change auto-invalidates. Skips the
     # upstream LLM call entirely on hit — no llm_calls row written because
     # nothing was actually called.
-    cache_key = _cache_key_analyze(text, profile, model)
+    cache_key = _cache_key_analyze(text, profile, model, signals)
     cached = _try_cache_get(cache_key)
     if cached is not None:
         try:
@@ -478,7 +496,12 @@ def analyze(text: str, user_id: int | None = None, *, ctx: UsageContext | None =
             logger.warning("analyze cache had non-JSON payload; refreshing")
 
     profile_block = f"\nAbout the person you are analysing for:\n{profile}\n" if profile else ""
-    prompt = _PROMPT.format(profile_block=profile_block, text=text)
+    signals_block = f"\n{signals}\n" if signals else ""
+    prompt = _PROMPT.format(profile_block=profile_block, signals_block=signals_block, text=text)
+
+    # Traces feed the eval pipeline — they must capture the full
+    # personalization context the model saw, signals included.
+    trace_profile = profile + (f"\n\n[signals]\n{signals}" if signals else "")
 
     client = _get_client()
     started = time.monotonic()
@@ -497,7 +520,7 @@ def analyze(text: str, user_id: int | None = None, *, ctx: UsageContext | None =
             for block in resp.content:
                 if getattr(block, "type", None) == "tool_use" and block.name == "record_analysis":
                     result = _normalize(block.input)
-                    _capture_trace(model=model, text=text, profile=profile, output=result, ctx=ctx)
+                    _capture_trace(model=model, text=text, profile=trace_profile, output=result, ctx=ctx)
                     _try_cache_set(cache_key, "analyze", json.dumps(result, ensure_ascii=False))
                     return result
             raise RuntimeError("Anthropic did not return a record_analysis tool_use block")
@@ -516,7 +539,7 @@ def analyze(text: str, user_id: int | None = None, *, ctx: UsageContext | None =
         except json.JSONDecodeError as e:
             raise RuntimeError(f"OpenAI returned non-JSON content: {e}: {content[:200]}")
         result = _normalize(raw)
-        _capture_trace(model=model, text=text, profile=profile, output=result, ctx=ctx)
+        _capture_trace(model=model, text=text, profile=trace_profile, output=result, ctx=ctx)
         _try_cache_set(cache_key, "analyze", json.dumps(result, ensure_ascii=False))
         return result
     except Exception as e:
