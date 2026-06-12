@@ -76,6 +76,13 @@ _DIGEST_ENABLED = os.getenv("DIGEST_ENABLED", "").lower() in ("1", "true", "yes"
 _DIGEST_WEEKDAY = int(os.getenv("DIGEST_WEEKDAY", "4"))  # Mon=0 … Fri=4
 _DIGEST_HOUR_UTC = int(os.getenv("DIGEST_HOUR_UTC", "6"))
 
+# Channel monitoring (#68): poll subscribed feeds on an interval. Defaults ON
+# like the prune — with no subscriptions each cycle is a no-op, and adding a
+# subscription is an explicit user action. Spend is bounded by the per-cycle
+# analysis ceiling in bot.monitor. Opt out with MONITOR_ENABLED=false.
+_MONITOR_ENABLED = os.getenv("MONITOR_ENABLED", "true").lower() in ("1", "true", "yes")
+_MONITOR_INTERVAL_S = int(os.getenv("MONITOR_INTERVAL_S", "3600"))
+
 
 async def _daily_error_scan_loop() -> None:
     """Wake once a day at SCAN_HOUR_UTC and run scripts.scan_errors.run_scan."""
@@ -131,6 +138,24 @@ async def _weekly_digest_loop() -> None:
             raise
         except Exception:
             logger.exception("Weekly digest run failed; will retry next week")
+
+
+async def _monitor_loop() -> None:
+    """Poll subscribed channels every MONITOR_INTERVAL_S. Interval-based (not
+    a daily slot): drops should surface within the hour, and an idle cycle
+    with no subscriptions costs one SELECT."""
+    from bot.monitor import poll_all_subscriptions
+
+    while True:
+        try:
+            await asyncio.sleep(_MONITOR_INTERVAL_S)
+            stats = await poll_all_subscriptions()
+            if stats["subscriptions"]:
+                logger.info("channel monitor: %s", stats)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Channel monitor cycle failed; retrying next interval")
 
 
 # The heavy request paths offload their blocking fetch/transcode/LLM work via
@@ -189,6 +214,9 @@ async def lifespan(app: FastAPI):
             "Weekly digest enabled (weekday=%d, hour=%d UTC)",
             _DIGEST_WEEKDAY, _DIGEST_HOUR_UTC,
         )
+    if _MONITOR_ENABLED:
+        maintenance_tasks.append(asyncio.create_task(_monitor_loop()))
+        logger.info("Channel monitor enabled (interval=%ds)", _MONITOR_INTERVAL_S)
 
     yield
 

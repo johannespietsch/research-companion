@@ -134,6 +134,8 @@ _CREATE_INDEXES_SQL = [
     "CREATE INDEX IF NOT EXISTS idx_saved_suggestions_user ON saved_suggestions(user_id, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_saved_suggestions_item ON saved_suggestions(item_id)",
     "CREATE INDEX IF NOT EXISTS idx_suggestion_signals_user ON suggestion_signals(user_id, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_subscriptions_user ON subscriptions(user_id, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_subscription_items_sub ON subscription_items(subscription_id, status)",
     "CREATE INDEX IF NOT EXISTS idx_jobs_updated_at ON jobs(updated_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_llm_calls_ts ON llm_calls(ts DESC)",
     "CREATE INDEX IF NOT EXISTS idx_llm_calls_user ON llm_calls(user_id, ts DESC)",
@@ -329,6 +331,56 @@ SUGGESTION_SIGNAL_EVENTS = frozenset({
 # (and to bound disk growth — pruned daily with the other audit tables).
 SUGGESTION_SIGNALS_RETENTION_SECONDS = 180 * 24 * 3_600
 
+# Channel monitoring (#68): the feeds a user follows. `feed_url` is the
+# canonical RSS/Atom URL (YouTube channels resolve to their Atom feed at
+# subscribe time, so the poller only ever speaks one protocol). One row per
+# (user, feed) — two users following the same feed each get their own row,
+# because analysis is lens-personalized per user (the shared *fetch* is
+# deduped by url_cache, not here).
+_CREATE_SUBSCRIPTIONS_SQL = """\
+CREATE TABLE IF NOT EXISTS subscriptions (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id        INTEGER NOT NULL,
+    feed_url       TEXT NOT NULL,
+    title          TEXT NOT NULL DEFAULT '',
+    source_kind    TEXT NOT NULL DEFAULT 'rss',
+    last_polled_at TEXT NOT NULL DEFAULT '',
+    created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S', 'now')),
+    UNIQUE(user_id, feed_url),
+    FOREIGN KEY (user_id) REFERENCES users(id)
+)"""
+
+# Entries the poller has seen per subscription — the cross-poll dedupe set and
+# the per-entry processing state. `status`: 'seeded' (present when the user
+# subscribed; never analyzed — subscribing must not trigger a backfill of LLM
+# calls), 'pending' (queued), 'done' (analyzed; item_id links the library row),
+# 'error' (pipeline failed; not retried).
+_CREATE_SUBSCRIPTION_ITEMS_SQL = """\
+CREATE TABLE IF NOT EXISTS subscription_items (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    subscription_id INTEGER NOT NULL,
+    user_id         INTEGER NOT NULL,
+    entry_url       TEXT NOT NULL,
+    entry_title     TEXT NOT NULL DEFAULT '',
+    status          TEXT NOT NULL DEFAULT 'pending',
+    item_id         INTEGER,
+    verdict         TEXT NOT NULL DEFAULT '',
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S', 'now')),
+    updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S', 'now')),
+    UNIQUE(subscription_id, entry_url),
+    FOREIGN KEY (subscription_id) REFERENCES subscriptions(id),
+    FOREIGN KEY (user_id) REFERENCES users(id)
+)"""
+
+SUBSCRIPTION_ITEM_STATUSES = frozenset({"seeded", "pending", "done", "error"})
+
+# Cap per user to bound polling load and LLM spend; generous for one person.
+MAX_SUBSCRIPTIONS_PER_USER = 30
+# Old seen-entries are safe to forget once they've long scrolled out of the
+# feed window (feeds carry ~15–50 recent entries) — a year is comfortably past
+# that, and keeps the dedupe set from growing without bound.
+SUBSCRIPTION_ITEMS_RETENTION_SECONDS = 365 * 24 * 3_600
+
 # Allowed feedback signals. Explicit taps + cheap implicit proxies. Kept as an
 # allowlist so the data stays clean enough to learn from.
 FEEDBACK_SIGNALS = frozenset({
@@ -448,6 +500,8 @@ def _init() -> None:
         conn.execute(_CREATE_LLM_CACHE_HITS_SQL)
         conn.execute(_CREATE_PROCESSED_URLS_SQL)
         conn.execute(_CREATE_SUGGESTION_SIGNALS_SQL)
+        conn.execute(_CREATE_SUBSCRIPTIONS_SQL)
+        conn.execute(_CREATE_SUBSCRIPTION_ITEMS_SQL)
         for stmt in _CREATE_INDEXES_SQL:
             conn.execute(stmt)
 
@@ -584,6 +638,8 @@ def delete_user(user_id: int) -> dict:
         conn.execute("DELETE FROM feedback WHERE user_id = ?", (user_id,))
         conn.execute("DELETE FROM saved_suggestions WHERE user_id = ?", (user_id,))
         conn.execute("DELETE FROM suggestion_signals WHERE user_id = ?", (user_id,))
+        conn.execute("DELETE FROM subscription_items WHERE user_id = ?", (user_id,))
+        conn.execute("DELETE FROM subscriptions WHERE user_id = ?", (user_id,))
         user_deleted = conn.execute(
             "DELETE FROM users WHERE id = ?", (user_id,)
         ).rowcount
@@ -853,6 +909,107 @@ def get_suggestion_signals(
 
 
 # ---------------------------------------------------------------------------
+# Subscriptions (channel monitoring, #68)
+# ---------------------------------------------------------------------------
+
+def add_subscription(user_id: int, feed_url: str, *, title: str = "",
+                     source_kind: str = "rss") -> int | None:
+    """Create one subscription. Returns its id, or None when it already exists
+    (idempotent). Raises ValueError at the per-user cap so the API can surface
+    a clear message."""
+    with _get_conn() as conn:
+        n = conn.execute(
+            "SELECT COUNT(*) AS n FROM subscriptions WHERE user_id = ?", (user_id,)
+        ).fetchone()["n"]
+        if n >= MAX_SUBSCRIPTIONS_PER_USER:
+            raise ValueError(f"subscription cap reached ({MAX_SUBSCRIPTIONS_PER_USER})")
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO subscriptions (user_id, feed_url, title, source_kind) "
+            "VALUES (?, ?, ?, ?)",
+            (user_id, feed_url[:2048], title[:300], source_kind),
+        )
+        return cur.lastrowid if cur.rowcount else None
+
+
+def get_subscriptions(user_id: int) -> list[sqlite3.Row]:
+    with _get_conn() as conn:
+        return conn.execute(
+            "SELECT id, feed_url, title, source_kind, last_polled_at, created_at "
+            "FROM subscriptions WHERE user_id = ? ORDER BY created_at DESC, id DESC",
+            (user_id,),
+        ).fetchall()
+
+
+def get_all_subscriptions() -> list[sqlite3.Row]:
+    """Every subscription across users — the poller's worklist."""
+    with _get_conn() as conn:
+        return conn.execute(
+            "SELECT id, user_id, feed_url, title, source_kind, last_polled_at "
+            "FROM subscriptions ORDER BY id"
+        ).fetchall()
+
+
+def delete_subscription(sub_id: int, user_id: int) -> bool:
+    """Remove a subscription and its seen-entry state. Ownership-scoped."""
+    with _get_conn() as conn:
+        cur = conn.execute(
+            "DELETE FROM subscriptions WHERE id = ? AND user_id = ?",
+            (sub_id, user_id),
+        )
+        if not cur.rowcount:
+            return False
+        conn.execute(
+            "DELETE FROM subscription_items WHERE subscription_id = ?", (sub_id,)
+        )
+        return True
+
+
+def mark_subscription_polled(sub_id: int) -> None:
+    with _get_conn() as conn:
+        conn.execute(
+            "UPDATE subscriptions SET last_polled_at = ? WHERE id = ?",
+            (_utcnow_iso(), sub_id),
+        )
+
+
+def record_subscription_entry(
+    sub_id: int, user_id: int, entry_url: str, entry_title: str = "",
+    *, status: str = "pending",
+) -> bool:
+    """Register one feed entry as seen. Returns False if it was already known
+    (the cross-poll dedupe)."""
+    with _get_conn() as conn:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO subscription_items "
+            "(subscription_id, user_id, entry_url, entry_title, status) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (sub_id, user_id, entry_url[:2048], (entry_title or "")[:300], status),
+        )
+        return cur.rowcount > 0
+
+
+def get_pending_subscription_entries(sub_id: int, limit: int = 10) -> list[sqlite3.Row]:
+    with _get_conn() as conn:
+        return conn.execute(
+            "SELECT id, subscription_id, user_id, entry_url, entry_title "
+            "FROM subscription_items WHERE subscription_id = ? AND status = 'pending' "
+            "ORDER BY id DESC LIMIT ?",
+            (sub_id, limit),
+        ).fetchall()
+
+
+def set_subscription_entry_result(
+    entry_id: int, *, status: str, item_id: int | None = None, verdict: str = "",
+) -> None:
+    with _get_conn() as conn:
+        conn.execute(
+            "UPDATE subscription_items SET status = ?, item_id = ?, verdict = ?, "
+            "updated_at = ? WHERE id = ?",
+            (status, item_id, verdict, _utcnow_iso(), entry_id),
+        )
+
+
+# ---------------------------------------------------------------------------
 # Account linking (web ↔ Telegram)
 # ---------------------------------------------------------------------------
 
@@ -1023,11 +1180,16 @@ def prune_maintenance(now=None) -> dict:
             "DELETE FROM suggestion_signals WHERE created_at < ?",
             (_ts(now - timedelta(seconds=SUGGESTION_SIGNALS_RETENTION_SECONDS)),),
         ).rowcount or 0
+        subscription_items = conn.execute(
+            "DELETE FROM subscription_items WHERE created_at < ?",
+            (_ts(now - timedelta(seconds=SUBSCRIPTION_ITEMS_RETENTION_SECONDS)),),
+        ).rowcount or 0
     return {
         "error_log": errors, "url_cache": cache, "link_codes": codes,
         "jobs": jobs, "processed_updates": updates, "llm_cache": llm_cache,
         "llm_cache_hits": llm_cache_hits, "processed_urls": processed_urls,
         "suggestion_signals": suggestion_signals,
+        "subscription_items": subscription_items,
     }
 
 
