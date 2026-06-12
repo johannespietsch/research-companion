@@ -133,29 +133,51 @@ def build_digest(user_id: int, *, now: datetime | None = None) -> dict | None:
     # Top actions: the best suggestion of each watch/skim item, best-first
     # (suggestions[] is already ordered best-first by the analyzer), one per
     # source so a single dense read doesn't crowd out the rest of the week.
-    actions = []
+    # Convergent suggestions across items collapse into one action backed by
+    # all of its sources (#70) — N reads → 1 thing to do.
+    from bot.consolidate import cluster
+
+    candidates = []
     for rank, row, analysis in parsed:
-        if rank >= _VERDICT_RANK["skip"] or len(actions) >= MAX_ACTIONS:
+        if rank >= _VERDICT_RANK["skip"]:
             continue
         suggestions = analysis.get("suggestions") or []
         if not suggestions:
             continue
         s = suggestions[0]
-        label = _item_label(analysis, row["source"])
-        actions.append({
+        candidates.append({
             "title": (s.get("title") or "Try this").strip(),
             "detail": (s.get("detail") or "").strip(),
             "effort": (s.get("effort") or "").strip(),
             "first_step": (s.get("first_step") or "").strip(),
+            "grounded_in": (analysis.get("grounded_in") or "").strip(),
             "source": row["source"],
-            "source_label": label,
+            "source_label": _item_label(analysis, row["source"]),
+        })
+
+    actions = []
+    for group in cluster(candidates)[:MAX_ACTIONS]:
+        lead = group[0]  # candidates are rank-ordered, so the lead is the best take
+        extra = [
+            {"title": m["source_label"], "url": m["source"]}
+            for m in group[1:]
+        ]
+        actions.append({
+            "title": lead["title"],
+            "detail": lead["detail"],
+            "effort": lead["effort"],
+            "first_step": lead["first_step"],
+            "source": lead["source"],
+            "source_label": lead["source_label"],
+            "also_from": extra,
             "brief": build_agent_brief(
-                action=(s.get("detail") or s.get("title") or "").strip(),
-                first_step=(s.get("first_step") or "").strip(),
-                grounded_in=(analysis.get("grounded_in") or "").strip(),
+                action=lead["detail"] or lead["title"],
+                first_step=lead["first_step"],
+                grounded_in=lead["grounded_in"],
                 profile=profile,
-                source_title=label,
-                source_url=row["source"],
+                source_title=lead["source_label"],
+                source_url=lead["source"],
+                extra_sources=extra,
                 variant="link",
             ),
         })
@@ -205,6 +227,8 @@ def render_digest_text(d: dict) -> str:
             if a["first_step"]:
                 out.append(f"   First move: {a['first_step']}")
             out.append(f"   From: {a['source_label']} — {a['source']}")
+            for extra in a.get("also_from") or []:
+                out.append(f"   Also recommended by: {extra['title']} — {extra['url']}")
             if a["brief"]:
                 out += ["", "   Hand this to your AI (ChatGPT, Claude, Cursor …):", ""]
                 out += ["   | " + line for line in a["brief"].splitlines()]
@@ -247,6 +271,11 @@ def render_digest_html(d: dict) -> str:
                 + (f"<p style=\"margin:0 0 6px;\">First move: {esc(a['first_step'])}</p>" if a["first_step"] else "")
                 + f"<p style=\"margin:0 0 6px;font-size:12px;color:#5e5e58;\">From: "
                   f"<a href=\"{esc(a['source'], quote=True)}\">{esc(a['source_label'])}</a></p>"
+                + "".join(
+                    f"<p style=\"margin:0 0 6px;font-size:12px;color:#5e5e58;\">Also recommended by: "
+                    f"<a href=\"{esc(x['url'], quote=True)}\">{esc(x['title'])}</a></p>"
+                    for x in (a.get("also_from") or [])
+                )
                 + (
                     "<p style=\"margin:8px 0 4px;font-size:12px;color:#5e5e58;\">"
                     "Hand this to your AI (ChatGPT, Claude, Cursor …):</p>"

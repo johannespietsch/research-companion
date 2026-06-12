@@ -123,6 +123,23 @@ CREATE TABLE IF NOT EXISTS saved_suggestions (
 # FEEDBACK_SIGNALS taps so the follow-up reads consistently across surfaces.
 SAVED_SUGGESTION_STATUSES = frozenset({"saved", "tried", "done"})
 
+# Extra sources backing a consolidated Shortlist entry (#70). The entry's own
+# item_id is its primary source; each row here is one *additional* item whose
+# similar suggestion merged into it instead of appending a duplicate entry.
+# `user_id` is denormalized for cheap GDPR erasure. Entries predating
+# consolidation simply have no rows here.
+_CREATE_SAVED_SUGGESTION_SOURCES_SQL = """\
+CREATE TABLE IF NOT EXISTS saved_suggestion_sources (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    saved_id   INTEGER NOT NULL,
+    user_id    INTEGER NOT NULL,
+    item_id    INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%S', 'now')),
+    UNIQUE(saved_id, item_id),
+    FOREIGN KEY (saved_id) REFERENCES saved_suggestions(id),
+    FOREIGN KEY (item_id) REFERENCES items(id)
+)"""
+
 _CREATE_INDEXES_SQL = [
     "CREATE INDEX IF NOT EXISTS idx_items_user ON items(user_id, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_link_codes_expires ON link_codes(expires_at)",
@@ -133,6 +150,7 @@ _CREATE_INDEXES_SQL = [
     "CREATE INDEX IF NOT EXISTS idx_feedback_item ON feedback(item_id)",
     "CREATE INDEX IF NOT EXISTS idx_saved_suggestions_user ON saved_suggestions(user_id, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_saved_suggestions_item ON saved_suggestions(item_id)",
+    "CREATE INDEX IF NOT EXISTS idx_saved_suggestion_sources_saved ON saved_suggestion_sources(saved_id)",
     "CREATE INDEX IF NOT EXISTS idx_suggestion_signals_user ON suggestion_signals(user_id, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_subscriptions_user ON subscriptions(user_id, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_subscription_items_sub ON subscription_items(subscription_id, status)",
@@ -482,6 +500,7 @@ def _init() -> None:
         conn.execute(_CREATE_ERROR_LOG_SQL)
         conn.execute(_CREATE_FEEDBACK_SQL)
         conn.execute(_CREATE_SAVED_SUGGESTIONS_SQL)
+        conn.execute(_CREATE_SAVED_SUGGESTION_SOURCES_SQL)
         conn.execute(_CREATE_JOBS_SQL)
         # Added after jobs shipped: carries the user-facing failure message so
         # the Worker can show *why* a job failed instead of a generic string.
@@ -637,6 +656,7 @@ def delete_user(user_id: int) -> dict:
         conn.execute("DELETE FROM link_codes WHERE user_id = ?", (user_id,))
         conn.execute("DELETE FROM feedback WHERE user_id = ?", (user_id,))
         conn.execute("DELETE FROM saved_suggestions WHERE user_id = ?", (user_id,))
+        conn.execute("DELETE FROM saved_suggestion_sources WHERE user_id = ?", (user_id,))
         conn.execute("DELETE FROM suggestion_signals WHERE user_id = ?", (user_id,))
         conn.execute("DELETE FROM subscription_items WHERE user_id = ?", (user_id,))
         conn.execute("DELETE FROM subscriptions WHERE user_id = ?", (user_id,))
@@ -843,14 +863,56 @@ def update_saved_suggestion_status(saved_id: int, user_id: int, status: str) -> 
 
 
 def delete_saved_suggestion(saved_id: int, user_id: int) -> bool:
-    """Remove one shortlisted suggestion. Ownership-scoped — returns False if
-    the row doesn't exist or belongs to another user."""
+    """Remove one shortlisted suggestion (and its extra sources).
+    Ownership-scoped — returns False if the row doesn't exist or belongs to
+    another user."""
     with _get_conn() as conn:
         cur = conn.execute(
             "DELETE FROM saved_suggestions WHERE id = ? AND user_id = ?",
             (saved_id, user_id),
         )
+        if not cur.rowcount:
+            return False
+        conn.execute(
+            "DELETE FROM saved_suggestion_sources WHERE saved_id = ?", (saved_id,)
+        )
+        return True
+
+
+def add_saved_suggestion_source(saved_id: int, user_id: int, item_id: int) -> bool:
+    """Attach one extra source item to a consolidated entry (#70). Idempotent;
+    a no-op when the item is already attached or is the entry's own primary
+    item. Ownership-scoped via the entry."""
+    with _get_conn() as conn:
+        entry = conn.execute(
+            "SELECT item_id FROM saved_suggestions WHERE id = ? AND user_id = ?",
+            (saved_id, user_id),
+        ).fetchone()
+        if not entry or entry["item_id"] == item_id:
+            return False
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO saved_suggestion_sources (saved_id, user_id, item_id) "
+            "VALUES (?, ?, ?)",
+            (saved_id, user_id, item_id),
+        )
         return cur.rowcount > 0
+
+
+def get_saved_suggestion_sources(user_id: int) -> dict[int, list[sqlite3.Row]]:
+    """All extra sources for a user's Shortlist, keyed by saved_id. Each row
+    joins the item for its URL + stored analysis (the title lives inside)."""
+    with _get_conn() as conn:
+        rows = conn.execute(
+            "SELECT s.saved_id, s.item_id, i.source AS source, "
+            "       i.analysis AS item_analysis "
+            "FROM saved_suggestion_sources s JOIN items i ON i.id = s.item_id "
+            "WHERE s.user_id = ? ORDER BY s.id",
+            (user_id,),
+        ).fetchall()
+    out: dict[int, list[sqlite3.Row]] = {}
+    for r in rows:
+        out.setdefault(r["saved_id"], []).append(r)
+    return out
 
 
 # ---------------------------------------------------------------------------

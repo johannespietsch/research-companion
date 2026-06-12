@@ -64,10 +64,20 @@ class TestBuildDigest:
     def test_actions_lead_watch_first_and_cap_at_three(self, db, digest_env):
         from bot.digest import MAX_ACTIONS, build_digest
         uid = db.upsert_user_by_email("u@example.com")
-        _add_item(db, uid, verdict="skim", suggestions=[_suggestion(title="Skim move")],
+        # Distinct details per suggestion — convergent ones would (rightly)
+        # consolidate into a single action since #70.
+        details = [
+            "rewrite the ingestion job in rust",
+            "benchmark quantized models on the laptop",
+            "publish the trading bot postmortem",
+            "interview three users about the digest",
+        ]
+        _add_item(db, uid, verdict="skim",
+                  suggestions=[_suggestion(title="Skim move", detail=details[3])],
                   main_idea="Skim read", source="https://ex.com/skim")
         for i in range(3):
-            _add_item(db, uid, verdict="watch", suggestions=[_suggestion(title=f"Watch move {i}")],
+            _add_item(db, uid, verdict="watch",
+                      suggestions=[_suggestion(title=f"Watch move {i}", detail=details[i])],
                       main_idea=f"Watch read {i}", source=f"https://ex.com/w{i}")
         d = build_digest(uid, now=NOW)
         assert len(d["actions"]) == MAX_ACTIONS
