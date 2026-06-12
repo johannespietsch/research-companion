@@ -143,6 +143,7 @@ see the roadmap; not yet implemented.
 | `DIGEST_UNSUBSCRIBE_SECRET` | HMAC secret for unsubscribe links — sending fails closed without it |
 | `DIGEST_REPLY_TO_EMAIL` | Reply-To for the digest — point at a monitored address (e.g. Cloudflare Email Routing → private inbox) so user replies actually land somewhere |
 | `DIGEST_WEEKDAY`, `DIGEST_HOUR_UTC`, `DIGEST_BASE_URL` | Optional digest tuning (defaults: Friday, 06:00 UTC, base = `WEBHOOK_URL`) |
+| `MONITOR_ENABLED`, `MONITOR_INTERVAL_S` | Channel-monitoring poll loop (default: on, hourly). No-op until users subscribe; LLM spend is bounded per cycle (see `bot/monitor.py`) |
 
 ## Runbook — Fly is wedged / dashboard unreachable
 

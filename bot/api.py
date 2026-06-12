@@ -35,15 +35,18 @@ from bot.db import (
     LINK_CODE_TTL_SECONDS,
     SAVED_SUGGESTION_STATUSES,
     SUGGESTION_SIGNAL_EVENTS,
+    add_subscription,
     create_job,
     create_link_code,
     delete_item,
     delete_saved_suggestion,
+    delete_subscription,
     delete_user,
     get_all_items,
     get_item,
     get_job_record,
     get_saved_suggestions,
+    get_subscriptions,
     get_suggestion_signals,
     get_user,
     get_user_profile,
@@ -478,6 +481,15 @@ async def user_export(user_id: int, _: None = Depends(_require_try_secret)):
             }
             for r in get_suggestion_signals(user_id, limit=10_000)
         ],
+        "subscriptions": [
+            {
+                "feed_url": s["feed_url"],
+                "title": s["title"],
+                "source_kind": s["source_kind"],
+                "created_at": s["created_at"],
+            }
+            for s in get_subscriptions(user_id)
+        ],
     }
 
 
@@ -542,6 +554,75 @@ async def feedback(req: _FeedbackRequest, _: None = Depends(_require_try_secret)
     if not get_item(req.item_id, req.user_id):
         raise HTTPException(status_code=404, detail={"error": "not-found"})
     record_feedback(req.user_id, req.item_id, req.signal)
+
+
+# ---------------------------------------------------------------------------
+# Subscriptions (channel monitoring, #68) — Worker-gated CRUD. The poll loop
+# in main.py does the actual monitoring; these endpoints only manage the list.
+# ---------------------------------------------------------------------------
+
+class _SubscriptionCreateRequest(BaseModel):
+    user_id: int
+    url: str
+
+
+@router.post("/subscriptions", status_code=201)
+async def subscription_create(
+    req: _SubscriptionCreateRequest, _: None = Depends(_require_try_secret)
+):
+    """Subscribe a user to a channel/feed. The input URL is resolved to a
+    canonical feed at subscribe time (RSS/Atom passthrough, YouTube channel →
+    Atom feed, HTML page → advertised feed), so bad URLs fail here with a
+    clear message instead of silently never producing drops."""
+    from bot.monitor import FeedError, resolve_feed
+    from bot.ssrf import BlockedURLError
+
+    if not get_user(req.user_id):
+        raise HTTPException(status_code=404, detail={"error": "not-found"})
+    try:
+        resolved = await asyncio.get_running_loop().run_in_executor(
+            None, resolve_feed, req.url
+        )
+    except (FeedError, BlockedURLError) as e:
+        raise HTTPException(
+            status_code=422,
+            detail={"error": "invalid-feed",
+                    "message": str(e) or "No feed found at that URL."},
+        )
+    try:
+        sub_id = add_subscription(
+            req.user_id, resolved["feed_url"],
+            title=resolved["title"], source_kind=resolved["source_kind"],
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=409,
+                            detail={"error": "limit-reached", "message": str(e)})
+    if sub_id is None:
+        raise HTTPException(status_code=409, detail={"error": "already-subscribed"})
+    return {"id": sub_id, **resolved}
+
+
+@router.get("/subscriptions")
+async def subscriptions_list(user_id: int, _: None = Depends(_require_try_secret)):
+    return [
+        {
+            "id": s["id"],
+            "feed_url": s["feed_url"],
+            "title": s["title"],
+            "source_kind": s["source_kind"],
+            "last_polled_at": s["last_polled_at"],
+            "created_at": s["created_at"],
+        }
+        for s in get_subscriptions(user_id)
+    ]
+
+
+@router.delete("/subscriptions/{sub_id}", status_code=204)
+async def subscription_delete(
+    sub_id: int, user_id: int, _: None = Depends(_require_try_secret)
+):
+    if not delete_subscription(sub_id, user_id):
+        raise HTTPException(status_code=404, detail={"error": "not-found"})
 
 
 class _SuggestionSignalRequest(BaseModel):

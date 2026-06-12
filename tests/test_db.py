@@ -423,7 +423,7 @@ class TestPruneMaintenance:
         assert counts == {
             "error_log": 1, "url_cache": 1, "link_codes": 1, "jobs": 1,
             "processed_updates": 1, "llm_cache": 1, "llm_cache_hits": 1,
-            "processed_urls": 1, "suggestion_signals": 0,
+            "processed_urls": 1, "suggestion_signals": 0, "subscription_items": 0,
         }
 
         with db._get_conn() as conn:
@@ -443,7 +443,7 @@ class TestPruneMaintenance:
         assert counts == {
             "error_log": 0, "url_cache": 0, "link_codes": 0, "jobs": 0,
             "processed_updates": 0, "llm_cache": 0, "llm_cache_hits": 0,
-            "processed_urls": 0, "suggestion_signals": 0,
+            "processed_urls": 0, "suggestion_signals": 0, "subscription_items": 0,
         }
 
 
