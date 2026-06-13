@@ -172,8 +172,8 @@ class TestDigestClustering:
                    title="Websockets", detail="migrate the trading bot to async websockets")
         d = build_digest(uid, now=NOW)
         assert len(d["actions"]) == 2
-        merged = next(a for a in d["actions"] if a["also_from"])
-        assert {x["url"] for x in merged["also_from"]} == {"https://ex.com/a"} or \
-               {x["url"] for x in merged["also_from"]} == {"https://ex.com/b"}
-        assert "Also recommended by:" in merged["brief"]
-        assert "Also recommended by:" in render_digest_text(d)
+        # The two eval-harness reads collapse into one action backed by both;
+        # the digest surfaces the count (the per-source detail lives in-app, #78).
+        merged = next(a for a in d["actions"] if a["also_count"])
+        assert merged["also_count"] == 1  # one extra source folded in
+        assert "backed by 2 of this week's reads" in render_digest_text(d)
