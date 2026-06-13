@@ -122,16 +122,32 @@ def _actions_for(
     """Build the agent-handoff `actions` list for a response.
 
     Personalizes the brief with the signed-in user's profile (anon gets none),
-    and grounds it in a bounded excerpt of the content. Pure templating — no
-    extra LLM calls.
+    grounds it in a bounded excerpt of the content, and — for signed-in users —
+    folds in each suggestion's relevant library history (#71). Pure templating,
+    no extra LLM calls.
     """
     profile = get_user_profile(user_id) if user_id is not None else ""
+
+    history_for = None
+    if user_id is not None:
+        from bot.memory import build_history_block
+
+        def history_for(title: str, detail: str) -> str:
+            # Best-effort: memory is an enhancement, never a hard dependency of
+            # the handoff. A DB hiccup yields a brief without history.
+            try:
+                return build_history_block(user_id, title=title, detail=detail)
+            except Exception:
+                logger.exception("history block failed; brief without memory")
+                return ""
+
     return build_actions(
         analysis,
         profile=profile or "",
         source_title=source_title,
         source_url=source_url,
         summary_excerpt=source_text or "",
+        history_for=history_for,
     )
 
 
