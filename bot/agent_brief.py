@@ -53,11 +53,17 @@ def build_agent_brief(
     source_url: str = "",
     summary_excerpt: str = "",
     extra_sources: list[dict] | None = None,
+    history: str = "",
     variant: str = "full",
 ) -> str:
     """Render one handoff brief as a clean prompt. ``variant`` is "full" or "link".
 
     Empty ``action`` yields an empty string (nothing to hand off).
+
+    ``history`` is a pre-rendered, user-voice block of the reader's own library
+    history relevant to this action (bot/memory.py, #71). It sits in the
+    instruction region — it's the user speaking about their own past, NOT
+    untrusted source material, so it stays outside the fenced SOURCE block.
     """
     action = (action or "").strip()
     if not action:
@@ -74,6 +80,8 @@ def build_agent_brief(
         out += ["", f"A concrete first move: {first_step.strip()}"]
     if profile and profile.strip():
         out += ["", "About me — tailor everything to this:", _clip_sentence(profile, PROFILE_CHARS)]
+    if history and history.strip():
+        out += ["", history.strip()]
 
     # Source block — fenced + flagged as reference (prompt-injection guard).
     src: list[str] = []
@@ -128,6 +136,7 @@ def build_actions(
     source_title: str = "",
     source_url: str = "",
     summary_excerpt: str = "",
+    history_for=None,
 ) -> list[dict]:
     """Build the `actions` list — one entry per suggestion (0–5).
 
@@ -135,6 +144,11 @@ def build_actions(
     full copy-paste version; `brief_link` is the concise version for "open in …"
     deep links. Pure templating — no extra LLM calls. Returns [] when the
     analysis has no suggestions (content with no follow-up worth the time).
+
+    ``history_for`` is an optional ``(title, detail) -> str`` callable supplying
+    a per-suggestion library-history block (#71). Kept as a callback so this
+    function stays DB-free and testable; the caller (bot.api._actions_for)
+    wires it to bot.memory for signed-in users only.
     """
     grounded_in = (analysis.get("grounded_in") or "").strip()
     actions: list[dict] = []
@@ -153,6 +167,7 @@ def build_actions(
             source_title=source_title,
             source_url=source_url,
             summary_excerpt=summary_excerpt,
+            history=history_for(title, detail) if history_for else "",
         )
         actions.append({
             "index": i,
