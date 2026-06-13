@@ -47,7 +47,20 @@ _UA = "filter.fyi feed monitor (+https://filter.fyi)"
 
 _YT_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com"}
 _YT_FEED = "https://www.youtube.com/feeds/videos.xml?channel_id={cid}"
-_YT_CHANNEL_ID_RE = re.compile(r'"channelId"\s*:\s*"(UC[0-9A-Za-z_-]{22})"')
+# A YouTube channel page exposes its UC… id in several spots. We try the most
+# stable ones (canonical link / og:url always point at the /channel/UC… form
+# even from a handle page), so a markup tweak to any single field can't break
+# resolution.
+_YT_CHANNEL_ID_RES = [
+    re.compile(r'"channelId"\s*:\s*"(UC[0-9A-Za-z_-]{22})"'),
+    re.compile(r'"externalId"\s*:\s*"(UC[0-9A-Za-z_-]{22})"'),
+    re.compile(r'<link[^>]+rel="canonical"[^>]+href="https://www\.youtube\.com/channel/(UC[0-9A-Za-z_-]{22})"'),
+    re.compile(r'<meta[^>]+property="og:url"[^>]+content="https://www\.youtube\.com/channel/(UC[0-9A-Za-z_-]{22})"'),
+]
+# YouTube serves an EU "consent" interstitial to datacenter IPs (e.g. Fly),
+# which carries none of the channel markup. This cookie records the consent
+# and is what every YouTube-feed tool sends to get the real page.
+_YT_CONSENT_COOKIE = "SOCS=CAI"
 _FEED_LINK_RE = re.compile(
     r'<link[^>]+rel=["\']alternate["\'][^>]*>', re.IGNORECASE
 )
@@ -59,13 +72,24 @@ class FeedError(Exception):
     """A user-facing problem with a feed URL (unreachable, no feed found…)."""
 
 
+def _is_youtube(url: str) -> bool:
+    try:
+        return urlparse(url).hostname in _YT_HOSTS
+    except ValueError:
+        return False
+
+
 def _get(url: str) -> httpx.Response:
     """SSRF-guarded GET with a size cap. Re-checks the final URL after
-    redirects (per bot/ssrf.py's documented limitation)."""
+    redirects (per bot/ssrf.py's documented limitation). Sends the YouTube
+    consent cookie so datacenter IPs get the real channel page, not the EU
+    consent wall."""
     assert_public_url(url)
+    headers = {"User-Agent": _UA}
+    if _is_youtube(url):
+        headers["Cookie"] = _YT_CONSENT_COOKIE
     resp = httpx.get(
-        url, timeout=_FETCH_TIMEOUT_S, follow_redirects=True,
-        headers={"User-Agent": _UA},
+        url, timeout=_FETCH_TIMEOUT_S, follow_redirects=True, headers=headers,
     )
     assert_public_url(str(resp.url))
     resp.raise_for_status()
@@ -101,9 +125,10 @@ def _youtube_feed_url(url: str, body: str | None) -> str | None:
     # Handle/legacy forms (/@name, /c/name, /user/name) carry the channelId
     # only inside the page markup.
     if body:
-        m = _YT_CHANNEL_ID_RE.search(body)
-        if m:
-            return _YT_FEED.format(cid=m.group(1))
+        for pat in _YT_CHANNEL_ID_RES:
+            m = pat.search(body)
+            if m:
+                return _YT_FEED.format(cid=m.group(1))
     return None
 
 
