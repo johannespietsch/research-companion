@@ -18,6 +18,20 @@ from bot.transcriber import transcribe
 
 logger = logging.getLogger(__name__)
 
+# Telegram's Bot API caps file downloads (getFile) at 20 MB — a hard server-side
+# limit we can't raise. Larger uploads fail with "File is too big"; we catch
+# that early and point the user at a link instead (which the URL path now
+# transcribes — see fetcher._transcribe_audio_url, #8).
+_TELEGRAM_MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
+_TOO_BIG_MSG = (
+    "That file is over Telegram's 20 MB limit for bots, so I can't download it. "
+    "Paste a link to the audio or video instead and I'll fetch it directly."
+)
+
+
+def _too_big(file_size: int | None) -> bool:
+    return bool(file_size) and file_size > _TELEGRAM_MAX_DOWNLOAD_BYTES
+
 
 def _suggestions_keyboard(analysis: dict, item_id: int | None) -> InlineKeyboardMarkup | None:
     """One '🔧 <title>' button per suggestion. Tapping sends that suggestion's
@@ -173,6 +187,9 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = get_or_create_user_by_telegram(update.effective_user.id)
     audio = update.message.audio
+    if _too_big(audio.file_size):
+        await update.message.reply_text(_TOO_BIG_MSG)
+        return
     suffix = f".{audio.mime_type.split('/')[-1]}" if audio.mime_type else ".mp3"
     await update.message.reply_text(f"Transcribing audio: {audio.file_name or 'file'}...")
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
@@ -200,6 +217,9 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = get_or_create_user_by_telegram(update.effective_user.id)
     video = update.message.video or update.message.video_note
+    if _too_big(video.file_size):
+        await update.message.reply_text(_TOO_BIG_MSG)
+        return
     await update.message.reply_text("Extracting and transcribing video audio...")
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
         path = f.name

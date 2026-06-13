@@ -65,7 +65,9 @@ ERR_NO_TRANSCRIPT = "no-transcript"          # video-with-no-transcript variant 
 ERR_ANALYZE_FAILED = "analyze-failed"        # LLM call failed mid-chain
 ERR_BUSY = "busy"                            # shed: no heavy-work slot free (overload)
 
-_VIDEO_SOURCE_TYPES: frozenset[str] = frozenset({"youtube", "video"})
+# Transcribed sources: a failed fetch here means "no transcript", not "no text"
+# — so the caller shows the transcript-specific message.
+_VIDEO_SOURCE_TYPES: frozenset[str] = frozenset({"youtube", "video", "audio"})
 
 # A degraded fetch (no transcript, too long for Whisper, etc.) flags itself
 # with `reason` but may still carry a thin fallback — e.g. a captionless video
