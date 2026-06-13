@@ -35,6 +35,7 @@ from bot.db import (
     LINK_CODE_TTL_SECONDS,
     SAVED_SUGGESTION_STATUSES,
     SUGGESTION_SIGNAL_EVENTS,
+    add_saved_suggestion_source,
     add_subscription,
     create_job,
     create_link_code,
@@ -45,6 +46,7 @@ from bot.db import (
     get_all_items,
     get_item,
     get_job_record,
+    get_saved_suggestion_sources,
     get_saved_suggestions,
     get_subscriptions,
     get_suggestion_signals,
@@ -686,9 +688,35 @@ async def saved_suggestion_create(
 ):
     """Park ("later") a suggestion on the user's Shortlist. Idempotent on
     (user, item, suggestion_index). Ownership-scoped: the item must belong to
-    the user (404 otherwise), so you can't pin against someone else's read."""
+    the user (404 otherwise), so you can't pin against someone else's read.
+
+    Consolidation (#70): a save that closely matches an existing Shortlist
+    entry from a *different* item merges into it — the existing entry gains
+    this item as a source instead of the list gaining a near-duplicate. The
+    response carries `merged: true` + the surviving entry so the client can
+    point at it. Exact re-saves of the same (item, index) keep the original
+    idempotent-refresh path.
+    """
+    from bot.consolidate import find_similar
+
     if not get_item(req.item_id, req.user_id):
         raise HTTPException(status_code=404, detail={"error": "not-found"})
+
+    existing = get_saved_suggestions(req.user_id)
+    own = next(
+        (r for r in existing
+         if r["item_id"] == req.item_id and r["suggestion_index"] == req.suggestion_index),
+        None,
+    )
+    if own is None:
+        match = find_similar(
+            req.title, req.detail,
+            [r for r in existing if r["item_id"] != req.item_id],
+        )
+        if match is not None:
+            add_saved_suggestion_source(match["id"], req.user_id, req.item_id)
+            return {"id": match["id"], "status": match["status"], "merged": True}
+
     saved_id = save_suggestion(
         req.user_id,
         req.item_id,
@@ -705,10 +733,20 @@ async def saved_suggestion_create(
 @router.get("/saved-suggestions")
 async def saved_suggestions_list(user_id: int, _: None = Depends(_require_try_secret)):
     """The user's Shortlist, newest first. Each row carries its source URL and
-    the source item's title (for the back-link) alongside the snapshot."""
+    the source item's title (for the back-link) alongside the snapshot, plus
+    any extra sources a consolidated entry has absorbed (#70)."""
+    extra_sources = get_saved_suggestion_sources(user_id)
     out = []
     for r in get_saved_suggestions(user_id):
         _, item_title = _extract_verdict_and_title(r["item_analysis"])
+        sources = []
+        for s in extra_sources.get(r["id"], []):
+            _, s_title = _extract_verdict_and_title(s["item_analysis"])
+            sources.append({
+                "item_id": s["item_id"],
+                "source": s["source"],
+                "item_title": s_title,
+            })
         out.append({
             "id": r["id"],
             "item_id": r["item_id"],
@@ -723,6 +761,7 @@ async def saved_suggestions_list(user_id: int, _: None = Depends(_require_try_se
             "updated_at": r["updated_at"],
             "source": r["source"],
             "item_title": item_title,
+            "sources": sources,
         })
     return out
 

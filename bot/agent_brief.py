@@ -52,6 +52,7 @@ def build_agent_brief(
     source_title: str = "",
     source_url: str = "",
     summary_excerpt: str = "",
+    extra_sources: list[dict] | None = None,
     variant: str = "full",
 ) -> str:
     """Render one handoff brief as a clean prompt. ``variant`` is "full" or "link".
@@ -82,6 +83,15 @@ def build_agent_brief(
         src.append((source_title or source_url).strip())
     if grounded_in and grounded_in.strip():
         src.append(f"Key point it hinges on: {grounded_in.strip()}")
+    # Consolidated entries (#70): every source that converged on this action,
+    # so the assistant can cross-reference instead of trusting one take.
+    for s in extra_sources or []:
+        title = (s.get("title") or "").strip()
+        url = (s.get("url") or "").strip()
+        if title and url:
+            src.append(f"Also recommended by: {title} — {url}")
+        elif title or url:
+            src.append(f"Also recommended by: {title or url}")
     if variant == "full" and summary_excerpt and summary_excerpt.strip():
         src += ["", "What it says:", _clip_sentence(summary_excerpt, SUMMARY_EXCERPT_CHARS)]
     if src:
