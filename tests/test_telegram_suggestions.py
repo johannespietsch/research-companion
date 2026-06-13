@@ -40,3 +40,34 @@ class TestSuggestionsKeyboard:
         long = {"suggestions": [{"title": "x" * 200, "effort": ""}]}
         kb = _suggestions_keyboard(long, item_id=7)
         assert len(kb.inline_keyboard[0][0].text) <= 60
+
+
+class TestOversizedFileGuard:
+    """Telegram caps bot downloads at 20 MB; oversized audio/video must fail
+    gracefully (issue #8) instead of an unhandled BadRequest."""
+
+    def test_too_big_threshold(self):
+        from bot.handlers import _too_big, _TELEGRAM_MAX_DOWNLOAD_BYTES
+        assert _too_big(_TELEGRAM_MAX_DOWNLOAD_BYTES + 1) is True
+        assert _too_big(_TELEGRAM_MAX_DOWNLOAD_BYTES) is False
+        assert _too_big(None) is False  # unknown size → let the download try
+
+    def test_oversized_audio_replies_and_skips_download(self, monkeypatch):
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+        from bot import handlers
+
+        monkeypatch.setattr(handlers, "get_or_create_user_by_telegram", lambda _id: 1)
+        audio = MagicMock()
+        audio.file_size = 25 * 1024 * 1024
+        audio.get_file = AsyncMock()
+        update = MagicMock()
+        update.effective_user.id = 7
+        update.message.audio = audio
+        update.message.reply_text = AsyncMock()
+
+        asyncio.run(handlers.handle_audio(update, MagicMock()))
+
+        audio.get_file.assert_not_called()  # never attempted the download
+        msg = update.message.reply_text.call_args[0][0]
+        assert "20 MB" in msg and "link" in msg
