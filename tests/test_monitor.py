@@ -87,11 +87,51 @@ class TestResolveFeed:
         assert r["feed_url"] == feed
         assert r["source_kind"] == "youtube"
 
+    def test_youtube_channel_id_via_canonical_link_fallback(self, fake_get):
+        # Markup without "channelId" but with the canonical /channel/ link —
+        # the resolver must still find the id (#65 robustness).
+        from bot.monitor import resolve_feed
+        feed = "https://www.youtube.com/feeds/videos.xml?channel_id=UCabcdefghijklmnopqrstuv"
+        page = ('<html><head><link rel="canonical" '
+                'href="https://www.youtube.com/channel/UCabcdefghijklmnopqrstuv">'
+                '</head></html>')
+        fake_get["https://www.youtube.com/@handleonly"] = page
+        fake_get[feed] = FEED_XML
+        assert resolve_feed("https://www.youtube.com/@handleonly")["feed_url"] == feed
+
     def test_page_without_feed_raises_user_facing_error(self, fake_get):
         from bot.monitor import FeedError, resolve_feed
         fake_get["https://ex.com/nothing"] = HTML_NO_FEED
         with pytest.raises(FeedError, match="No feed found"):
             resolve_feed("https://ex.com/nothing")
+
+
+class TestYouTubeConsentCookie:
+    def test_get_sends_consent_cookie_to_youtube_only(self, monkeypatch):
+        # #65: datacenter IPs hit YouTube's EU consent wall without this cookie,
+        # so the channel page (and its channelId) never loads.
+        from bot import monitor
+        seen = {}
+
+        class _Resp:
+            def __init__(self, url):
+                self.url = url
+                self.content = b"<rss></rss>"
+                self.text = "<rss></rss>"
+            def raise_for_status(self):
+                pass
+
+        def fake_httpx_get(url, **kw):
+            seen[url] = kw.get("headers", {})
+            return _Resp(url)
+
+        monkeypatch.setattr(monitor.httpx, "get", fake_httpx_get)
+        monkeypatch.setattr(monitor, "assert_public_url", lambda u: None)
+
+        monitor._get("https://www.youtube.com/@x")
+        monitor._get("https://blog.example/feed.xml")
+        assert "SOCS" in seen["https://www.youtube.com/@x"].get("Cookie", "")
+        assert "Cookie" not in seen["https://blog.example/feed.xml"]
 
     def test_non_public_target_is_blocked(self):
         # Real SSRF guard, no stub: localhost is rejected before any DNS.
