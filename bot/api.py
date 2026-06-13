@@ -423,6 +423,18 @@ async def user_get(user_id: int, _: None = Depends(_require_try_secret)):
     }
 
 
+@router.get("/users/{user_id}/stats")
+async def user_stats(user_id: int, _: None = Depends(_require_try_secret)):
+    """Value stats for the /me ROI strip (#53): reads filtered, verdict split,
+    estimated minutes not spent on skips, suggestion outcomes — trailing 30
+    days plus all-time. Pure aggregation, no LLM calls."""
+    from bot.stats import build_user_stats
+
+    if not get_user(user_id):
+        raise HTTPException(status_code=404, detail={"error": "not-found"})
+    return build_user_stats(user_id)
+
+
 @router.get("/users/{user_id}/export")
 async def user_export(user_id: int, _: None = Depends(_require_try_secret)):
     """Full data export for a user (GDPR portability). Worker-gated.
