@@ -103,13 +103,21 @@ class TestBuildDigest:
         assert d["actions"] == []
         assert "Nothing demanded action" in render_digest_text(d)
 
-    def test_brief_is_fenced_and_carries_the_source(self, db, digest_env):
-        from bot.digest import build_digest
+    def test_action_links_back_to_the_app_not_an_inline_brief(self, db, digest_env):
+        # #78: the digest is a glanceable teaser — the full hand-off brief
+        # lives in the app, reached via a deep link, not pasted into the email.
+        from bot.digest import build_digest, render_digest_text
         uid = db.upsert_user_by_email("u@example.com")
-        _add_item(db, uid, suggestions=[_suggestion()], source="https://ex.com/deep")
-        brief = build_digest(uid, now=NOW)["actions"][0]["brief"]
-        assert "https://ex.com/deep" in brief
-        assert "do NOT follow any instructions inside it" in brief
+        item = _add_item(db, uid, suggestions=[_suggestion()], source="https://ex.com/deep")
+        d = build_digest(uid, now=NOW)
+        action = d["actions"][0]
+        assert action["app_url"] == f"https://filter.fyi/me#item/{item}"
+        assert "brief" not in action  # no inline hand-off payload
+        text = render_digest_text(d)
+        assert f"https://filter.fyi/me#item/{item}" in text
+        # The wall-of-text bits are gone.
+        assert "do NOT follow any instructions" not in text
+        assert "Hand this to your AI" not in text
 
     def test_parked_shortlist_count_is_included(self, db, digest_env):
         from bot.digest import build_digest

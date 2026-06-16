@@ -30,12 +30,14 @@ from urllib.parse import quote
 
 import httpx
 
-from bot.agent_brief import build_agent_brief
 from bot.analyzer import parse_stored
 
 logger = logging.getLogger(__name__)
 
 MAX_ACTIONS = 3
+# Public app origin for the "open in the app" links that pull readers back to
+# where the full hand-off brief + one-click copy live (#78).
+APP_BASE = "https://filter.fyi"
 # Don't resend if the last digest went out within this window — covers a
 # restart later on send day without blocking next week's slot.
 RESEND_GUARD_DAYS = 6
@@ -105,6 +107,12 @@ def _item_label(analysis: dict, source: str) -> str:
     return label[:120] if label else (source or "untitled")
 
 
+def _app_item_url(item_id: int) -> str:
+    """Deep link to a saved item's detail view in the app, where its full
+    hand-off brief + copy button live."""
+    return f"{APP_BASE}/me#item/{item_id}"
+
+
 def build_digest(user_id: int, *, now: datetime | None = None) -> dict | None:
     """Assemble one user's digest over the trailing 7 days.
 
@@ -149,37 +157,23 @@ def build_digest(user_id: int, *, now: datetime | None = None) -> dict | None:
             "title": (s.get("title") or "Try this").strip(),
             "detail": (s.get("detail") or "").strip(),
             "effort": (s.get("effort") or "").strip(),
-            "first_step": (s.get("first_step") or "").strip(),
-            "grounded_in": (analysis.get("grounded_in") or "").strip(),
-            "source": row["source"],
+            "item_id": row["id"],
             "source_label": _item_label(analysis, row["source"]),
         })
 
+    # Each action is glanceable (#78): title, one-line detail, effort, and a
+    # link back into the app where the full hand-off brief + one-click copy
+    # live. The digest is a teaser that pulls you in, not the payload itself.
     actions = []
     for group in cluster(candidates)[:MAX_ACTIONS]:
         lead = group[0]  # candidates are rank-ordered, so the lead is the best take
-        extra = [
-            {"title": m["source_label"], "url": m["source"]}
-            for m in group[1:]
-        ]
         actions.append({
             "title": lead["title"],
             "detail": lead["detail"],
             "effort": lead["effort"],
-            "first_step": lead["first_step"],
-            "source": lead["source"],
             "source_label": lead["source_label"],
-            "also_from": extra,
-            "brief": build_agent_brief(
-                action=lead["detail"] or lead["title"],
-                first_step=lead["first_step"],
-                grounded_in=lead["grounded_in"],
-                profile=profile,
-                source_title=lead["source_label"],
-                source_url=lead["source"],
-                extra_sources=extra,
-                variant="link",
-            ),
+            "app_url": _app_item_url(lead["item_id"]),
+            "also_count": len(group) - 1,
         })
 
     skipped = [
@@ -224,14 +218,10 @@ def render_digest_text(d: dict) -> str:
             out.append(head)
             if a["detail"]:
                 out.append(f"   {a['detail']}")
-            if a["first_step"]:
-                out.append(f"   First move: {a['first_step']}")
-            out.append(f"   From: {a['source_label']} — {a['source']}")
-            for extra in a.get("also_from") or []:
-                out.append(f"   Also recommended by: {extra['title']} — {extra['url']}")
-            if a["brief"]:
-                out += ["", "   Hand this to your AI (ChatGPT, Claude, Cursor …):", ""]
-                out += ["   | " + line for line in a["brief"].splitlines()]
+            if a.get("also_count"):
+                n = a["also_count"]
+                out.append(f"   backed by {n + 1} of this week's reads")
+            out.append(f"   → open in filter.fyi: {a['app_url']}")
             out.append("")
     else:
         out += ["", "Nothing demanded action this week — staying informed was enough."]
@@ -240,7 +230,7 @@ def render_digest_text(d: dict) -> str:
         out += [f"- {s['label']}" for s in d["skipped"]]
     if d["parked_count"]:
         out += ["", f"Still parked on your shortlist: {d['parked_count']} suggestion"
-                    f"{'s' if d['parked_count'] != 1 else ''} → https://filter.fyi/me#shortlist"]
+                    f"{'s' if d['parked_count'] != 1 else ''} → {APP_BASE}/me#shortlist"]
     out += [
         "",
         "—",
@@ -264,25 +254,18 @@ def render_digest_html(d: dict) -> str:
         parts.append('<p style="font-weight:700;letter-spacing:0.08em;">DO THIS — the week in next steps</p>')
         for a in d["actions"]:
             effort = f" <span style=\"color:#1f7a3a;\">[{esc(a['effort'])}]</span>" if a["effort"] else ""
+            backed = (
+                f"<p style=\"margin:0 0 6px;font-size:12px;color:#5e5e58;\">"
+                f"backed by {a['also_count'] + 1} of this week's reads</p>"
+                if a.get("also_count") else ""
+            )
             parts.append(
                 '<div style="border:1px solid #1f7a3a;background:#dfe8d6;padding:12px;margin:10px 0;">'
                 f"<p style=\"font-weight:700;margin:0 0 6px;\">{esc(a['title'])}{effort}</p>"
-                + (f"<p style=\"margin:0 0 6px;\">{esc(a['detail'])}</p>" if a["detail"] else "")
-                + (f"<p style=\"margin:0 0 6px;\">First move: {esc(a['first_step'])}</p>" if a["first_step"] else "")
-                + f"<p style=\"margin:0 0 6px;font-size:12px;color:#5e5e58;\">From: "
-                  f"<a href=\"{esc(a['source'], quote=True)}\">{esc(a['source_label'])}</a></p>"
-                + "".join(
-                    f"<p style=\"margin:0 0 6px;font-size:12px;color:#5e5e58;\">Also recommended by: "
-                    f"<a href=\"{esc(x['url'], quote=True)}\">{esc(x['title'])}</a></p>"
-                    for x in (a.get("also_from") or [])
-                )
-                + (
-                    "<p style=\"margin:8px 0 4px;font-size:12px;color:#5e5e58;\">"
-                    "Hand this to your AI (ChatGPT, Claude, Cursor …):</p>"
-                    f"<pre style=\"white-space:pre-wrap;border:1px solid #1c1c1a;background:#f7f4ec;"
-                    f"padding:8px;font-size:12px;\">{esc(a['brief'])}</pre>"
-                    if a["brief"] else ""
-                )
+                + (f"<p style=\"margin:0 0 8px;\">{esc(a['detail'])}</p>" if a["detail"] else "")
+                + backed
+                + f"<p style=\"margin:0;\"><a href=\"{esc(a['app_url'], quote=True)}\" "
+                  f"style=\"color:#1f7a3a;font-weight:700;\">→ open in filter.fyi</a></p>"
                 + "</div>"
             )
     else:
@@ -294,7 +277,7 @@ def render_digest_html(d: dict) -> str:
     if d["parked_count"]:
         parts.append(
             f"<p>Still parked on your shortlist: {d['parked_count']} — "
-            '<a href="https://filter.fyi/me#shortlist">review them</a>.</p>'
+            f'<a href="{APP_BASE}/me#shortlist">review them</a>.</p>'
         )
     unsub = esc(unsubscribe_url(d["user_id"]), quote=True)
     parts.append(
