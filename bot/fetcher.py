@@ -407,6 +407,10 @@ def _yt_dlp_transcribe(url: str) -> dict:
         # upload format, so a second high-quality intermediate is pure waste.
         "format": "ba[abr<=64]/ba/b",
         "outtmpl": "audio.%(ext)s",
+        # Safety net for direct-audio URLs whose duration can't be probed: cap
+        # the transient download so a runaway file can't fill the 1 GB box.
+        # ~64 kbps × this ≈ 7 h of audio, well past any real episode.
+        "max_filesize": 200 * 1024 * 1024,
     }
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -675,6 +679,53 @@ def _domain_matches(domain: str, *targets: str) -> bool:
     return any(domain == t or domain.endswith(f".{t}") for t in targets)
 
 
+# Direct audio (podcast) URLs end up here instead of the HTML article path:
+# running trafilatura on audio bytes yields an empty tree and no text (#8).
+# Detection is by file suffix on the URL path — precise and zero-cost. The
+# anchor.fm/podbean style "play" links carry the real .mp3 at the end of the
+# path, so the suffix check catches them too.
+_AUDIO_SUFFIXES = (".mp3", ".m4a", ".aac", ".wav", ".ogg", ".oga", ".opus", ".flac", ".m4b")
+
+
+def _looks_like_audio(url: str) -> bool:
+    try:
+        return urlparse(url).path.lower().endswith(_AUDIO_SUFFIXES)
+    except ValueError:
+        return False
+
+
+def _transcribe_audio_url(url: str, max_whisper_duration: int) -> dict:
+    """Fetch + transcribe a direct audio URL (#8).
+
+    Probes duration first (cheap metadata pass) so a multi-hour episode doesn't
+    silently blow the Whisper budget — mirrors the Vimeo path. Then reuses the
+    yt-dlp audio download + Whisper transcription. yt-dlp handles direct media
+    URLs natively, including the redirect chains podcast CDNs use.
+    """
+    import yt_dlp
+
+    title = url
+    duration = 0
+    try:
+        with yt_dlp.YoutubeDL({"quiet": True, "skip_download": True}) as ydl:
+            info = ydl.extract_info(url, download=False) or {}
+        title = info.get("title") or url
+        duration = int(info.get("duration") or 0)
+    except Exception as e:
+        # Many raw audio files carry no probeable metadata — fall through to
+        # transcription, which the per-download filesize cap still bounds.
+        logger.info("audio duration probe failed for %s: %s", url, e)
+
+    if duration and duration > max_whisper_duration:
+        logger.info("Audio %s: %ds exceeds cap %ds", url, duration, max_whisper_duration)
+        return {"text": title, "title": title, "source_type": "audio",
+                "reason": fetch_errors.VIDEO_TOO_LONG_FOR_WHISPER}
+
+    result = _yt_dlp_transcribe(url)
+    result["source_type"] = "audio"
+    return result
+
+
 async def fetch_url(
     url: str, *, max_whisper_duration: int = WHISPER_MAX_DURATION_ANON_S
 ) -> dict:
@@ -884,6 +935,12 @@ async def _fetch_url_uncached(
     if _domain_matches(domain, "twitter.com", "x.com", "t.co"):
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, _fetch_tweet, url)
+
+    if _looks_like_audio(url):
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None, _transcribe_audio_url, url, max_whisper_duration
+        )
 
     if urlparse(url).path.lower().endswith(".pdf"):
         return await _pdf_fetch(url)

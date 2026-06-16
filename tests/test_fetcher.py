@@ -579,3 +579,56 @@ class TestArticleAcademicWiring:
         monkeypatch.setattr(fetcher, "_generic_fetch", _walled)
         result = asyncio.run(fetcher._fetch_url_uncached("https://nytimes.com/2026/some-story"))
         assert result["reason"] == fetcher.fetch_errors.PAYWALLED
+
+
+class TestDirectAudioUrls:
+    """Direct audio (podcast) URLs route to transcription, not the HTML path (#8)."""
+
+    def test_looks_like_audio_by_suffix(self):
+        from bot.fetcher import _looks_like_audio
+        assert _looks_like_audio("https://cdn.example/ep1.mp3")
+        assert _looks_like_audio("https://cdn.example/ep1.m4a?token=abc")
+        # anchor.fm-style play link carries the real .mp3 at the path's end
+        assert _looks_like_audio(
+            "https://anchor.fm/s/abc/podcast/play/123/"
+            "https%3A%2F%2Fd3.cloudfront.net%2Fstaging%2Fx-44100-2-y.mp3"
+        )
+        assert not _looks_like_audio("https://example.com/article")
+        assert not _looks_like_audio("https://example.com/listen?file=ep.mp3")
+
+    def test_fetch_url_routes_audio_to_transcriber(self, monkeypatch):
+        from bot import fetcher
+        monkeypatch.setattr(fetcher, "assert_public_url", lambda u: None)
+        with patch.object(fetcher, "_transcribe_audio_url") as transcribe, \
+             patch.object(fetcher, "_generic_fetch", new_callable=AsyncMock) as generic:
+            transcribe.return_value = {"text": "Episode\n\nTranscript:\nhello",
+                                       "title": "Episode", "source_type": "audio"}
+            result = asyncio.run(fetcher._fetch_url_uncached("https://cdn.example/ep1.mp3"))
+        transcribe.assert_called_once()
+        generic.assert_not_called()
+        assert result["source_type"] == "audio"
+        assert "hello" in result["text"]
+
+    def test_transcribe_audio_url_skips_whisper_when_too_long(self):
+        from bot import fetcher, fetch_errors
+        with patch("yt_dlp.YoutubeDL") as YDL, \
+             patch.object(fetcher, "_yt_dlp_transcribe") as transcribe:
+            ydl = YDL.return_value.__enter__.return_value
+            ydl.extract_info.return_value = {"title": "Long Pod", "duration": 9000}  # 2.5h
+            result = fetcher._transcribe_audio_url("https://cdn.example/ep.mp3",
+                                                   max_whisper_duration=2 * 3600)
+        transcribe.assert_not_called()
+        assert result["reason"] == fetch_errors.VIDEO_TOO_LONG_FOR_WHISPER
+        assert result["source_type"] == "audio"
+
+    def test_transcribe_audio_url_proceeds_when_duration_unknown(self):
+        from bot import fetcher
+        with patch("yt_dlp.YoutubeDL") as YDL, \
+             patch.object(fetcher, "_yt_dlp_transcribe") as transcribe:
+            ydl = YDL.return_value.__enter__.return_value
+            ydl.extract_info.return_value = {"title": "Pod"}  # no duration
+            transcribe.return_value = {"text": "t", "title": "Pod", "source_type": "video"}
+            result = fetcher._transcribe_audio_url("https://cdn.example/ep.mp3",
+                                                   max_whisper_duration=1800)
+        transcribe.assert_called_once_with("https://cdn.example/ep.mp3")
+        assert result["source_type"] == "audio"  # corrected from transcribe's "video"
