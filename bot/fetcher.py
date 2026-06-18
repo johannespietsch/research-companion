@@ -597,6 +597,19 @@ _PAYWALL_SIGNATURES = (
     "you've reached your",
     "you have reached your",
 )
+# Block / removed / not-found boilerplate that extracts longer than the JS-wall
+# heuristics but is still not real content — most often Reddit pages served to
+# datacenter IPs, which would otherwise be analysed into a meaningless verdict
+# (#67). Matched anywhere in the (short) extracted text.
+_NO_CONTENT_SIGNATURES = (
+    "you've been blocked by network security",
+    "the page you requested does not exist",
+    "this post has been removed",
+    "sorry, this post has been removed",
+    "this community has been banned",
+    "this account has been suspended",
+    "page not found",
+)
 
 
 def _wall_reason(text: str | None) -> str | None:
@@ -613,6 +626,8 @@ def _wall_reason(text: str | None) -> str | None:
             return fetch_errors.JS_REQUIRED
         if any(s in low for s in _PAYWALL_SIGNATURES):
             return fetch_errors.PAYWALLED
+        if any(s in low for s in _NO_CONTENT_SIGNATURES):
+            return fetch_errors.NO_TEXT_EXTRACTED
     if len(clean) < _MIN_ARTICLE_CHARS:
         return fetch_errors.NO_TEXT_EXTRACTED
     return None
@@ -677,6 +692,21 @@ async def _generic_fetch(url: str) -> dict:
 def _domain_matches(domain: str, *targets: str) -> bool:
     """Check if domain equals or is a subdomain of any target."""
     return any(domain == t or domain.endswith(f".{t}") for t in targets)
+
+
+# Reddit's modern www/app pages are a client-rendered JS shell — a plain fetch
+# extracts nothing, so a Reddit link used to either error or (worse) get a
+# meaningless verdict off page chrome (#67). old.reddit.com still serves the
+# real server-rendered post, so we rewrite the host. (Media subdomains
+# i.redd.it / v.redd.it are left alone — they aren't articles.) Reddit also
+# Cloudflare-gates datacenter IPs, so this is best-effort; when it's blocked
+# the fetch surfaces a clean Reddit-specific error rather than a bogus verdict.
+def _to_old_reddit(url: str) -> str:
+    parts = urlparse(url)
+    host = parts.hostname or ""
+    if host in ("www.reddit.com", "reddit.com", "np.reddit.com", "m.reddit.com"):
+        return parts._replace(netloc="old.reddit.com").geturl()
+    return url
 
 
 # Direct audio (podcast) URLs end up here instead of the HTML article path:
@@ -941,6 +971,11 @@ async def _fetch_url_uncached(
         return await loop.run_in_executor(
             None, _transcribe_audio_url, url, max_whisper_duration
         )
+
+    if _domain_matches(domain, "reddit.com"):
+        # Server-rendered old.reddit instead of the www JS shell; same generic
+        # extraction + wall/no-content detection handles the rest.
+        return await _generic_fetch(_to_old_reddit(url))
 
     if urlparse(url).path.lower().endswith(".pdf"):
         return await _pdf_fetch(url)

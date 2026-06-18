@@ -87,8 +87,20 @@ _USER_MESSAGES: dict[str, str] = {
 }
 
 
+# Reddit Cloudflare-gates datacenter fetches and serves a JS-only shell on www,
+# so a generic "couldn't extract" message is misleading (#67). When the failure
+# is on a Reddit URL, say what's actually going on.
+_REDDIT_CONTENT_REASONS = frozenset({NO_TEXT_EXTRACTED, JS_REQUIRED, FETCH_FAILED, RATE_LIMITED})
+_REDDIT_MESSAGE = (
+    "Reddit blocks automated fetches from servers, so we often can't read a "
+    "post's content. Paste the post text directly and I'll analyse it."
+)
+
+
 def user_message(reason: str | None, url: str = "") -> str:
     """Friendly explanation for a fetch failure, with a sensible fallback."""
+    if "reddit.com" in (url or "").lower() and reason in _REDDIT_CONTENT_REASONS:
+        return _REDDIT_MESSAGE
     if reason and reason in _USER_MESSAGES:
         return _USER_MESSAGES[reason]
     if url:
