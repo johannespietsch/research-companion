@@ -632,3 +632,53 @@ class TestDirectAudioUrls:
                                                    max_whisper_duration=1800)
         transcribe.assert_called_once_with("https://cdn.example/ep.mp3")
         assert result["source_type"] == "audio"  # corrected from transcribe's "video"
+
+
+class TestRedditFetch:
+    """Reddit www/app pages are a JS shell; route to old.reddit and never let a
+    blocked/removed page become a verdict (#67)."""
+
+    def test_rewrites_www_to_old_reddit(self):
+        from bot.fetcher import _to_old_reddit
+        assert _to_old_reddit(
+            "https://www.reddit.com/r/x/comments/abc/title/"
+        ) == "https://old.reddit.com/r/x/comments/abc/title/"
+        assert _to_old_reddit("https://reddit.com/r/x/comments/abc/t/") \
+            == "https://old.reddit.com/r/x/comments/abc/t/"
+        # media + already-old hosts are left untouched
+        assert _to_old_reddit("https://i.redd.it/abc.png") == "https://i.redd.it/abc.png"
+        assert _to_old_reddit("https://old.reddit.com/r/x/") == "https://old.reddit.com/r/x/"
+
+    def test_fetch_url_routes_reddit_through_old_host(self, monkeypatch):
+        from bot import fetcher
+        monkeypatch.setattr(fetcher, "assert_public_url", lambda u: None)
+        seen = {}
+
+        async def fake_generic(u):
+            seen["url"] = u
+            return {"text": "real post body " * 30, "title": "Post", "source_type": "article"}
+
+        monkeypatch.setattr(fetcher, "_generic_fetch", fake_generic)
+        result = asyncio.run(
+            fetcher._fetch_url_uncached("https://www.reddit.com/r/x/comments/abc/title/")
+        )
+        assert seen["url"].startswith("https://old.reddit.com/")
+        assert result["text"].startswith("real post body")
+
+    def test_blocked_reddit_page_is_no_content_not_a_verdict(self):
+        # The "blocked / does not exist" boilerplate must read as no-content so
+        # the pipeline errors instead of analysing chrome into a verdict.
+        from bot import fetcher, fetch_errors
+        blocked = "You've been blocked by network security. File a ticket below."
+        removed = "the page you requested does not exist. " + "x " * 100  # > min chars
+        assert fetcher._wall_reason(blocked) == fetch_errors.NO_TEXT_EXTRACTED
+        assert fetcher._wall_reason(removed) == fetch_errors.NO_TEXT_EXTRACTED
+        # a genuine long post is still real content
+        assert fetcher._wall_reason("A substantive discussion. " * 50) is None
+
+    def test_reddit_failure_message_is_specific(self):
+        from bot.fetch_errors import user_message, NO_TEXT_EXTRACTED, JS_REQUIRED
+        msg = user_message(NO_TEXT_EXTRACTED, "https://www.reddit.com/r/x/comments/abc/t/")
+        assert "Reddit" in msg and "paste" in msg.lower()
+        # non-reddit keeps the generic message
+        assert "Reddit" not in user_message(JS_REQUIRED, "https://example.com/a")
