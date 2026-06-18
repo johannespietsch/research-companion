@@ -24,6 +24,10 @@ class UsageContext:
     anon_id: str | None = None
     job_id: str | None = None
     source_type: str = ""
+    # Anon-only: a pre-defined persona key (bot.personas) the visitor picked, so
+    # their first analysis uses that lens instead of DEFAULT_PROFILE. Ignored
+    # for signed-in users — their saved lens always wins (#72).
+    persona: str = ""
 
 
 def _record_usage(
@@ -290,11 +294,18 @@ _OPENAI_JSON_SUFFIX = (
 )
 
 
-def _load_profile(user_id: int | None) -> str:
-    if user_id is None:
-        return DEFAULT_PROFILE
-    from bot.db import get_user_profile
-    return get_user_profile(user_id) or DEFAULT_PROFILE
+def _load_profile(user_id: int | None, persona: str = "") -> str:
+    """Resolve the profile fed to the analyzer.
+
+    Signed-in users always get their own saved lens (persona ignored). Anon
+    users get the persona they picked, if any (#72); otherwise everyone falls
+    back to DEFAULT_PROFILE.
+    """
+    if user_id is not None:
+        from bot.db import get_user_profile
+        return get_user_profile(user_id) or DEFAULT_PROFILE
+    from bot.personas import resolve_anon_profile
+    return resolve_anon_profile(persona) or DEFAULT_PROFILE
 
 
 def _load_signals(user_id: int | None) -> str:
@@ -474,7 +485,7 @@ def analyze(text: str, user_id: int | None = None, *, ctx: UsageContext | None =
     elif ctx.user_id is None and user_id is not None:
         ctx = UsageContext(user_id=user_id, anon_id=ctx.anon_id, job_id=ctx.job_id, source_type=ctx.source_type)
 
-    profile = _load_profile(ctx.user_id)
+    profile = _load_profile(ctx.user_id, ctx.persona)
     signals = _load_signals(ctx.user_id)
     model = _resolve_model("analyze", ctx)
 
