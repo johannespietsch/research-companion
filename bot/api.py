@@ -930,6 +930,9 @@ class _JobRequest(BaseModel):
     # Optional anon UUID from the Worker (anon /api/job traffic). Same purpose
     # as TryRequest.anon_id: per-visitor usage attribution only.
     anon_id: str | None = None
+    # Optional anon persona key (#72) — the lens an anonymous visitor picked.
+    # Ignored for signed-in users (their saved lens wins).
+    persona: str = ""
 
 
 @router.post("/job", status_code=202)
@@ -952,7 +955,8 @@ async def start_job(req: _JobRequest, _: None = Depends(_require_try_secret)):
     create_job(job_id)
 
     task = asyncio.create_task(
-        _run_job(job_id, url, req.user_id, req.user_note, req.anon_id, text=text)
+        _run_job(job_id, url, req.user_id, req.user_note, req.anon_id,
+                 text=text, persona=req.persona)
     )
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
@@ -968,6 +972,7 @@ async def _run_job(
     anon_id: str | None = None,
     *,
     text: str = "",
+    persona: str = "",
 ) -> None:
     """Background task: routes through the unified URL pipeline and stamps
     progress steps for the polling UI. The pipeline does its own progression
@@ -975,7 +980,7 @@ async def _run_job(
     the browser has something to show — finer per-step progress would need
     a callback API on the pipeline, parked as a follow-up."""
     try:
-        ctx = UsageContext(user_id=user_id, anon_id=anon_id, job_id=job_id)
+        ctx = UsageContext(user_id=user_id, anon_id=anon_id, job_id=job_id, persona=persona)
 
         def _on_step(label: str) -> None:
             _job_steps[job_id] = label
