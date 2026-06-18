@@ -24,6 +24,7 @@ from bot.pipeline import (
     ERR_NO_TEXT,
     ERR_NO_TRANSCRIPT,
     PipelineError,
+    analyze_text,
     analyze_url,
 )
 from bot.auth import require_token
@@ -920,7 +921,10 @@ async def library_delete(item_id: int, user_id: int, _: None = Depends(_require_
 
 
 class _JobRequest(BaseModel):
-    url: str
+    # Exactly one of url / text. `text` is the "paste the content directly"
+    # fallback for sources we can't fetch (Reddit, paywalls, JS-only pages).
+    url: str = ""
+    text: str = ""
     user_id: int | None = None
     user_note: str = ""
     # Optional anon UUID from the Worker (anon /api/job traffic). Same purpose
@@ -934,17 +938,22 @@ async def start_job(req: _JobRequest, _: None = Depends(_require_try_secret)):
 
     The Worker calls this instead of /api/try or /api/library/add. The browser
     polls GET /api/job/:id until status → 'done' or 'error'. The background
-    task runs fetch → summarize → analyze(summary) in sequence; for signed-in
-    users it also saves the item to the backend DB.
+    task runs fetch → summarize → analyze (or, for pasted text, summarize →
+    analyze) in sequence; for signed-in users it also saves the item.
     """
+    text = (req.text or "").strip()
     url = (req.url or "").strip()
-    if not _is_http_url(url):
+    # Text takes precedence — it's the explicit "paste it in" fallback. Only
+    # validate the URL when there's no pasted text.
+    if not text and not _is_http_url(url):
         raise HTTPException(status_code=400, detail={"error": "invalid-url"})
 
     job_id = str(uuid.uuid4())
     create_job(job_id)
 
-    task = asyncio.create_task(_run_job(job_id, url, req.user_id, req.user_note, req.anon_id))
+    task = asyncio.create_task(
+        _run_job(job_id, url, req.user_id, req.user_note, req.anon_id, text=text)
+    )
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
 
@@ -957,6 +966,8 @@ async def _run_job(
     user_id: int | None,
     user_note: str,
     anon_id: str | None = None,
+    *,
+    text: str = "",
 ) -> None:
     """Background task: routes through the unified URL pipeline and stamps
     progress steps for the polling UI. The pipeline does its own progression
@@ -970,29 +981,41 @@ async def _run_job(
             _job_steps[job_id] = label
 
         try:
-            result = await analyze_url(
-                url,
-                ctx=ctx,
-                save_for_user_id=user_id,
-                user_note=user_note,
-                on_step=_on_step,
-                # The browser is polling, not holding a 25s request — so queue
-                # for a slot under load instead of shedding immediately. Only
-                # errors as busy if the backlog is still draining after this.
-                capacity_timeout=_JOB_CAPACITY_WAIT_S,
-            )
+            if text:
+                result = await analyze_text(
+                    text,
+                    ctx=ctx,
+                    save_for_user_id=user_id,
+                    user_note=user_note,
+                    on_step=_on_step,
+                    capacity_timeout=_JOB_CAPACITY_WAIT_S,
+                )
+            else:
+                result = await analyze_url(
+                    url,
+                    ctx=ctx,
+                    save_for_user_id=user_id,
+                    user_note=user_note,
+                    on_step=_on_step,
+                    # The browser is polling, not holding a 25s request — so queue
+                    # for a slot under load instead of shedding immediately. Only
+                    # errors as busy if the backlog is still draining after this.
+                    capacity_timeout=_JOB_CAPACITY_WAIT_S,
+                )
         except PipelineError as e:
             set_job_error(job_id, e.code, fetch_error_message(e.fetched.get("reason"), url))
             return
 
         analysis = result.analysis
         verdict = analysis.pop("verdict", "skim")
+        # Pasted text has no source URL; everything else mirrors the URL path.
+        result_url = "" if text else url
         # `content` is the full stored brief, exposed so the result page can
         # show the basis for the verdict. `content_preview` is kept for the
         # Worker's D1 claim path, which stays on a 2k slice to bound row size.
         payload: dict = {
-            "url": url,
-            "title": result.title or url,
+            "url": result_url,
+            "title": result.title or result_url,
             "source_type": result.source_type,
             "image_urls": result.image_urls,
             "content": result.summary,
@@ -1004,7 +1027,7 @@ async def _run_job(
                 user_id=user_id,
                 source_text=result.summary,
                 source_title=result.title,
-                source_url=url,
+                source_url=result_url,
             ),
         }
         if result.saved_id is not None:
