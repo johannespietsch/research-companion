@@ -398,6 +398,53 @@ class TestJobFlow:
         assert "id" not in result
         assert db.get_all_items() == []
 
+    # --- pasted-text path (the "paste it in" fallback) ---
+
+    def test_start_job_accepts_text_without_url(self, client, auth_headers):
+        r = client.post("/api/job",
+                        json={"text": "A pasted reddit post about benchmarks."},
+                        headers=auth_headers)
+        assert r.status_code == 202
+        assert isinstance(r.json().get("job_id"), str)
+
+    def test_start_job_rejects_empty_text_and_url(self, client, auth_headers):
+        r = client.post("/api/job", json={"text": "   "}, headers=auth_headers)
+        assert r.status_code == 400
+
+    def test_run_job_text_completes_without_fetching(self, client, db, monkeypatch):
+        import asyncio
+        import json
+        import bot.pipeline
+
+        async def boom(*a, **k):
+            raise AssertionError("text job must not fetch")
+        monkeypatch.setattr(bot.pipeline, "fetch_url", boom)
+
+        import bot.api
+        db.create_job("job-text")
+        asyncio.run(bot.api._run_job("job-text", "", None, "", text="Gemini-SQL2 post\n\nbody"))
+
+        rec = db.get_job_record("job-text")
+        assert rec["status"] == "done"
+        result = json.loads(rec["result"])
+        assert result["verdict"] == "watch"
+        assert result["url"] == ""              # no source URL for pasted text
+        assert result["title"] == "Gemini-SQL2 post"
+        assert result["source_type"] == "text"
+
+    def test_run_job_text_signed_in_saves_item(self, client, db, auth_headers):
+        import asyncio
+        import bot.api
+
+        uid = client.post("/api/users/upsert", json={"email": "t@b.com"},
+                          headers=auth_headers).json()["user_id"]
+        db.create_job("job-text2")
+        asyncio.run(bot.api._run_job("job-text2", "", uid, "", text="pasted body"))
+
+        items = db.get_all_items(uid)
+        assert len(items) == 1
+        assert items[0]["source"] == "" and items[0]["source_type"] == "text"
+
     def test_run_job_done_payload_exposes_full_summary(self, client, db):
         # The result page renders the full stored brief in a "what we read"
         # disclosure, so the done payload must carry `content` alongside the

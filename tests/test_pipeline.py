@@ -416,3 +416,60 @@ class TestCapacityGuard:
             pipeline.analyze_url("https://example.com", ctx=UsageContext())
         )
         assert result.analysis["verdict"] == "watch"
+
+
+class TestAnalyzeText:
+    """The fetch-less sibling for the web 'paste text' fallback (Reddit etc.)."""
+
+    def test_summarizes_and_analyzes_without_fetching(self, pipeline, monkeypatch):
+        from bot.analyzer import UsageContext
+        # If fetch_url is touched, fail loudly — text must skip it entirely.
+        async def boom(*a, **k):
+            raise AssertionError("analyze_text must not fetch")
+        monkeypatch.setattr(pipeline, "fetch_url", boom)
+        result = asyncio.run(pipeline.analyze_text(
+            "A pasted reddit post about text-to-SQL benchmarks.", ctx=UsageContext()
+        ))
+        assert result.source_type == "text"
+        assert result.summary.startswith("SUMMARY(")
+        assert result.analysis["verdict"] == "watch"
+
+    def test_title_derived_from_first_line(self, pipeline):
+        from bot.analyzer import UsageContext
+        result = asyncio.run(pipeline.analyze_text(
+            "Gemini-SQL2 breakthrough\n\nbody text here", ctx=UsageContext()
+        ))
+        assert result.title == "Gemini-SQL2 breakthrough"
+
+    def test_explicit_title_wins(self, pipeline):
+        from bot.analyzer import UsageContext
+        result = asyncio.run(pipeline.analyze_text(
+            "body", ctx=UsageContext(), title="My title"
+        ))
+        assert result.title == "My title"
+
+    def test_empty_text_raises_no_text(self, pipeline):
+        from bot.analyzer import UsageContext
+        from bot.pipeline import ERR_NO_TEXT, PipelineError
+        with pytest.raises(PipelineError) as ei:
+            asyncio.run(pipeline.analyze_text("   ", ctx=UsageContext()))
+        assert ei.value.code == ERR_NO_TEXT
+
+    def test_signed_in_saves_with_no_source_url(self, pipeline, db):
+        from bot.analyzer import UsageContext
+        uid = db.get_or_create_user_by_telegram(1)
+        result = asyncio.run(pipeline.analyze_text(
+            "pasted body", ctx=UsageContext(user_id=uid), save_for_user_id=uid,
+        ))
+        assert result.saved_id is not None
+        row = db.get_all_items(uid)[0]
+        assert row["source"] == ""           # no URL for pasted text
+        assert row["source_type"] == "text"
+
+    def test_anonymous_does_not_save(self, pipeline, db):
+        from bot.analyzer import UsageContext
+        result = asyncio.run(pipeline.analyze_text(
+            "pasted body", ctx=UsageContext(anon_id="anon-1"),
+        ))
+        assert result.saved_id is None
+        assert db.get_all_items(None) == []

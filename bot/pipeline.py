@@ -42,6 +42,7 @@ from bot.analyzer import (
     to_json_str,
 )
 from bot.concurrency import CapacityError, heavy
+from bot.config import MAX_CONTENT_CHARS
 from bot.db import record_processed_url, save_item
 from bot.fetcher import fetch_url, whisper_cap_for
 
@@ -269,6 +270,105 @@ async def analyze_url(
             status=audit_status,
             error_code=audit_error_code,
             transcript_source=fetched.get("transcript_source") or "",
+            latency_ms=int((time.monotonic() - started) * 1000),
+        )
+
+
+def title_from_text(text: str) -> str:
+    """A short, human title for pasted text: its first non-empty line, clipped.
+    Falls back to a generic label so the result card never shows a blank."""
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if line:
+            return line[:80] + ("…" if len(line) > 80 else "")
+    return "Pasted text"
+
+
+async def analyze_text(
+    text: str,
+    *,
+    ctx: UsageContext,
+    title: str = "",
+    save_for_user_id: int | None = None,
+    user_note: str = "",
+    on_step: Optional[Callable[[str], None]] = None,
+    capacity_timeout: float | None = None,
+) -> PipelineResult:
+    """Analyse pasted/raw text directly — the fetch-less sibling of
+    ``analyze_url``. Powers the web "paste text" fallback for sources we can't
+    fetch (Reddit, paywalls, JS-only pages). Skips the fetch + image steps;
+    runs the same summarise → analyse → (optional) save chain under the shared
+    capacity slot and writes the same audit row.
+    """
+    def _step(label: str) -> None:
+        if on_step is not None:
+            try:
+                on_step(label)
+            except Exception:
+                logger.exception("pipeline on_step callback raised; ignoring")
+
+    text = (text or "").strip()[:MAX_CONTENT_CHARS]
+    if not text:
+        raise PipelineError(ERR_NO_TEXT)
+
+    source_type = "text"
+    if not ctx.source_type:
+        ctx.source_type = source_type
+    title = (title or "").strip() or title_from_text(text)
+
+    try:
+        await heavy.acquire(capacity_timeout)
+    except CapacityError:
+        raise PipelineError(ERR_BUSY, message="Service is busy; please try again in a few seconds.")
+
+    started = time.monotonic()
+    fetched: dict = {"title": title, "source_type": source_type, "text": text}
+    audit_status = "ok"
+    audit_error_code = ""
+    try:
+        _step("summarizing")
+        loop = asyncio.get_running_loop()
+        summary = await loop.run_in_executor(None, lambda: summarize_content(text, ctx=ctx))
+
+        _step("analyzing")
+        try:
+            analysis = await loop.run_in_executor(None, lambda: analyze(summary, ctx=ctx))
+        except Exception as e:
+            logger.exception("pipeline: analyze crashed for pasted text")
+            raise PipelineError(ERR_ANALYZE_FAILED, fetched=fetched, message=str(e))
+
+        saved_id: int | None = None
+        if save_for_user_id is not None:
+            saved_id = save_item(
+                user_id=save_for_user_id,
+                source_type=source_type,
+                source="",  # no URL — it's pasted text
+                content=summary,
+                analysis=to_json_str(analysis),
+                user_note=user_note,
+            )
+
+        return PipelineResult(
+            fetched=fetched, summary=summary, analysis=analysis, saved_id=saved_id,
+        )
+    except PipelineError as e:
+        if e.fetched:
+            fetched = e.fetched
+        audit_status = "error"
+        audit_error_code = e.code
+        raise
+    finally:
+        heavy.release()
+        record_processed_url(
+            url="(pasted text)",
+            title=title,
+            source_type=source_type,
+            user_id=ctx.user_id,
+            anon_id=ctx.anon_id,
+            job_id=ctx.job_id,
+            status=audit_status,
+            error_code=audit_error_code,
+            transcript_source="",
             latency_ms=int((time.monotonic() - started) * 1000),
         )
 
