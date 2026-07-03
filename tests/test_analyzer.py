@@ -23,6 +23,49 @@ class TestSummarizeContent:
         out = analyzer.summarize_content("x" * (analyzer.SUMMARY_MAX_CHARS + 5000))
         assert out == "x" * analyzer.SUMMARY_MAX_CHARS
 
+    def test_uses_streaming_on_anthropic(self, monkeypatch):
+        """Long-transcript briefs request a large max_tokens, which the Anthropic
+        SDK refuses on a *non-streaming* call ("Streaming is required for
+        operations that may take longer than 10 minutes"). Summaries must go
+        through `messages.stream()` so that guard never fires and silently
+        drops us to the truncated-transcript fallback."""
+        from bot import analyzer
+
+        class _Block:
+            type = "text"
+            text = "CURATED BRIEF"
+
+        class _FinalMessage:
+            content = [_Block()]
+            stop_reason = "end_turn"
+            usage = type("U", (), {"input_tokens": 12, "output_tokens": 3})()
+
+        class _StreamCtx:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def get_final_message(self):
+                return _FinalMessage()
+
+        class _Messages:
+            def stream(self, **kwargs):
+                return _StreamCtx()
+
+            def create(self, **kwargs):  # pragma: no cover - must not be hit
+                raise AssertionError("summarize_content must stream, not create")
+
+        class _Client:
+            messages = _Messages()
+
+        monkeypatch.setattr(analyzer, "_PROVIDER", "anthropic")
+        monkeypatch.setattr(analyzer, "_get_client", lambda: _Client())
+
+        out = analyzer.summarize_content("some long transcript text")
+        assert out == "CURATED BRIEF"
+
     def test_output_tokens_scale_with_input(self):
         from bot import analyzer
 
