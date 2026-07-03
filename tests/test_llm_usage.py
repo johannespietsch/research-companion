@@ -256,8 +256,9 @@ class TestResultCache:
         monkeypatch.setattr(analyzer, "_PREMIUM_MODEL", "claude-haiku-4-5-20251001")
 
         # First call: model raises → fallback returns truncated text.
+        # summarize_content streams, so the failure must come from stream().
         class Boom:
-            messages = SimpleNamespace(create=lambda **kw: (_ for _ in ()).throw(RuntimeError("rate-limited")))
+            messages = SimpleNamespace(stream=lambda **kw: (_ for _ in ()).throw(RuntimeError("rate-limited")))
         monkeypatch.setattr(analyzer, "_get_client", lambda: Boom())
         result1 = analyzer.summarize_content("x" * 200)
         assert result1.startswith("x")  # fallback truncation
@@ -377,9 +378,25 @@ class _FakeAnthropic:
             content = [SimpleNamespace(type="text", text=text or "")]
         resp = SimpleNamespace(
             content=content,
+            stop_reason="end_turn",
             usage=SimpleNamespace(input_tokens=input_tokens, output_tokens=output_tokens),
         )
-        self.messages = SimpleNamespace(create=lambda **kw: resp)
+
+        # `summarize_content` streams (see analyzer.py); expose a context-manager
+        # `stream()` whose get_final_message() returns the same resp. `analyze`
+        # still uses the non-streaming `create()`.
+        class _Stream:
+            def __enter__(self_inner):
+                return self_inner
+            def __exit__(self_inner, *exc):
+                return False
+            def get_final_message(self_inner):
+                return resp
+
+        self.messages = SimpleNamespace(
+            create=lambda **kw: resp,
+            stream=lambda **kw: _Stream(),
+        )
 
 
 class _FakeOpenAI:

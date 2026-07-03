@@ -669,11 +669,20 @@ def summarize_content(
     try:
         client = _get_client()
         if _PROVIDER == "anthropic":
-            resp = client.messages.create(
+            # Stream the summary rather than blocking on one response. The SDK
+            # rejects a *non-streaming* request whose `max_tokens` implies a
+            # >10-minute worst case — which long-transcript briefs routinely
+            # trip, since `_summary_output_tokens` scales the budget up to 32k
+            # (fails instantly, latency 0, before any network call → the brief
+            # silently degraded to the truncated-transcript fallback). Streaming
+            # keeps the socket open incrementally; the model still stops at
+            # end_turn when the brief is done, so real latency is unchanged.
+            with client.messages.stream(
                 model=model,
                 max_tokens=max_tokens,
                 messages=[{"role": "user", "content": prompt}],
-            )
+            ) as stream:
+                resp = stream.get_final_message()
             in_tok, out_tok = _anthropic_tokens(resp)
             stop_reason = getattr(resp, "stop_reason", None)
             out = "".join(
