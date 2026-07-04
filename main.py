@@ -218,7 +218,10 @@ async def lifespan(app: FastAPI):
         maintenance_tasks.append(asyncio.create_task(_monitor_loop()))
         logger.info("Channel monitor enabled (interval=%ds)", _MONITOR_INTERVAL_S)
 
-    yield
+    # The MCP transport's session manager must run for the app's lifetime —
+    # entering it here ties its task group to FastAPI's lifespan.
+    async with mcp.session_manager.run():
+        yield
 
     for task in maintenance_tasks:
         task.cancel()
@@ -238,9 +241,14 @@ app = FastAPI(lifespan=lifespan)
 
 from bot.api import router as api_router  # noqa: E402
 from bot.admin import router as admin_router  # noqa: E402
+from bot.mcp_server import build_mcp_asgi_app, mcp  # noqa: E402
 
 app.include_router(api_router)
 app.include_router(admin_router)
+
+# MCP (Streamable HTTP) — filter.fyi as a tool inside Claude/Cursor/any agent.
+# Bearer-authenticated per user; see bot/mcp_server.py.
+app.mount("/mcp", build_mcp_asgi_app())
 
 _STATIC_DIR = Path(__file__).parent / "bot" / "static"
 
