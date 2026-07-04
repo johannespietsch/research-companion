@@ -12,9 +12,32 @@ class TestResolve:
     def test_known_keys_return_their_profile(self):
         from bot.personas import ANON_PERSONA_KEYS, resolve_anon_profile
         assert ANON_PERSONA_KEYS == {"leader", "explorer", "builder"}
-        assert "decision-maker" in resolve_anon_profile("leader").lower()
-        assert "not technical" in resolve_anon_profile("explorer").lower()
-        assert "code" in resolve_anon_profile("builder").lower()
+        leader = resolve_anon_profile("leader").lower()
+        explorer = resolve_anon_profile("explorer").lower()
+        builder = resolve_anon_profile("builder").lower()
+        # Each captures a posture (decide / ease-in / do), not a topic.
+        assert "decision-maker" in leader
+        assert "low-pressure" in explorer
+        assert "hands-on" in builder
+
+    def test_personas_are_topic_agnostic(self):
+        """The lenses must work whatever the reader filters (markets, learning,
+        a hobby), not just AI — so the prompts describe posture, not subject."""
+        from bot.personas import ANON_PERSONAS
+        leader = ANON_PERSONAS["leader"].lower()
+        # leader tailors to decisions "whatever the topic", not AI adoption.
+        assert "whatever the topic" in leader
+        assert "ai adoption" not in leader
+
+    def test_builder_is_not_code_only(self):
+        """Regression for the "Get hands-on" relabel: the builder lens must
+        still land for non-coders (a trader's backtest, a learner's drill) and
+        not assume the reader writes code."""
+        from bot.personas import resolve_anon_profile
+        builder = resolve_anon_profile("builder").lower()
+        # Offers a non-technical hands-on path, not only code.
+        assert "when it isn't" in builder
+        assert "assume they can read code" not in builder
 
     def test_unknown_or_empty_is_none(self):
         from bot.personas import resolve_anon_profile
@@ -74,7 +97,7 @@ class TestAnalyzerIntegration:
         analyzer, prompts = self._fake(monkeypatch)
         analyzer.analyze("content", ctx=analyzer.UsageContext(persona="leader"))
         assert "decision-maker" in prompts[0].lower()
-        assert "do not write code" in prompts[0].lower()
+        assert "skip step-by-step implementation" in prompts[0].lower()
 
     def test_cache_key_differs_by_persona(self, db):
         from bot import analyzer
