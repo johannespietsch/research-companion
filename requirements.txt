@@ -25,5 +25,7 @@ feedparser>=6.0.0
 pyjwt[crypto]>=2.8.0
 # web UI file uploads
 python-multipart>=0.0.9
+# MCP server (/mcp, Streamable HTTP) — filter.fyi as a tool for AI agents
+mcp>=1.13.0
 # tests
 pytest>=8.0.0
