@@ -570,10 +570,17 @@ async def library_delete(item_id: int, user_id: int, _: None = Depends(_require_
     delete_item(item_id, user_id)
 
 
+_SOCIAL_DOMAINS = {"linkedin.com", "twitter.com", "x.com", "instagram.com"}
+
+
 class _JobRequest(BaseModel):
     url: str
     user_id: int | None = None
     user_note: str = ""
+    # Bookmarklet path: content extracted client-side in the user's browser.
+    # When present, fetch_url is skipped and this text is analysed directly.
+    content: str | None = None
+    title: str = ""
 
 
 @router.post("/job", status_code=202)
@@ -584,6 +591,9 @@ async def start_job(req: _JobRequest, _: None = Depends(_require_try_secret)):
     polls GET /api/job/:id until status → 'done' or 'error'. The background
     task runs fetch → summarize → analyze(summary) in sequence; for signed-in
     users it also saves the item to the backend DB.
+
+    When `content` is provided (bookmarklet flow), the fetch step is skipped
+    and the supplied text is used directly.
     """
     url = (req.url or "").strip()
     if not _is_http_url(url):
@@ -592,26 +602,46 @@ async def start_job(req: _JobRequest, _: None = Depends(_require_try_secret)):
     job_id = str(uuid.uuid4())
     create_job(job_id)
 
-    task = asyncio.create_task(_run_job(job_id, url, req.user_id, req.user_note))
+    task = asyncio.create_task(
+        _run_job(job_id, url, req.user_id, req.user_note, req.content, req.title)
+    )
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
 
     return {"job_id": job_id}
 
 
-async def _run_job(job_id: str, url: str, user_id: int | None, user_note: str) -> None:
+async def _run_job(
+    job_id: str,
+    url: str,
+    user_id: int | None,
+    user_note: str,
+    prefetched_content: str | None = None,
+    prefetched_title: str = "",
+) -> None:
     """Background task: fetch → summarize → analyze(summary) → optionally save."""
     try:
-        _job_steps[job_id] = "fetching"
-        try:
-            fetched = await fetch_url(url)
-        except Exception:
-            logger.exception("job %s: fetch_url crashed for %s", job_id, url)
-            set_job_error(job_id, "fetch-failed")
-            return
+        if prefetched_content is not None:
+            # Bookmarklet path: content was captured in the user's browser session,
+            # so they were already authenticated on the source site.
+            text = prefetched_content[:MAX_CONTENT_CHARS]
+            netloc = urlparse(url).netloc.lower().lstrip("www.")
+            source_type = "social" if any(d in netloc for d in _SOCIAL_DOMAINS) else "article"
+            item_title = prefetched_title or url
+            image_urls: list = []
+        else:
+            _job_steps[job_id] = "fetching"
+            try:
+                fetched = await fetch_url(url)
+            except Exception:
+                logger.exception("job %s: fetch_url crashed for %s", job_id, url)
+                set_job_error(job_id, "fetch-failed")
+                return
 
-        text = (fetched.get("text") or "").strip()
-        source_type = fetched.get("source_type") or "article"
+            text = (fetched.get("text") or "").strip()
+            source_type = fetched.get("source_type") or "article"
+            item_title = fetched.get("title") or url
+            image_urls = fetched.get("image_urls") or []
 
         if not text:
             if source_type in _VIDEO_SOURCE_TYPES:
@@ -653,9 +683,9 @@ async def _run_job(job_id: str, url: str, user_id: int | None, user_note: str) -
         verdict = analysis.pop("verdict", "skim")
         result: dict = {
             "url": url,
-            "title": fetched.get("title") or url,
+            "title": item_title,
             "source_type": source_type,
-            "image_urls": fetched.get("image_urls") or [],
+            "image_urls": image_urls,
             "content_preview": summary[:TRY_PREVIEW_CHARS],
             "verdict": verdict,
             "analysis": analysis,
