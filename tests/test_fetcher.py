@@ -263,6 +263,191 @@ class TestYouTubeFallbackChain:
         assert result["text"] == ""
 
 
+VIMEO_URL = "https://vimeo.com/76979871"
+
+
+class TestVimeoIdExtraction:
+    def test_plain_url(self):
+        from bot import fetcher
+        assert fetcher._vimeo_id_and_hash(VIMEO_URL) == ("76979871", None)
+
+    def test_unlisted_url_with_hash(self):
+        from bot import fetcher
+        assert fetcher._vimeo_id_and_hash("https://vimeo.com/76979871/abcdef0123") == (
+            "76979871", "abcdef0123",
+        )
+
+    def test_channel_url(self):
+        from bot import fetcher
+        assert fetcher._vimeo_id_and_hash("https://vimeo.com/channels/staffpicks/76979871") == (
+            "76979871", None,
+        )
+
+    def test_player_embed_url(self):
+        from bot import fetcher
+        assert fetcher._vimeo_id_and_hash("https://player.vimeo.com/video/76979871") == (
+            "76979871", None,
+        )
+
+    def test_non_vimeo_url_returns_none(self):
+        from bot import fetcher
+        assert fetcher._vimeo_id_and_hash("https://example.com/path") is None
+
+
+class TestVimeoFallbackChain:
+    """The chain (highest-quality first → cheapest-degraded last):
+      Vimeo native caption track (no duration limit)
+        → yt-dlp subtitles
+        → yt-dlp audio + Whisper (only for short videos)
+        → description-only
+    """
+
+    def _config(self, *, tracks=None, duration=90, title="A Vimeo Video"):
+        return {
+            "video": {"title": title, "duration": duration, "thumbs": {"640": "https://i.vimeocdn.com/thumb.jpg"}},
+            "request": {"text_tracks": tracks or []},
+        }
+
+    def test_uses_native_captions_when_available(self):
+        from bot import fetcher
+
+        config = self._config(tracks=[{"lang": "en", "url": "/texttrack/123.vtt"}])
+        vtt_resp = MagicMock(text="WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nhello world")
+        vtt_resp.raise_for_status.return_value = None
+
+        with patch.object(fetcher, "_vimeo_config", return_value=config), \
+             patch.object(fetcher.requests, "get", return_value=vtt_resp) as get, \
+             patch.object(fetcher, "_yt_dlp_extract") as extract:
+            result = fetcher._vimeo_transcript(VIMEO_URL)
+
+        extract.assert_not_called()
+        assert "hello world" in result["text"]
+        assert result["source_type"] == "video"
+        assert result["transcript_source"] == "vimeo"
+        assert result["language"] == "en"
+        assert result["title"] == "A Vimeo Video"
+        assert any("i.vimeocdn.com" in u for u in result["image_urls"])
+        get.assert_called_once_with("https://player.vimeo.com/texttrack/123.vtt", timeout=15)
+
+    def test_native_captions_bypass_whisper_duration_cap(self):
+        """A long video (over max_whisper_duration) with native captions still
+        gets a full transcript — the whole point of using Vimeo's own caption
+        API instead of yt-dlp/Whisper for long-form videos (#101)."""
+        from bot import fetcher
+
+        config = self._config(
+            tracks=[{"lang": "en", "url": "/texttrack/123.vtt"}], duration=12_000,  # ~3.3h
+        )
+        vtt_resp = MagicMock(text="WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nlong talk content")
+        vtt_resp.raise_for_status.return_value = None
+
+        with patch.object(fetcher, "_vimeo_config", return_value=config), \
+             patch.object(fetcher.requests, "get", return_value=vtt_resp), \
+             patch.object(fetcher, "_yt_dlp_transcribe") as transcribe:
+            result = fetcher._vimeo_transcript(VIMEO_URL, max_whisper_duration=10 * 60)
+
+        transcribe.assert_not_called()
+        assert "long talk content" in result["text"]
+        assert "reason" not in result
+
+    def test_falls_back_to_yt_dlp_when_no_native_captions(self):
+        from bot import fetcher
+
+        config = self._config(tracks=[])
+
+        with patch.object(fetcher, "_vimeo_config", return_value=config), \
+             patch.object(fetcher, "_yt_dlp_extract") as extract, \
+             patch.object(fetcher, "_yt_dlp_transcribe") as transcribe:
+            extract.return_value = {
+                "text": "Title\nBy: ch\n\nTranscript:\nsubs body",
+                "title": "Title",
+                "source_type": "video",
+                "has_transcript": True,
+                "duration": 90,
+            }
+            result = fetcher._vimeo_transcript(VIMEO_URL)
+
+        assert "subs body" in result["text"]
+        transcribe.assert_not_called()
+
+    def test_falls_back_when_vimeo_config_unavailable(self):
+        from bot import fetcher
+
+        with patch.object(fetcher, "_vimeo_config", return_value=None), \
+             patch.object(fetcher, "_yt_dlp_extract") as extract, \
+             patch.object(fetcher, "_yt_dlp_transcribe") as transcribe:
+            extract.return_value = {
+                "text": "Title\nBy: ch\n\nTranscript:\nsubs body",
+                "title": "Title",
+                "source_type": "video",
+                "has_transcript": True,
+                "duration": 90,
+            }
+            result = fetcher._vimeo_transcript(VIMEO_URL)
+
+        assert "subs body" in result["text"]
+
+    def test_falls_back_to_whisper_for_short_video_without_subs(self):
+        from bot import fetcher
+
+        with patch.object(fetcher, "_vimeo_config", return_value=None), \
+             patch.object(fetcher, "_yt_dlp_extract") as extract, \
+             patch.object(fetcher, "_yt_dlp_transcribe") as transcribe:
+            extract.return_value = {
+                "text": "Title\nBy: ch\n\nshort description",
+                "title": "Title",
+                "source_type": "video",
+                "has_transcript": False,
+                "duration": 90,
+            }
+            transcribe.return_value = {
+                "text": "Title\nBy: ch\n\nTranscript:\nspoken words",
+                "title": "Title",
+                "source_type": "video",
+            }
+            result = fetcher._vimeo_transcript(VIMEO_URL)
+
+        transcribe.assert_called_once_with(VIMEO_URL)
+        assert "spoken words" in result["text"]
+        assert result["transcript_source"] == "whisper"
+
+    def test_skips_whisper_when_duration_exceeds_cap_and_no_captions(self):
+        from bot import fetcher, fetch_errors
+
+        with patch.object(fetcher, "_vimeo_config", return_value=None), \
+             patch.object(fetcher, "_yt_dlp_extract") as extract, \
+             patch.object(fetcher, "_yt_dlp_transcribe") as transcribe:
+            extract.return_value = {
+                "text": "Title\nBy: ch\n\nlong description",
+                "title": "Title",
+                "source_type": "video",
+                "has_transcript": False,
+                "duration": 1200,
+            }
+            result = fetcher._vimeo_transcript(VIMEO_URL, max_whisper_duration=10 * 60)
+
+        transcribe.assert_not_called()
+        assert result["reason"] == fetch_errors.VIDEO_TOO_LONG_FOR_WHISPER
+
+    def test_propagates_empty_extract_without_calling_whisper(self):
+        from bot import fetcher
+
+        with patch.object(fetcher, "_vimeo_config", return_value=None), \
+             patch.object(fetcher, "_yt_dlp_extract") as extract, \
+             patch.object(fetcher, "_yt_dlp_transcribe") as transcribe:
+            extract.return_value = {
+                "text": "",
+                "title": VIMEO_URL,
+                "source_type": "unknown",
+                "has_transcript": False,
+                "duration": 0,
+            }
+            result = fetcher._vimeo_transcript(VIMEO_URL)
+
+        transcribe.assert_not_called()
+        assert result["text"] == ""
+
+
 class TestWallDetection:
     """_wall_reason flags JS/ad-block walls and paywall teasers that return
     short boilerplate instead of article text."""

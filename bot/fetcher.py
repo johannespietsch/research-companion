@@ -4,7 +4,7 @@ import logging
 import re
 from functools import lru_cache
 from pathlib import Path
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import quote, unquote, urljoin, urlparse
 
 import httpx
 import requests
@@ -172,6 +172,133 @@ def _youtube_transcript(url: str, max_whisper_duration: int = WHISPER_MAX_DURATI
     return extract
 
 
+_VIMEO_HASH_RE = re.compile(r"^[0-9a-f]{8,}$", re.IGNORECASE)
+
+
+def _vimeo_id_and_hash(url: str) -> tuple[str, str | None] | None:
+    """Pull the numeric video id (and, for unlisted videos, the trailing hash)
+    out of any Vimeo URL shape: vimeo.com/123, vimeo.com/123/abcdef0123,
+    vimeo.com/channels/x/123, player.vimeo.com/video/123, etc."""
+    segments = [s for s in urlparse(url).path.split("/") if s]
+    for i, seg in enumerate(segments):
+        if seg.isdigit() and len(seg) >= 6:
+            video_hash = None
+            if i + 1 < len(segments) and _VIMEO_HASH_RE.match(segments[i + 1]):
+                video_hash = segments[i + 1]
+            return seg, video_hash
+    return None
+
+
+def _vimeo_config(video_id: str, video_hash: str | None) -> dict | None:
+    """Fetch Vimeo's own player config for a video (public, unauthenticated —
+    the same JSON the embedded player itself loads)."""
+    try:
+        resp = requests.get(
+            f"https://player.vimeo.com/video/{video_id}/config",
+            params={"h": video_hash} if video_hash else {},
+            timeout=10,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+                "Referer": "https://vimeo.com/",
+            },
+        )
+        if resp.status_code != 200:
+            return None
+        return resp.json()
+    except Exception as e:
+        logger.info(f"Vimeo config fetch failed for {video_id}: {e}")
+        return None
+
+
+def _select_vimeo_track(tracks: list[dict]) -> dict | None:
+    english = next((t for t in tracks if (t.get("lang") or "").lower().startswith("en")), None)
+    return english or (tracks[0] if tracks else None)
+
+
+def _vimeo_native_transcript(config: dict, video_id: str) -> dict | None:
+    """Try Vimeo's own caption track (same JSON the embedded player loads) —
+    a cheap HTTP fetch that works regardless of video length, unlike the
+    yt-dlp + Whisper fallback which is bounded by max_whisper_duration. This is
+    what makes long-form Vimeo videos with captions transcribable at all (#101)."""
+    video_meta = config.get("video") or {}
+    tracks = ((config.get("request") or {}).get("text_tracks")) or []
+    track = _select_vimeo_track(tracks)
+    if not track or not track.get("url"):
+        return None
+
+    try:
+        vtt_url = urljoin("https://player.vimeo.com/", track["url"])
+        resp = requests.get(vtt_url, timeout=15)
+        resp.raise_for_status()
+        text = _vtt_to_text(resp.text)
+    except Exception as e:
+        logger.info(f"Vimeo caption download failed for {video_id}: {e}")
+        return None
+
+    if not text:
+        return None
+
+    title = video_meta.get("title") or f"Vimeo video ({video_id})"
+    thumbs = video_meta.get("thumbs") or {}
+    image_urls = [thumbs[max(thumbs, key=lambda k: int(k) if k.isdigit() else 0)]] if thumbs else []
+    return {
+        "text": f"{title}\n\nTranscript:\n{text}"[:MAX_CONTENT_CHARS],
+        "title": title,
+        "source_type": "video",
+        "image_urls": image_urls,
+        "language": track.get("lang"),
+        "duration": int(video_meta.get("duration") or 0),
+        "transcript_source": "vimeo",
+    }
+
+
+def _vimeo_transcript(url: str, max_whisper_duration: int = WHISPER_MAX_DURATION_ANON_S) -> dict:
+    """Vimeo counterpart to `_youtube_transcript`: try Vimeo's own caption
+    track first (cheap, no duration limit), then fall back to yt-dlp
+    metadata/subtitles, then Whisper for captionless videos short enough to
+    fit the caller's tier."""
+    ids = _vimeo_id_and_hash(url)
+    if ids:
+        video_id, video_hash = ids
+        config = _vimeo_config(video_id, video_hash)
+        if config:
+            native = _vimeo_native_transcript(config, video_id)
+            if native:
+                return native
+        logger.info(f"No native captions for Vimeo {video_id}, falling back to yt-dlp")
+
+    extract = _yt_dlp_extract(url)
+    if extract.get("has_transcript"):
+        extract.setdefault("transcript_source", "vimeo")
+        return extract
+    if not extract.get("text"):
+        extract.setdefault("transcript_source", "none")
+        return extract
+
+    duration = extract.get("duration") or 0
+    if duration and duration <= max_whisper_duration:
+        logger.info(
+            f"Vimeo {url}: no subtitles, trying audio + Whisper "
+            f"(duration {duration}s, cap {max_whisper_duration}s)"
+        )
+        whisper = _yt_dlp_transcribe(url)
+        if whisper.get("text"):
+            whisper["source_type"] = "video"
+            whisper["transcript_source"] = "whisper"
+            return whisper
+        logger.info(f"Vimeo {url}: Whisper fallback also failed, returning description")
+        extract["reason"] = fetch_errors.WHISPER_FAILED
+        extract["transcript_source"] = "description"
+    elif duration > max_whisper_duration:
+        extract["reason"] = fetch_errors.VIDEO_TOO_LONG_FOR_WHISPER
+        extract["transcript_source"] = "description"
+    else:
+        extract["reason"] = fetch_errors.NO_TRANSCRIPT
+        extract["transcript_source"] = "description"
+
+    return extract
+
+
 def _tweet_id_from_url(url: str) -> str | None:
     match = re.search(r"(?:twitter\.com|x\.com)/\S+/status(?:es)?/(\d+)", url)
     return match.group(1) if match else None
@@ -263,6 +390,20 @@ def _fetch_tweet(url: str) -> dict:
     if not (result.get("text") or "").strip():
         result["reason"] = fetch_errors.TWEET_UNAVAILABLE
     return result
+
+
+def _vtt_to_text(raw: str) -> str:
+    """Flatten a WebVTT file to plain text, deduping the repeated lines VTT
+    cue windows commonly carry."""
+    lines, seen = [], set()
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line.startswith("WEBVTT") or "-->" in line or line.isdigit():
+            continue
+        if line not in seen:
+            seen.add(line)
+            lines.append(line)
+    return " ".join(lines)
 
 
 def _yt_dlp_extract(url: str) -> dict:
@@ -359,15 +500,7 @@ def _yt_dlp_extract(url: str) -> dict:
                         continue
                     with open(os.path.join(dirpath, fname), encoding="utf-8", errors="ignore") as f:
                         raw = f.read()
-                    lines, seen = [], set()
-                    for line in raw.splitlines():
-                        line = line.strip()
-                        if not line or line.startswith("WEBVTT") or "-->" in line or line.isdigit():
-                            continue
-                        if line not in seen:   # VTT often repeats lines across cue windows
-                            seen.add(line)
-                            lines.append(line)
-                    subtitle_text = " ".join(lines)
+                    subtitle_text = _vtt_to_text(raw)
                     if subtitle_text:
                         logger.debug(f"Subtitles from {fname}: {len(subtitle_text)} chars")
                         break
@@ -951,16 +1084,7 @@ async def _fetch_url_uncached(
 
     if _domain_matches(domain, "vimeo.com"):
         loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(None, _yt_dlp_extract, url)
-        if result["text"].strip():
-            return result
-        duration = result.get("duration") or 0
-        if duration and duration > max_whisper_duration:
-            logger.info(f"Vimeo {url}: {duration}s exceeds cap {max_whisper_duration}s")
-            result["reason"] = fetch_errors.VIDEO_TOO_LONG_FOR_WHISPER
-            return result
-        logger.info(f"No subtitles for {url}, falling back to Whisper transcription")
-        return await loop.run_in_executor(None, _yt_dlp_transcribe, url)
+        return await loop.run_in_executor(None, _vimeo_transcript, url, max_whisper_duration)
 
     if _domain_matches(domain, "twitter.com", "x.com", "t.co"):
         loop = asyncio.get_running_loop()
