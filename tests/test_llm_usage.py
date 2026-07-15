@@ -271,6 +271,65 @@ class TestResultCache:
         assert result2 == "proper summary"
 
 
+class TestSkipCache:
+    """`skip_cache=True` must force a fresh upstream call past an existing
+    cache entry, and refresh that entry — the retrigger endpoint (#103)
+    depends on this to repair a stale cached result post-fix."""
+
+    def test_analyze_skip_cache_forces_upstream_call_and_refreshes(self, db, monkeypatch):
+        from bot import analyzer
+        monkeypatch.setattr(analyzer, "_PROVIDER", "anthropic")
+        monkeypatch.setattr(analyzer, "_MODEL", "claude-haiku-4-5-20251001")
+        monkeypatch.setattr(analyzer, "_PREMIUM_MODEL", "claude-haiku-4-5-20251001")
+
+        stale = _FakeAnthropic(input_tokens=100, output_tokens=50, tool_input={
+            "main_idea": "stale", "why_it_matters": "y", "category": "c",
+            "quick_win": "qw", "bigger_play": "bp", "time_required": "5m",
+            "verdict": "watch",
+        })
+        monkeypatch.setattr(analyzer, "_get_client", lambda: stale)
+        first = analyzer.analyze("the same text", ctx=analyzer.UsageContext(user_id=1))
+        assert first["main_idea"] == "stale"
+
+        fresh = _FakeAnthropic(input_tokens=100, output_tokens=50, tool_input={
+            "main_idea": "fresh", "why_it_matters": "y", "category": "c",
+            "quick_win": "qw", "bigger_play": "bp", "time_required": "5m",
+            "verdict": "watch",
+        })
+        monkeypatch.setattr(analyzer, "_get_client", lambda: fresh)
+        second = analyzer.analyze(
+            "the same text", ctx=analyzer.UsageContext(user_id=1), skip_cache=True,
+        )
+        assert second["main_idea"] == "fresh", "skip_cache must bypass the stale entry"
+        assert len(_all_llm_calls(db)) == 2, "skip_cache must hit upstream, not the cache"
+
+        # A subsequent normal (cached) call now sees the refreshed entry.
+        third = analyzer.analyze("the same text", ctx=analyzer.UsageContext(user_id=1))
+        assert third["main_idea"] == "fresh"
+        assert len(_all_llm_calls(db)) == 2, "the refreshed entry should now be a cache hit"
+
+    def test_summarize_content_skip_cache_forces_upstream_call_and_refreshes(self, db, monkeypatch):
+        from bot import analyzer
+        monkeypatch.setattr(analyzer, "_PROVIDER", "anthropic")
+        monkeypatch.setattr(analyzer, "_MODEL", "claude-haiku-4-5-20251001")
+        monkeypatch.setattr(analyzer, "_PREMIUM_MODEL", "claude-haiku-4-5-20251001")
+
+        stale = _FakeAnthropic(input_tokens=500, output_tokens=200, text="stale summary")
+        monkeypatch.setattr(analyzer, "_get_client", lambda: stale)
+        first = analyzer.summarize_content("the source text")
+        assert first == "stale summary"
+
+        fresh = _FakeAnthropic(input_tokens=500, output_tokens=200, text="fresh summary")
+        monkeypatch.setattr(analyzer, "_get_client", lambda: fresh)
+        second = analyzer.summarize_content("the source text", skip_cache=True)
+        assert second == "fresh summary"
+        assert len(_all_llm_calls(db)) == 2
+
+        third = analyzer.summarize_content("the source text")
+        assert third == "fresh summary"
+        assert len(_all_llm_calls(db)) == 2
+
+
 class TestImageCache:
     """analyze_image must cache too — its non-determinism is what breaks the
     *analyze* cache on the Telegram URL path, which appends image

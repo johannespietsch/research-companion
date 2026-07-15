@@ -471,3 +471,117 @@ class TestRangeFiltering:
         assert admin_client.get(
             "/api/admin/cost-overview?days=10000", headers=admin_headers
         ).status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# Retrigger
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def retrigger_client(monkeypatch):
+    """Same as `admin_client`, but with the pipeline's external dependencies
+    (fetch/summarize/analyze) stubbed the way tests/conftest.py's `client`
+    fixture does for bot.api — retrigger runs the same bot.pipeline chain."""
+    monkeypatch.setenv("FILTER_FYI_ADMIN_SECRET", "test-admin-secret")
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    import bot.admin
+    import bot.pipeline
+
+    async def fake_fetch_url(url, **kwargs):
+        return {
+            "text": "Fresh full body, not just a title.",
+            "title": "A Title",
+            "source_type": "social",
+            "image_urls": [],
+        }
+
+    def fake_analyze(text, user_id=None, **_kwargs):
+        return {
+            "main_idea": "x", "why_it_matters": "y", "category": "c",
+            "suggestions": [], "time_required": "5m", "verdict": "watch",
+        }
+
+    def fake_summarize_content(text, **_kwargs):
+        return "Neutral summary of the content."
+
+    monkeypatch.setattr(bot.pipeline, "fetch_url", fake_fetch_url)
+    monkeypatch.setattr(bot.pipeline, "analyze", fake_analyze)
+    monkeypatch.setattr(bot.pipeline, "summarize_content", fake_summarize_content)
+
+    app = FastAPI()
+    app.include_router(bot.admin.router)
+    return TestClient(app)
+
+
+class TestRetrigger:
+    def test_missing_secret_rejected(self, retrigger_client):
+        r = retrigger_client.post(
+            "/api/admin/retrigger", json={"url": "https://x.com/a/status/1"}
+        )
+        assert r.status_code == 401
+
+    def test_invalid_url_rejected(self, retrigger_client, admin_headers):
+        r = retrigger_client.post(
+            "/api/admin/retrigger", json={"url": "not-a-url"}, headers=admin_headers,
+        )
+        assert r.status_code == 400
+
+    def test_success_returns_fresh_result(self, retrigger_client, admin_headers):
+        r = retrigger_client.post(
+            "/api/admin/retrigger",
+            json={"url": "https://x.com/a/status/1"},
+            headers=admin_headers,
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["status"] == "ok"
+        assert body["title"] == "A Title"
+        assert body["source_type"] == "social"
+        assert body["verdict"] == "watch"
+
+    def test_writes_a_fresh_processed_urls_row(self, db, retrigger_client, admin_headers):
+        retrigger_client.post(
+            "/api/admin/retrigger",
+            json={"url": "https://x.com/a/status/1"},
+            headers=admin_headers,
+        )
+        with db._get_conn() as conn:
+            rows = conn.execute(
+                "SELECT url, status, anon_id FROM processed_urls"
+            ).fetchall()
+        assert len(rows) == 1
+        assert rows[0]["url"] == "https://x.com/a/status/1"
+        assert rows[0]["status"] == "ok"
+        assert rows[0]["anon_id"] == "admin-retrigger"
+
+    def test_bypasses_url_cache(self, db, retrigger_client, admin_headers):
+        """A stale url_cache entry (the exact scenario #103's fix needs to
+        repair post-deploy) must not shadow the retriggered fetch."""
+        db.set_cached_fetch(
+            "https://x.com/a/status/1",
+            {"text": "STALE title-only stub", "title": "Stale", "source_type": "social"},
+        )
+        r = retrigger_client.post(
+            "/api/admin/retrigger",
+            json={"url": "https://x.com/a/status/1"},
+            headers=admin_headers,
+        )
+        assert r.json()["title"] == "A Title", "must fetch fresh, not the stale cache entry"
+
+    def test_pipeline_error_reported_not_raised(self, retrigger_client, admin_headers, monkeypatch):
+        import bot.pipeline
+
+        async def empty_fetch(url, **kwargs):
+            return {"text": "", "title": "", "source_type": "article"}
+        monkeypatch.setattr(bot.pipeline, "fetch_url", empty_fetch)
+
+        r = retrigger_client.post(
+            "/api/admin/retrigger",
+            json={"url": "https://example.com/empty"},
+            headers=admin_headers,
+        )
+        assert r.status_code == 200, "a still-broken URL is a valid retrigger outcome, not an HTTP error"
+        body = r.json()
+        assert body["status"] == "error"
+        assert body["error_code"] == "extraction-failed"

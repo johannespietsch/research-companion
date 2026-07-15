@@ -901,7 +901,10 @@ def _transcribe_audio_url(url: str, max_whisper_duration: int) -> dict:
 
 
 async def fetch_url(
-    url: str, *, max_whisper_duration: int = WHISPER_MAX_DURATION_ANON_S
+    url: str,
+    *,
+    max_whisper_duration: int = WHISPER_MAX_DURATION_ANON_S,
+    skip_cache: bool = False,
 ) -> dict:
     """Public entry point. Wraps `_fetch_url_uncached` with a per-URL cache so
     repeat submissions, retries, and concurrent fetches of the same URL don't
@@ -913,10 +916,15 @@ async def fetch_url(
     transcribe, never the transcript itself, so the cache stays keyed by URL —
     except the one tier-dependent degraded outcome (`video_too_long_for_whisper`)
     which we never cache, so a stricter tier can't poison a more generous one.
+
+    `skip_cache=True` bypasses the cache read (a stale/bad entry stays stale
+    forever otherwise — e.g. a fetcher bug cached a degraded result before the
+    fix shipped) but still overwrites the entry with the fresh result, so the
+    next normal request benefits too. Used by the admin retrigger endpoint.
     """
     from bot.db import get_cached_fetch, set_cached_fetch
 
-    cached = get_cached_fetch(url)
+    cached = None if skip_cache else get_cached_fetch(url)
     if cached is not None:
         logger.info(f"url_cache hit for {url}")
         return cached

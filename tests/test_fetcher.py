@@ -555,6 +555,27 @@ class TestUrlCacheLayer:
         assert "https://example.com/a" in r_a2["text"]
         assert "https://example.com/b" in r_b2["text"]
 
+    def test_skip_cache_bypasses_read_but_refreshes_entry(self):
+        """A stale cached fetch (e.g. from a since-fixed extraction bug) must
+        stay bypassable on demand — see issue #103's retrigger endpoint."""
+        from bot import fetcher
+
+        with patch.object(fetcher, "_fetch_url_uncached", new_callable=AsyncMock) as inner:
+            inner.side_effect = [
+                {"text": "stale body", "title": "Hi", "source_type": "article"},
+                {"text": "fresh body", "title": "Hi", "source_type": "article"},
+            ]
+
+            r1 = asyncio.run(fetcher.fetch_url("https://example.com/a"))
+            r2 = asyncio.run(fetcher.fetch_url("https://example.com/a", skip_cache=True))
+            # A subsequent normal (cached) read now sees the refreshed entry.
+            r3 = asyncio.run(fetcher.fetch_url("https://example.com/a"))
+
+        assert inner.call_count == 2, "skip_cache must hit upstream, not the stale entry"
+        assert r1["text"] == "stale body"
+        assert r2["text"] == "fresh body"
+        assert r3["text"] == "fresh body", "skip_cache run must refresh the cache entry"
+
 
 class TestRobots:
     """robots.txt is deliberately NOT consulted: a generic fetch is a single
