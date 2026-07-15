@@ -339,6 +339,13 @@ def _syndication_fetch(tweet_id: str) -> dict | None:
         return None
 
 
+def _article_body_from_blocks(article: dict) -> str:
+    """fxtwitter puts X Article bodies in a Draft.js-style block list, not a
+    flat `text` field — reconstruct it by joining each block's text."""
+    blocks = (article.get("content") or {}).get("blocks") or []
+    return "\n\n".join(b["text"] for b in blocks if b.get("text"))
+
+
 def _format_fxtwitter(tweet: dict, url: str) -> dict:
     handle = tweet.get("author", {}).get("screen_name", "")
     author = tweet.get("author", {}).get("name", "")
@@ -351,7 +358,11 @@ def _format_fxtwitter(tweet: dict, url: str) -> dict:
     article = tweet.get("article")
     if article:
         title = article.get("title", "")
-        body = article.get("text") or tweet.get("text", "")
+        body = (
+            _article_body_from_blocks(article)
+            or article.get("preview_text")
+            or tweet.get("text", "")
+        )
         text = f"X Article by @{handle}: {title}\n\n{body}"
         return {"text": text[:MAX_CONTENT_CHARS], "title": title or f"Article by @{handle}", "source_type": "social", "image_urls": image_urls}
 

@@ -867,3 +867,48 @@ class TestRedditFetch:
         assert "Reddit" in msg and "paste" in msg.lower()
         # non-reddit keeps the generic message
         assert "Reddit" not in user_message(JS_REQUIRED, "https://example.com/a")
+
+
+class TestXArticleExtraction:
+    # fxtwitter puts the X Article body in article.content.blocks (Draft.js
+    # style), not article.text — that key doesn't exist in current responses.
+    # See issue #103: articles were coming through as title + attribution only.
+
+    def _article_tweet(self, blocks=None, preview_text="preview only"):
+        return {
+            "author": {"screen_name": "gregisenberg", "name": "GREG ISENBERG"},
+            "text": "",
+            "article": {
+                "title": "How I'd make $10 million with AI agents",
+                "preview_text": preview_text,
+                "content": {"blocks": blocks} if blocks is not None else {},
+            },
+        }
+
+    def test_article_body_is_reconstructed_from_blocks(self):
+        from bot import fetcher
+        tweet = self._article_tweet(blocks=[
+            {"text": "First paragraph.", "type": "unstyled"},
+            {"text": "", "type": "unstyled"},  # empty blocks are dropped
+            {"text": "Second paragraph.", "type": "header-two"},
+        ])
+        result = fetcher._format_fxtwitter(tweet, "https://x.com/i/status/1")
+        assert "First paragraph." in result["text"]
+        assert "Second paragraph." in result["text"]
+        assert result["title"] == "How I'd make $10 million with AI agents"
+
+    def test_falls_back_to_preview_text_when_no_blocks(self):
+        from bot import fetcher
+        tweet = self._article_tweet(blocks=[], preview_text="just the preview")
+        result = fetcher._format_fxtwitter(tweet, "https://x.com/i/status/1")
+        assert "just the preview" in result["text"]
+
+    def test_regular_tweet_without_article_is_unaffected(self):
+        from bot import fetcher
+        tweet = {
+            "author": {"screen_name": "someone", "name": "Someone"},
+            "text": "just a normal tweet",
+        }
+        result = fetcher._format_fxtwitter(tweet, "https://x.com/i/status/1")
+        assert "just a normal tweet" in result["text"]
+        assert result["title"] == "Post by @someone"
