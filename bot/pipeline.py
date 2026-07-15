@@ -121,6 +121,7 @@ async def analyze_url(
     max_whisper_duration: int | None = None,
     on_step: Optional[Callable[[str], None]] = None,
     capacity_timeout: float | None = None,
+    skip_cache: bool = False,
 ) -> PipelineResult:
     """Run the full URL → analysis chain.
 
@@ -146,6 +147,11 @@ async def analyze_url(
     shedding with `PipelineError(ERR_BUSY)`. None → the limiter default (short;
     synchronous web callers shed fast so they don't blow the Worker's ~25s
     budget); the polling job runner passes a larger value to queue instead.
+
+    `skip_cache=True` bypasses `url_cache` and `llm_cache` reads for this run
+    (both still get overwritten with the fresh result). For normal traffic
+    this is always False; the admin retrigger endpoint sets it to force a
+    clean re-fetch + re-analyse of a URL whose cached result is known bad.
     """
     def _step(label: str) -> None:
         if on_step is not None:
@@ -179,7 +185,9 @@ async def analyze_url(
     try:
         _step("fetching")
         try:
-            fetched = await fetch_url(url, max_whisper_duration=max_whisper_duration)
+            fetched = await fetch_url(
+                url, max_whisper_duration=max_whisper_duration, skip_cache=skip_cache
+            )
         except Exception as e:
             logger.exception("pipeline: fetch_url crashed for %s", url)
             raise PipelineError(ERR_FETCH_FAILED, message=str(e))
@@ -224,12 +232,16 @@ async def analyze_url(
         loop = asyncio.get_running_loop()
         summary = await loop.run_in_executor(
             None,
-            lambda: summarize_content(text, ctx=ctx, published_at=published_at),
+            lambda: summarize_content(
+                text, ctx=ctx, published_at=published_at, skip_cache=skip_cache
+            ),
         )
 
         _step("analyzing")
         try:
-            analysis = await loop.run_in_executor(None, lambda: analyze(summary, ctx=ctx))
+            analysis = await loop.run_in_executor(
+                None, lambda: analyze(summary, ctx=ctx, skip_cache=skip_cache)
+            )
         except Exception as e:
             logger.exception("pipeline: analyze crashed for %s", url)
             raise PipelineError(ERR_ANALYZE_FAILED, fetched=fetched, message=str(e))

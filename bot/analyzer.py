@@ -476,7 +476,13 @@ def _record_cache_hit(*, purpose: str, ctx: UsageContext | None) -> None:
         logger.exception("record_cache_hit failed; hit not logged")
 
 
-def analyze(text: str, user_id: int | None = None, *, ctx: UsageContext | None = None) -> dict:
+def analyze(
+    text: str,
+    user_id: int | None = None,
+    *,
+    ctx: UsageContext | None = None,
+    skip_cache: bool = False,
+) -> dict:
     """Returns a dict with keys: main_idea, why_it_matters, category, quick_win, bigger_play, time_required, verdict."""
     # Back-compat: callers that still pass `user_id` positionally get it merged
     # into the context so usage rows still attribute to a user.
@@ -492,9 +498,11 @@ def analyze(text: str, user_id: int | None = None, *, ctx: UsageContext | None =
     # Content-addressed cache lookup. Key spans every input that affects the
     # output, so a prompt/model/schema change auto-invalidates. Skips the
     # upstream LLM call entirely on hit — no llm_calls row written because
-    # nothing was actually called.
+    # nothing was actually called. `skip_cache` bypasses the read (but the
+    # result below still overwrites the entry, refreshing it) — used by the
+    # admin retrigger endpoint to force a fresh read past a stale cache key.
     cache_key = _cache_key_analyze(text, profile, model, signals)
-    cached = _try_cache_get(cache_key)
+    cached = None if skip_cache else _try_cache_get(cache_key)
     if cached is not None:
         try:
             result = json.loads(cached)
@@ -629,6 +637,7 @@ def summarize_content(
     *,
     ctx: UsageContext | None = None,
     published_at: str | None = None,
+    skip_cache: bool = False,
 ) -> str:
     """Distil source content into a faithful, length-scaled structured brief.
 
@@ -643,6 +652,9 @@ def summarize_content(
     in tagged as a best-estimate fallback — still better than letting the
     model default to its training year, which is what produced the date
     hallucinations seen on non-English transcripts.
+
+    `skip_cache=True` bypasses the cache read and forces a fresh LLM call,
+    overwriting the entry — see `analyze()`'s `skip_cache` for why.
     """
     text = (text or "").strip()
     if not text:
@@ -657,7 +669,7 @@ def summarize_content(
     # NOT part of the key — a per-day fallback would otherwise blow the cache
     # daily for any source without a real publication date.
     cache_key = _cache_key_summary(text, model)
-    cached = _try_cache_get(cache_key)
+    cached = None if skip_cache else _try_cache_get(cache_key)
     if cached is not None:
         logger.info("summary cache hit (key=%s...)", cache_key[:12])
         _record_cache_hit(purpose="summary", ctx=ctx)

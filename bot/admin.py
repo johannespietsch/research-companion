@@ -1,4 +1,5 @@
-"""Admin observability endpoints — read-only aggregations over operational data.
+"""Admin observability endpoints — mostly read-only aggregations over
+operational data, plus one mutating action (retrigger).
 
 Auth is intentionally separate from the try-secret used by /api/try and /api/job:
 admin endpoints take their own `FILTER_FYI_ADMIN_SECRET` so the two can rotate
@@ -14,6 +15,12 @@ Currently exposes:
   GET /api/admin/cost-overview?days=N
     All cost/usage aggregations for the last N days (default 30, max 365),
     drawn from llm_calls. See `cost_overview()` for the response shape.
+  GET /api/admin/usage-overview?days=N&limit=&offset=
+    Activity rollup + paginated row list from processed_urls. See
+    `usage_overview()` for the response shape.
+  POST /api/admin/retrigger
+    Re-run the URL pipeline for one URL, bypassing url_cache and llm_cache.
+    See `retrigger_endpoint()`.
 """
 from __future__ import annotations
 
@@ -23,6 +30,10 @@ import secrets
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from pydantic import BaseModel
+
+from bot.analyzer import UsageContext
+from bot.pipeline import PipelineError, analyze_url
 
 # llm_calls lives on the same Fly SQLite as everything else; bot.db's private
 # connection helper is the canonical entry point. We don't re-implement it.
@@ -528,3 +539,77 @@ async def usage_overview_endpoint(
     Whisper path. See `usage_overview()` for the full response shape.
     """
     return usage_overview(days, limit, offset)
+
+
+# ---------------------------------------------------------------------------
+# Retrigger — the one mutating admin action
+# ---------------------------------------------------------------------------
+#
+# Usage-overview rows only ever show 'ok' or 'error' based on whether the
+# pipeline raised — a fetch that "succeeds" but returns degraded content
+# (e.g. #103: X Articles coming back as title + attribution only) reads as
+# 'ok' with nothing to flag it. Once such a bug is fixed, the bad result is
+# still sitting in url_cache/llm_cache, so simply resubmitting the same URL
+# keeps serving the stale cached output until its TTL expires. Retrigger
+# forces a clean re-fetch + re-analyse past both caches for one URL, so an
+# operator can confirm a fix actually took effect on a known-bad example.
+
+
+def _is_http_url(s: str) -> bool:
+    from urllib.parse import urlparse
+    try:
+        u = urlparse(s)
+        return u.scheme in ("http", "https") and bool(u.netloc)
+    except Exception:
+        return False
+
+
+class RetriggerRequest(BaseModel):
+    url: str
+
+
+@router.post("/retrigger")
+async def retrigger_endpoint(
+    req: RetriggerRequest,
+    _: None = Depends(_require_admin_secret),
+) -> dict:
+    """Re-run the URL pipeline for `req.url`, bypassing url_cache and
+    llm_cache (both get overwritten with the fresh result on the way out, so
+    normal traffic benefits from the corrected cache entry too).
+
+    Runs unattributed to any user (anon_id="admin-retrigger", not saved to
+    any library) and still writes the usual `processed_urls` audit row, so
+    the fresh attempt shows up in the Usage pillar's row list right after
+    this call returns.
+
+    Always 200 on a completed run — a `PipelineError` (fetch failed, no
+    text, analyse crashed) is reported in the body as `status: "error"`
+    rather than raised, since "the retrigger ran and confirmed it's still
+    broken" is a valid, useful outcome for this endpoint, not a failure of
+    the endpoint itself.
+    """
+    url = (req.url or "").strip()
+    if not _is_http_url(url):
+        raise HTTPException(status_code=400, detail={"error": "invalid-url"})
+
+    ctx = UsageContext(anon_id="admin-retrigger")
+    try:
+        result = await analyze_url(url, ctx=ctx, skip_cache=True)
+    except PipelineError as e:
+        return {
+            "status": "error",
+            "url": url,
+            "error_code": e.code,
+            "message": str(e),
+            "title": e.fetched.get("title") or "",
+            "source_type": e.fetched.get("source_type") or "",
+        }
+
+    return {
+        "status": "ok",
+        "url": url,
+        "title": result.title,
+        "source_type": result.source_type,
+        "verdict": result.analysis.get("verdict"),
+        "summary_preview": result.summary[:500],
+    }
