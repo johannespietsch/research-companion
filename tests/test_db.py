@@ -173,6 +173,50 @@ class TestUserHelpers:
 
 
 # ---------------------------------------------------------------------------
+# upsert_item_by_source — refresh-in-place for the admin retrigger endpoint
+# ---------------------------------------------------------------------------
+
+class TestUpsertItemBySource:
+    def test_creates_when_no_existing_item(self, db):
+        uid = db.get_or_create_user_by_telegram(1)
+        item_id = db.upsert_item_by_source(
+            uid, "article", "https://ex.com/a", "content", '{"main_idea": "x"}',
+        )
+        item = db.get_item(item_id, user_id=uid)
+        assert item["source"] == "https://ex.com/a"
+        assert item["content"] == "content"
+
+    def test_updates_the_most_recent_match_in_place(self, db):
+        uid = db.get_or_create_user_by_telegram(1)
+        first_id = db.save_item(
+            uid, "article", "https://ex.com/a", "stale content", '{"main_idea": "stale"}', "a note",
+        )
+        returned_id = db.upsert_item_by_source(
+            uid, "article", "https://ex.com/a", "fresh content", '{"main_idea": "fresh"}',
+        )
+        assert returned_id == first_id
+        assert len(db.get_all_items(user_id=uid)) == 1
+        item = db.get_item(first_id, user_id=uid)
+        assert item["content"] == "fresh content"
+        assert item["analysis"] == '{"main_idea": "fresh"}'
+        assert item["user_note"] == "a note", "unrelated fields untouched"
+
+    def test_scoped_to_user_and_source(self, db):
+        u1 = db.get_or_create_user_by_telegram(1)
+        u2 = db.get_or_create_user_by_telegram(2)
+        db.save_item(u1, "article", "https://ex.com/a", "u1 content", "{}")
+        # Different user, same URL: must not touch u1's item.
+        db.upsert_item_by_source(u2, "article", "https://ex.com/a", "u2 content", "{}")
+        # Same user, different URL: must not touch the /a item.
+        db.upsert_item_by_source(u1, "article", "https://ex.com/b", "u1 other content", "{}")
+
+        assert len(db.get_all_items(user_id=u1)) == 2
+        assert len(db.get_all_items(user_id=u2)) == 1
+        u1_a = next(i for i in db.get_all_items(user_id=u1) if i["source"] == "https://ex.com/a")
+        assert u1_a["content"] == "u1 content"
+
+
+# ---------------------------------------------------------------------------
 # Link codes
 # ---------------------------------------------------------------------------
 

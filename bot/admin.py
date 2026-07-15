@@ -32,7 +32,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel
 
-from bot.analyzer import UsageContext
+from bot.analyzer import UsageContext, to_json_str
 from bot.pipeline import PipelineError, analyze_url
 
 # llm_calls lives on the same Fly SQLite as everything else; bot.db's private
@@ -566,6 +566,13 @@ def _is_http_url(s: str) -> bool:
 
 class RetriggerRequest(BaseModel):
     url: str
+    # Who originally submitted this URL — the Usage row the admin is acting
+    # on already carries these (see `usage_overview`'s `rows`), so the caller
+    # (the admin dashboard) passes them straight through rather than us
+    # re-deriving "most recent processed_urls row for this URL", which could
+    # pick the wrong submitter if several people hit the same URL.
+    user_id: int | None = None
+    anon_id: str | None = None
 
 
 @router.post("/retrigger")
@@ -577,10 +584,24 @@ async def retrigger_endpoint(
     llm_cache (both get overwritten with the fresh result on the way out, so
     normal traffic benefits from the corrected cache entry too).
 
-    Runs unattributed to any user (anon_id="admin-retrigger", not saved to
-    any library) and still writes the usual `processed_urls` audit row, so
-    the fresh attempt shows up in the Usage pillar's row list right after
-    this call returns.
+    Attribution follows the original submitter, not the admin:
+      - `user_id` set: the analysis runs under that user's profile/model tier
+        (`UsageContext(user_id=...)`), and their existing library item for
+        this URL is updated in place via `upsert_item_by_source` — so a
+        signed-in user whose saved item was corrupted by a since-fixed bug
+        sees the corrected version without a duplicate entry or the fix
+        landing on some anonymous admin identity instead.
+      - `user_id` absent but `anon_id` present: usage/cost rows attribute to
+        that anon_id, but there's nothing to update in place — anonymous
+        results live in the Worker's D1 store, not this backend, so we can't
+        reach in and refresh what they see. `item_updated` is False.
+      - Neither set (e.g. a very old audit row, or an ad-hoc URL an operator
+        is just spot-checking): falls back to the synthetic
+        anon_id="admin-retrigger" used before this endpoint knew about
+        submitters.
+
+    Still writes the usual `processed_urls` audit row, so the fresh attempt
+    shows up in the Usage pillar's row list right after this call returns.
 
     Always 200 on a completed run — a `PipelineError` (fetch failed, no
     text, analyse crashed) is reported in the body as `status: "error"`
@@ -592,7 +613,13 @@ async def retrigger_endpoint(
     if not _is_http_url(url):
         raise HTTPException(status_code=400, detail={"error": "invalid-url"})
 
-    ctx = UsageContext(anon_id="admin-retrigger")
+    if req.user_id is not None:
+        ctx = UsageContext(user_id=req.user_id)
+    elif req.anon_id:
+        ctx = UsageContext(anon_id=req.anon_id)
+    else:
+        ctx = UsageContext(anon_id="admin-retrigger")
+
     try:
         result = await analyze_url(url, ctx=ctx, skip_cache=True)
     except PipelineError as e:
@@ -605,6 +632,17 @@ async def retrigger_endpoint(
             "source_type": e.fetched.get("source_type") or "",
         }
 
+    item_id: int | None = None
+    if req.user_id is not None:
+        from bot.db import upsert_item_by_source
+        item_id = upsert_item_by_source(
+            user_id=req.user_id,
+            source_type=result.source_type,
+            source=url,
+            content=result.summary,
+            analysis=to_json_str(result.analysis),
+        )
+
     return {
         "status": "ok",
         "url": url,
@@ -612,4 +650,6 @@ async def retrigger_endpoint(
         "source_type": result.source_type,
         "verdict": result.analysis.get("verdict"),
         "summary_preview": result.summary[:500],
+        "item_updated": item_id is not None,
+        "item_id": item_id,
     }

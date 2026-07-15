@@ -693,6 +693,38 @@ def save_item(
         return cur.lastrowid
 
 
+def upsert_item_by_source(
+    user_id: int, source_type: str, source: str, content: str, analysis: str,
+) -> int:
+    """Refresh a user's existing saved item for `source` in place, or create
+    one if they don't have one yet. Unlike `save_item` (always inserts, so
+    resubmitting a URL piles up duplicate library entries), this updates the
+    most recent matching row — `user_note` and `created_at` are left alone.
+
+    Used by the admin retrigger endpoint: when a fetcher bug is fixed and an
+    operator reruns a URL past the cache, the user who originally saved it
+    should see the corrected version in place, not a stale copy plus a new
+    duplicate.
+    """
+    with _get_conn() as conn:
+        row = conn.execute(
+            "SELECT id FROM items WHERE user_id = ? AND source = ? ORDER BY id DESC LIMIT 1",
+            (user_id, source),
+        ).fetchone()
+        if row is not None:
+            conn.execute(
+                "UPDATE items SET source_type = ?, content = ?, analysis = ? WHERE id = ?",
+                (source_type, content, analysis, row["id"]),
+            )
+            return row["id"]
+        cur = conn.execute(
+            "INSERT INTO items (user_id, source_type, source, content, analysis) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (user_id, source_type, source, content, analysis),
+        )
+        return cur.lastrowid
+
+
 _ITEM_COLS = (
     "id, user_id, source_type, source, content, analysis, user_note, file_path, created_at"
 )
