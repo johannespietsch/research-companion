@@ -585,3 +585,96 @@ class TestRetrigger:
         body = r.json()
         assert body["status"] == "error"
         assert body["error_code"] == "extraction-failed"
+
+    def test_user_id_attributes_to_the_original_submitter_not_admin(
+        self, db, retrigger_client, admin_headers,
+    ):
+        """The whole point: a signed-in user's retrigger must NOT land under
+        the synthetic admin-retrigger identity — it must run (and be billed/
+        attributed) as that user."""
+        uid = db.get_or_create_user_by_telegram(1)
+        retrigger_client.post(
+            "/api/admin/retrigger",
+            json={"url": "https://x.com/a/status/1", "user_id": uid},
+            headers=admin_headers,
+        )
+        with db._get_conn() as conn:
+            row = conn.execute(
+                "SELECT user_id, anon_id FROM processed_urls"
+            ).fetchone()
+        assert row["user_id"] == uid
+        assert row["anon_id"] is None
+
+    def test_user_id_creates_item_when_none_exists(self, db, retrigger_client, admin_headers):
+        uid = db.get_or_create_user_by_telegram(2)
+        r = retrigger_client.post(
+            "/api/admin/retrigger",
+            json={"url": "https://x.com/a/status/1", "user_id": uid},
+            headers=admin_headers,
+        )
+        body = r.json()
+        assert body["item_updated"] is True
+        assert body["item_id"] is not None
+        item = db.get_item(body["item_id"], user_id=uid)
+        assert item is not None
+        assert item["source"] == "https://x.com/a/status/1"
+        assert item["source_type"] == "social"
+
+    def test_user_id_updates_existing_item_in_place_not_a_duplicate(
+        self, db, retrigger_client, admin_headers,
+    ):
+        """The scenario that motivated this: a user's saved item was corrupted
+        by a since-fixed fetcher bug (#103). Retrigger must refresh that same
+        item, not leave the stale one sitting alongside a new duplicate."""
+        uid = db.get_or_create_user_by_telegram(3)
+        stale_id = db.save_item(
+            uid, "social", "https://x.com/a/status/1",
+            "STALE title-only content", '{"main_idea": "stale"}', "my note",
+        )
+        r = retrigger_client.post(
+            "/api/admin/retrigger",
+            json={"url": "https://x.com/a/status/1", "user_id": uid},
+            headers=admin_headers,
+        )
+        body = r.json()
+        assert body["item_id"] == stale_id, "must update the existing item, not create a new one"
+        assert len(db.get_all_items(user_id=uid)) == 1, "no duplicate left behind"
+        refreshed = db.get_item(stale_id, user_id=uid)
+        assert refreshed["content"] == "Neutral summary of the content."
+        assert refreshed["content"] != "STALE title-only content"
+        assert refreshed["user_note"] == "my note", "unrelated fields must survive the refresh"
+
+    def test_anon_id_attributes_but_does_not_persist_an_item(
+        self, db, retrigger_client, admin_headers,
+    ):
+        """Anonymous results live in the Worker's D1 store, not this backend
+        — there's nothing here to update in place, so item_updated must be
+        False even though the retrigger itself succeeds."""
+        r = retrigger_client.post(
+            "/api/admin/retrigger",
+            json={"url": "https://x.com/a/status/1", "anon_id": "visitor-abc"},
+            headers=admin_headers,
+        )
+        body = r.json()
+        assert body["status"] == "ok"
+        assert body["item_updated"] is False
+        assert body["item_id"] is None
+        with db._get_conn() as conn:
+            row = conn.execute(
+                "SELECT user_id, anon_id FROM processed_urls"
+            ).fetchone()
+        assert row["anon_id"] == "visitor-abc"
+        assert row["user_id"] is None
+
+    def test_no_submitter_falls_back_to_admin_retrigger_identity(
+        self, db, retrigger_client, admin_headers,
+    ):
+        """Ad-hoc spot-checks (no known submitter) keep the old behaviour."""
+        retrigger_client.post(
+            "/api/admin/retrigger",
+            json={"url": "https://x.com/a/status/1"},
+            headers=admin_headers,
+        )
+        with db._get_conn() as conn:
+            row = conn.execute("SELECT anon_id FROM processed_urls").fetchone()
+        assert row["anon_id"] == "admin-retrigger"
