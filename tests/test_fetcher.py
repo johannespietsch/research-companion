@@ -933,3 +933,98 @@ class TestXArticleExtraction:
         result = fetcher._format_fxtwitter(tweet, "https://x.com/i/status/1")
         assert "just a normal tweet" in result["text"]
         assert result["title"] == "Post by @someone"
+
+
+TWEET_URL = "https://x.com/someone/status/1234567890"
+
+
+class TestTweetVideoTranscript:
+    """A tweet with an embedded video should get a Whisper transcript appended
+    to its caption (mirroring the YouTube/Vimeo captionless-video tier) —
+    otherwise a 2h video with a 3-sentence caption summarises off the caption
+    alone (issue reported: '~300 word summary, only the post's text was used')."""
+
+    def _tweet(self, *, caption="Check out this video", duration=90, screen_name="someone"):
+        return {
+            "author": {"screen_name": screen_name, "name": "Someone"},
+            "text": caption,
+            "media": {
+                "videos": [{"url": "https://video.twimg.com/vid.mp4", "duration": duration}],
+            },
+        }
+
+    def test_photo_only_tweet_is_unaffected(self):
+        from bot import fetcher
+
+        tweet = {"author": {"screen_name": "someone", "name": "Someone"}, "text": "just text"}
+        formatted = fetcher._format_fxtwitter(tweet, TWEET_URL)
+        with patch.object(fetcher, "_yt_dlp_transcribe") as transcribe:
+            result = fetcher._tweet_video_transcript(formatted, tweet, TWEET_URL, 30 * 60)
+
+        transcribe.assert_not_called()
+        assert result is formatted
+        assert "reason" not in result
+
+    def test_short_video_gets_transcribed_and_appended_to_caption(self):
+        from bot import fetcher
+
+        tweet = self._tweet(duration=90)
+        formatted = fetcher._format_fxtwitter(tweet, TWEET_URL)
+
+        with patch.object(fetcher, "_yt_dlp_transcribe") as transcribe:
+            transcribe.return_value = {
+                "text": "Title\nBy: someone\n\nTranscript:\nspoken content here",
+                "transcript": "spoken content here",
+                "title": "Title",
+                "source_type": "video",
+            }
+            result = fetcher._tweet_video_transcript(formatted, tweet, TWEET_URL, 30 * 60)
+
+        transcribe.assert_called_once_with(TWEET_URL)
+        assert "Check out this video" in result["text"]
+        assert "spoken content here" in result["text"]
+        assert result["transcript_source"] == "whisper"
+        assert result["duration"] == 90
+
+    def test_video_longer_than_cap_is_skipped_but_caption_kept(self):
+        from bot import fetcher, fetch_errors
+
+        tweet = self._tweet(duration=3 * 60 * 60)  # 3h, over the 30min anon cap
+        formatted = fetcher._format_fxtwitter(tweet, TWEET_URL)
+
+        with patch.object(fetcher, "_yt_dlp_transcribe") as transcribe:
+            result = fetcher._tweet_video_transcript(formatted, tweet, TWEET_URL, 30 * 60)
+
+        transcribe.assert_not_called()
+        assert result["reason"] == fetch_errors.VIDEO_TOO_LONG_FOR_WHISPER
+        assert "Check out this video" in result["text"]
+
+    def test_whisper_failure_keeps_caption_and_flags_reason(self):
+        from bot import fetcher, fetch_errors
+
+        tweet = self._tweet(duration=90)
+        formatted = fetcher._format_fxtwitter(tweet, TWEET_URL)
+
+        with patch.object(fetcher, "_yt_dlp_transcribe") as transcribe:
+            transcribe.return_value = {"text": "", "title": TWEET_URL, "source_type": "unknown"}
+            result = fetcher._tweet_video_transcript(formatted, tweet, TWEET_URL, 30 * 60)
+
+        assert result["reason"] == fetch_errors.WHISPER_FAILED
+        assert "Check out this video" in result["text"]
+
+    def test_fetch_tweet_wires_video_transcript_through_fxtwitter_tier(self):
+        """End-to-end through `_fetch_tweet`: fxtwitter tier 1 result flows
+        into the video-transcript step automatically."""
+        from bot import fetcher
+
+        tweet = self._tweet(duration=90)
+        with patch.object(fetcher, "_fxtwitter_fetch", return_value=tweet), \
+             patch.object(fetcher, "_yt_dlp_transcribe") as transcribe:
+            transcribe.return_value = {
+                "text": "Title\n\nTranscript:\nfull spoken text",
+                "transcript": "full spoken text",
+            }
+            result = fetcher._fetch_tweet(TWEET_URL, max_whisper_duration=30 * 60)
+
+        assert "full spoken text" in result["text"]
+        assert result["transcript_source"] == "whisper"

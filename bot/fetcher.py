@@ -54,7 +54,11 @@ def _youtube_oembed_title(url: str) -> str | None:
 # runs through the async job path (`/api/job`), which has no Worker-side
 # analysis timeout, so both tiers use their full cap everywhere.
 WHISPER_MAX_DURATION_ANON_S = 30 * 60        # 30 min — anonymous web tries
-WHISPER_MAX_DURATION_SIGNED_IN_S = 2 * 60 * 60  # 2 h — signed-in users
+# 2.5 h — signed-in users. X's own long-video uploads run up to ~2 h (a real
+# example ran 2h00m18s), so a flat 2 h cap clipped posts right at that limit;
+# this adds headroom above the platform's own ceiling rather than matching it
+# exactly. Same constant for every signed-in user — no per-account override.
+WHISPER_MAX_DURATION_SIGNED_IN_S = int(2.5 * 60 * 60)
 
 
 def whisper_cap_for(*, signed_in: bool) -> int:
@@ -382,25 +386,77 @@ def _format_syndication(data: dict, url: str) -> dict:
     return {"text": text[:MAX_CONTENT_CHARS], "title": f"Post by @{handle}", "source_type": "social", "image_urls": image_urls}
 
 
-def _fetch_tweet(url: str) -> dict:
+def _tweet_video_transcript(
+    result: dict, tweet: dict, url: str, max_whisper_duration: int
+) -> dict:
+    """If the tweet has an embedded video, transcribe it with Whisper
+    (duration-capped, mirroring `_youtube_transcript`/`_vimeo_transcript`) and
+    append the transcript to the post text. Without this, a tweet whose real
+    content is a long embedded video summarises off the caption alone — often
+    just a couple hundred words even when the video runs for hours."""
+    videos = (tweet.get("media") or {}).get("videos") or []
+    if not videos:
+        return result
+
+    duration = int(videos[0].get("duration") or 0)
+    if duration > max_whisper_duration:
+        result["reason"] = fetch_errors.VIDEO_TOO_LONG_FOR_WHISPER
+        result["transcript_source"] = "description"
+        return result
+    if not duration:
+        return result
+
+    whisper = _yt_dlp_transcribe(url)
+    transcript = whisper.get("transcript") or whisper.get("text")
+    if transcript:
+        result["text"] = f"{result['text']}\n\nVideo transcript:\n{transcript}"[:MAX_CONTENT_CHARS]
+        result["transcript_source"] = "whisper"
+        result["duration"] = duration
+    else:
+        result["reason"] = fetch_errors.WHISPER_FAILED
+        result["transcript_source"] = "description"
+    return result
+
+
+def _fetch_tweet(url: str, max_whisper_duration: int = WHISPER_MAX_DURATION_ANON_S) -> dict:
     tweet_id = _tweet_id_from_url(url)
 
     if tweet_id:
-        # 1. fxtwitter (handles X Articles too)
+        # 1. fxtwitter (handles X Articles too, and is the only tier that
+        # surfaces embedded video — see _tweet_video_transcript)
         tweet = _fxtwitter_fetch(tweet_id)
         if tweet:
-            return _format_fxtwitter(tweet, url)
+            result = _format_fxtwitter(tweet, url)
+            return _tweet_video_transcript(result, tweet, url, max_whisper_duration)
 
-        # 2. X syndication API (X's own embed endpoint)
+        # 2. X syndication API (X's own embed endpoint) — photos only, no
+        # video field, so a video tweet falling back here loses transcription.
         data = _syndication_fetch(tweet_id)
         if data:
             return _format_syndication(data, url)
 
-    # 3. yt-dlp as last resort
-    result = _yt_dlp_extract(url)
-    if not (result.get("text") or "").strip():
-        result["reason"] = fetch_errors.TWEET_UNAVAILABLE
-    return result
+    # 3. yt-dlp as last resort (weird URL shapes, or both APIs down)
+    extract = _yt_dlp_extract(url)
+    if extract.get("has_transcript"):
+        extract.setdefault("transcript_source", "twitter")
+        return extract
+    if not extract.get("text"):
+        extract["reason"] = fetch_errors.TWEET_UNAVAILABLE
+        return extract
+
+    duration = extract.get("duration") or 0
+    if duration and duration <= max_whisper_duration:
+        whisper = _yt_dlp_transcribe(url)
+        if whisper.get("text"):
+            whisper["source_type"] = "social"
+            whisper["transcript_source"] = "whisper"
+            return whisper
+        extract["reason"] = fetch_errors.WHISPER_FAILED
+        extract["transcript_source"] = "description"
+    elif duration > max_whisper_duration:
+        extract["reason"] = fetch_errors.VIDEO_TOO_LONG_FOR_WHISPER
+        extract["transcript_source"] = "description"
+    return extract
 
 
 def _vtt_to_text(raw: str) -> str:
@@ -579,7 +635,12 @@ def _yt_dlp_transcribe(url: str) -> dict:
         uploader = info.get("uploader") or info.get("channel") or ""
         title = info.get("title") or url
         text = f"{title}\nBy: {uploader}\n\nTranscript:\n{transcript}".strip()
-        return {"text": text[:MAX_CONTENT_CHARS], "title": title, "source_type": "video"}
+        return {
+            "text": text[:MAX_CONTENT_CHARS],
+            "title": title,
+            "source_type": "video",
+            "transcript": transcript,
+        }
     except Exception as e:
         logger.warning(f"yt-dlp transcribe failed for {url}: {e}")
         return {"text": "", "title": url, "source_type": "unknown", "reason": fetch_errors.WHISPER_FAILED}
@@ -1107,7 +1168,7 @@ async def _fetch_url_uncached(
 
     if _domain_matches(domain, "twitter.com", "x.com", "t.co"):
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, _fetch_tweet, url)
+        return await loop.run_in_executor(None, _fetch_tweet, url, max_whisper_duration)
 
     if _looks_like_audio(url):
         loop = asyncio.get_running_loop()
