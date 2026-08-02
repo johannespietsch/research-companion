@@ -514,7 +514,12 @@ def retrigger_client(monkeypatch):
     return TestClient(app)
 
 
-class TestRetrigger:
+class TestRetriggerEndpoint:
+    """POST /api/admin/retrigger only kicks off a background job and returns
+    a job_id — see TestRunRetriggerJob for the actual pipeline behaviour,
+    tested the same way tests/test_api.py tests bot.api._run_job directly
+    (asyncio.run against the job body, not through the blocking HTTP call)."""
+
     def test_missing_secret_rejected(self, retrigger_client):
         r = retrigger_client.post(
             "/api/admin/retrigger", json={"url": "https://x.com/a/status/1"}
@@ -527,25 +532,77 @@ class TestRetrigger:
         )
         assert r.status_code == 400
 
-    def test_success_returns_fresh_result(self, retrigger_client, admin_headers):
+    def test_returns_job_id_immediately(self, retrigger_client, admin_headers):
         r = retrigger_client.post(
             "/api/admin/retrigger",
             json={"url": "https://x.com/a/status/1"},
             headers=admin_headers,
         )
-        assert r.status_code == 200
-        body = r.json()
-        assert body["status"] == "ok"
-        assert body["title"] == "A Title"
-        assert body["source_type"] == "social"
-        assert body["verdict"] == "watch"
+        assert r.status_code == 202
+        assert isinstance(r.json().get("job_id"), str)
 
-    def test_writes_a_fresh_processed_urls_row(self, db, retrigger_client, admin_headers):
-        retrigger_client.post(
-            "/api/admin/retrigger",
-            json={"url": "https://x.com/a/status/1"},
-            headers=admin_headers,
-        )
+
+class TestRetriggerStatus:
+    def test_missing_secret_rejected(self, retrigger_client):
+        r = retrigger_client.get("/api/admin/retrigger/some-id")
+        assert r.status_code == 401
+
+    def test_404_for_unknown_job(self, retrigger_client, admin_headers):
+        r = retrigger_client.get("/api/admin/retrigger/unknown-id", headers=admin_headers)
+        assert r.status_code == 404
+
+    def test_pending_before_completion(self, db, retrigger_client, admin_headers):
+        db.create_job("job-pending")
+        r = retrigger_client.get("/api/admin/retrigger/job-pending", headers=admin_headers)
+        assert r.json() == {"status": "pending"}
+
+    def test_done_after_job_completes(self, db, retrigger_client, admin_headers):
+        import asyncio
+        import bot.admin
+
+        db.create_job("job-done")
+        asyncio.run(bot.admin._run_retrigger_job("job-done", "https://x.com/a/status/1", None, None))
+
+        r = retrigger_client.get("/api/admin/retrigger/job-done", headers=admin_headers)
+        body = r.json()
+        assert body["status"] == "done"
+        assert body["result"]["status"] == "ok"
+        assert body["result"]["title"] == "A Title"
+        assert body["result"]["verdict"] == "watch"
+
+    def test_error_after_job_fails(self, db, retrigger_client, admin_headers, monkeypatch):
+        import asyncio
+        import bot.admin
+        import bot.pipeline
+
+        async def empty_fetch(url, **kwargs):
+            return {"text": "", "title": "", "source_type": "article"}
+        monkeypatch.setattr(bot.pipeline, "fetch_url", empty_fetch)
+
+        db.create_job("job-error")
+        asyncio.run(bot.admin._run_retrigger_job("job-error", "https://example.com/empty", None, None))
+
+        r = retrigger_client.get("/api/admin/retrigger/job-error", headers=admin_headers)
+        body = r.json()
+        assert body["status"] == "error"
+        assert body["error"] == "extraction-failed"
+
+
+class TestRunRetriggerJob:
+    """Direct tests of `_run_retrigger_job`'s pipeline + upsert behaviour,
+    the same way test_api.py tests `_run_job` — bypasses the blocking HTTP
+    round trip and drives the background body straight."""
+
+    def _run(self, db, url="https://x.com/a/status/1", user_id=None, anon_id=None, job_id="job-1"):
+        import asyncio
+        import bot.admin
+
+        db.create_job(job_id)
+        asyncio.run(bot.admin._run_retrigger_job(job_id, url, user_id, anon_id))
+        return db.get_job_record(job_id)
+
+    def test_writes_a_fresh_processed_urls_row(self, db, retrigger_client):
+        self._run(db)
         with db._get_conn() as conn:
             rows = conn.execute(
                 "SELECT url, status, anon_id FROM processed_urls"
@@ -555,49 +612,35 @@ class TestRetrigger:
         assert rows[0]["status"] == "ok"
         assert rows[0]["anon_id"] == "admin-retrigger"
 
-    def test_bypasses_url_cache(self, db, retrigger_client, admin_headers):
+    def test_bypasses_url_cache(self, db, retrigger_client):
         """A stale url_cache entry (the exact scenario #103's fix needs to
         repair post-deploy) must not shadow the retriggered fetch."""
         db.set_cached_fetch(
             "https://x.com/a/status/1",
             {"text": "STALE title-only stub", "title": "Stale", "source_type": "social"},
         )
-        r = retrigger_client.post(
-            "/api/admin/retrigger",
-            json={"url": "https://x.com/a/status/1"},
-            headers=admin_headers,
-        )
-        assert r.json()["title"] == "A Title", "must fetch fresh, not the stale cache entry"
+        rec = self._run(db)
+        import json
+        result = json.loads(rec["result"])
+        assert result["title"] == "A Title", "must fetch fresh, not the stale cache entry"
 
-    def test_pipeline_error_reported_not_raised(self, retrigger_client, admin_headers, monkeypatch):
+    def test_pipeline_error_reported_not_raised(self, db, retrigger_client, monkeypatch):
         import bot.pipeline
 
         async def empty_fetch(url, **kwargs):
             return {"text": "", "title": "", "source_type": "article"}
         monkeypatch.setattr(bot.pipeline, "fetch_url", empty_fetch)
 
-        r = retrigger_client.post(
-            "/api/admin/retrigger",
-            json={"url": "https://example.com/empty"},
-            headers=admin_headers,
-        )
-        assert r.status_code == 200, "a still-broken URL is a valid retrigger outcome, not an HTTP error"
-        body = r.json()
-        assert body["status"] == "error"
-        assert body["error_code"] == "extraction-failed"
+        rec = self._run(db, url="https://example.com/empty")
+        assert rec["status"] == "error", "a still-broken URL is a valid retrigger outcome, not a crash"
+        assert rec["error"] == "extraction-failed"
 
-    def test_user_id_attributes_to_the_original_submitter_not_admin(
-        self, db, retrigger_client, admin_headers,
-    ):
+    def test_user_id_attributes_to_the_original_submitter_not_admin(self, db, retrigger_client):
         """The whole point: a signed-in user's retrigger must NOT land under
         the synthetic admin-retrigger identity — it must run (and be billed/
         attributed) as that user."""
         uid = db.get_or_create_user_by_telegram(1)
-        retrigger_client.post(
-            "/api/admin/retrigger",
-            json={"url": "https://x.com/a/status/1", "user_id": uid},
-            headers=admin_headers,
-        )
+        self._run(db, user_id=uid)
         with db._get_conn() as conn:
             row = conn.execute(
                 "SELECT user_id, anon_id FROM processed_urls"
@@ -605,60 +648,50 @@ class TestRetrigger:
         assert row["user_id"] == uid
         assert row["anon_id"] is None
 
-    def test_user_id_creates_item_when_none_exists(self, db, retrigger_client, admin_headers):
+    def test_user_id_creates_item_when_none_exists(self, db, retrigger_client):
+        import json
+
         uid = db.get_or_create_user_by_telegram(2)
-        r = retrigger_client.post(
-            "/api/admin/retrigger",
-            json={"url": "https://x.com/a/status/1", "user_id": uid},
-            headers=admin_headers,
-        )
-        body = r.json()
-        assert body["item_updated"] is True
-        assert body["item_id"] is not None
-        item = db.get_item(body["item_id"], user_id=uid)
+        rec = self._run(db, user_id=uid)
+        result = json.loads(rec["result"])
+        assert result["item_updated"] is True
+        assert result["item_id"] is not None
+        item = db.get_item(result["item_id"], user_id=uid)
         assert item is not None
         assert item["source"] == "https://x.com/a/status/1"
         assert item["source_type"] == "social"
 
-    def test_user_id_updates_existing_item_in_place_not_a_duplicate(
-        self, db, retrigger_client, admin_headers,
-    ):
+    def test_user_id_updates_existing_item_in_place_not_a_duplicate(self, db, retrigger_client):
         """The scenario that motivated this: a user's saved item was corrupted
         by a since-fixed fetcher bug (#103). Retrigger must refresh that same
         item, not leave the stale one sitting alongside a new duplicate."""
+        import json
+
         uid = db.get_or_create_user_by_telegram(3)
         stale_id = db.save_item(
             uid, "social", "https://x.com/a/status/1",
             "STALE title-only content", '{"main_idea": "stale"}', "my note",
         )
-        r = retrigger_client.post(
-            "/api/admin/retrigger",
-            json={"url": "https://x.com/a/status/1", "user_id": uid},
-            headers=admin_headers,
-        )
-        body = r.json()
-        assert body["item_id"] == stale_id, "must update the existing item, not create a new one"
+        rec = self._run(db, user_id=uid)
+        result = json.loads(rec["result"])
+        assert result["item_id"] == stale_id, "must update the existing item, not create a new one"
         assert len(db.get_all_items(user_id=uid)) == 1, "no duplicate left behind"
         refreshed = db.get_item(stale_id, user_id=uid)
         assert refreshed["content"] == "Neutral summary of the content."
         assert refreshed["content"] != "STALE title-only content"
         assert refreshed["user_note"] == "my note", "unrelated fields must survive the refresh"
 
-    def test_anon_id_attributes_but_does_not_persist_an_item(
-        self, db, retrigger_client, admin_headers,
-    ):
+    def test_anon_id_attributes_but_does_not_persist_an_item(self, db, retrigger_client):
         """Anonymous results live in the Worker's D1 store, not this backend
         — there's nothing here to update in place, so item_updated must be
         False even though the retrigger itself succeeds."""
-        r = retrigger_client.post(
-            "/api/admin/retrigger",
-            json={"url": "https://x.com/a/status/1", "anon_id": "visitor-abc"},
-            headers=admin_headers,
-        )
-        body = r.json()
-        assert body["status"] == "ok"
-        assert body["item_updated"] is False
-        assert body["item_id"] is None
+        import json
+
+        rec = self._run(db, anon_id="visitor-abc")
+        result = json.loads(rec["result"])
+        assert result["status"] == "ok"
+        assert result["item_updated"] is False
+        assert result["item_id"] is None
         with db._get_conn() as conn:
             row = conn.execute(
                 "SELECT user_id, anon_id FROM processed_urls"
@@ -666,15 +699,9 @@ class TestRetrigger:
         assert row["anon_id"] == "visitor-abc"
         assert row["user_id"] is None
 
-    def test_no_submitter_falls_back_to_admin_retrigger_identity(
-        self, db, retrigger_client, admin_headers,
-    ):
+    def test_no_submitter_falls_back_to_admin_retrigger_identity(self, db, retrigger_client):
         """Ad-hoc spot-checks (no known submitter) keep the old behaviour."""
-        retrigger_client.post(
-            "/api/admin/retrigger",
-            json={"url": "https://x.com/a/status/1"},
-            headers=admin_headers,
-        )
+        self._run(db)
         with db._get_conn() as conn:
             row = conn.execute("SELECT anon_id FROM processed_urls").fetchone()
         assert row["anon_id"] == "admin-retrigger"

@@ -19,14 +19,20 @@ Currently exposes:
     Activity rollup + paginated row list from processed_urls. See
     `usage_overview()` for the response shape.
   POST /api/admin/retrigger
-    Re-run the URL pipeline for one URL, bypassing url_cache and llm_cache.
-    See `retrigger_endpoint()`.
+    Kick off a background re-run of the URL pipeline for one URL, bypassing
+    url_cache and llm_cache. Returns a job_id immediately — see
+    `retrigger_endpoint()` and `GET /api/admin/retrigger/{job_id}`.
+  GET /api/admin/retrigger/{job_id}
+    Poll a retrigger job's status/result. See `retrigger_status()`.
 """
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import os
 import secrets
+import uuid
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
@@ -37,7 +43,14 @@ from bot.pipeline import PipelineError, analyze_url
 
 # llm_calls lives on the same Fly SQLite as everything else; bot.db's private
 # connection helper is the canonical entry point. We don't re-implement it.
-from bot.db import _get_conn
+from bot.db import (
+    _get_conn,
+    create_job,
+    get_job_record,
+    set_job_done,
+    set_job_error,
+    upsert_item_by_source,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +59,11 @@ router = APIRouter(prefix="/api/admin")
 _MAX_DAYS = 365
 _DEFAULT_DAYS = 30
 _TOP_USERS_LIMIT = 10
+
+# Keeps references to running retrigger tasks alive until they complete —
+# without this, Python's GC may collect the task mid-flight. Separate from
+# bot.api's own `_background_tasks` since that one is private to that module.
+_retrigger_tasks: set[asyncio.Task] = set()
 
 
 def _require_admin_secret(
@@ -575,14 +593,11 @@ class RetriggerRequest(BaseModel):
     anon_id: str | None = None
 
 
-@router.post("/retrigger")
-async def retrigger_endpoint(
-    req: RetriggerRequest,
-    _: None = Depends(_require_admin_secret),
-) -> dict:
-    """Re-run the URL pipeline for `req.url`, bypassing url_cache and
-    llm_cache (both get overwritten with the fresh result on the way out, so
-    normal traffic benefits from the corrected cache entry too).
+async def _run_retrigger_job(
+    job_id: str, url: str, user_id: int | None, anon_id: str | None
+) -> None:
+    """Background body of a retrigger: run the pipeline, upsert the item, and
+    write the outcome to `jobs` for the poller to pick up.
 
     Attribution follows the original submitter, not the admin:
       - `user_id` set: the analysis runs under that user's profile/model tier
@@ -600,50 +615,39 @@ async def retrigger_endpoint(
         anon_id="admin-retrigger" used before this endpoint knew about
         submitters.
 
-    Still writes the usual `processed_urls` audit row, so the fresh attempt
-    shows up in the Usage pillar's row list right after this call returns.
-
-    Always 200 on a completed run — a `PipelineError` (fetch failed, no
-    text, analyse crashed) is reported in the body as `status: "error"`
-    rather than raised, since "the retrigger ran and confirmed it's still
-    broken" is a valid, useful outcome for this endpoint, not a failure of
-    the endpoint itself.
+    A `PipelineError` (fetch failed, no text, analyse crashed) is recorded as
+    a `status: "error"` job rather than left pending forever, since "the
+    retrigger ran and confirmed it's still broken" is a valid, useful outcome
+    for this endpoint, not a failure of the endpoint itself.
     """
-    url = (req.url or "").strip()
-    if not _is_http_url(url):
-        raise HTTPException(status_code=400, detail={"error": "invalid-url"})
-
-    if req.user_id is not None:
-        ctx = UsageContext(user_id=req.user_id)
-    elif req.anon_id:
-        ctx = UsageContext(anon_id=req.anon_id)
+    if user_id is not None:
+        ctx = UsageContext(user_id=user_id)
+    elif anon_id:
+        ctx = UsageContext(anon_id=anon_id)
     else:
         ctx = UsageContext(anon_id="admin-retrigger")
 
     try:
         result = await analyze_url(url, ctx=ctx, skip_cache=True)
     except PipelineError as e:
-        return {
-            "status": "error",
-            "url": url,
-            "error_code": e.code,
-            "message": str(e),
-            "title": e.fetched.get("title") or "",
-            "source_type": e.fetched.get("source_type") or "",
-        }
+        set_job_error(job_id, e.code, str(e))
+        return
+    except Exception as e:
+        logger.exception("admin retrigger job %s crashed for %s", job_id, url)
+        set_job_error(job_id, "internal-error", str(e)[:200])
+        return
 
     item_id: int | None = None
-    if req.user_id is not None:
-        from bot.db import upsert_item_by_source
+    if user_id is not None:
         item_id = upsert_item_by_source(
-            user_id=req.user_id,
+            user_id=user_id,
             source_type=result.source_type,
             source=url,
             content=result.summary,
             analysis=to_json_str(result.analysis),
         )
 
-    return {
+    set_job_done(job_id, {
         "status": "ok",
         "url": url,
         "title": result.title,
@@ -652,4 +656,57 @@ async def retrigger_endpoint(
         "summary_preview": result.summary[:500],
         "item_updated": item_id is not None,
         "item_id": item_id,
-    }
+    })
+
+
+@router.post("/retrigger", status_code=202)
+async def retrigger_endpoint(
+    req: RetriggerRequest,
+    _: None = Depends(_require_admin_secret),
+) -> dict:
+    """Kick off a background re-run of the URL pipeline for `req.url`,
+    bypassing url_cache and llm_cache (both get overwritten with the fresh
+    result on the way out, so normal traffic benefits from the corrected
+    cache entry too). Returns `{job_id}` immediately — poll
+    `GET /api/admin/retrigger/{job_id}` for the outcome.
+
+    Runs as a background task rather than blocking the request: the full
+    fetch+summarize+analyse chain can take several minutes for a long video
+    (Whisper transcription + a long summary), which used to exceed the
+    Worker's own timeout on this call and leave the admin with no feedback
+    at all — see `_run_retrigger_job` for what actually happens.
+
+    Still writes the usual `processed_urls` audit row via the pipeline
+    itself, so the fresh attempt shows up in the Usage pillar's row list.
+    """
+    url = (req.url or "").strip()
+    if not _is_http_url(url):
+        raise HTTPException(status_code=400, detail={"error": "invalid-url"})
+
+    job_id = str(uuid.uuid4())
+    create_job(job_id)
+    task = asyncio.create_task(_run_retrigger_job(job_id, url, req.user_id, req.anon_id))
+    _retrigger_tasks.add(task)
+    task.add_done_callback(_retrigger_tasks.discard)
+
+    return {"job_id": job_id}
+
+
+@router.get("/retrigger/{job_id}")
+async def retrigger_status(
+    job_id: str,
+    _: None = Depends(_require_admin_secret),
+) -> dict:
+    """Poll a retrigger job's status/result — same shape as `GET /api/job/{id}`."""
+    job = get_job_record(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail={"error": "not-found"})
+    if job["status"] == "done":
+        try:
+            result = json.loads(job["result"])
+        except Exception:
+            result = None
+        return {"status": "done", "result": result}
+    if job["status"] == "error":
+        return {"status": "error", "error": job["error"], "message": job["message"]}
+    return {"status": "pending"}
