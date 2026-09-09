@@ -728,22 +728,14 @@ async def _streamyard_fetch(url: str) -> dict:
         Path(tmp_path).unlink(missing_ok=True)
 
 
-async def _pdf_fetch(url: str) -> dict:
-    """Download a PDF and extract text with pdfplumber."""
+def _pdf_extract(pdf_bytes: bytes, url: str) -> dict:
+    """Extract text from PDF bytes with pdfplumber.
+
+    Split out from _pdf_fetch so the generic HTML path can reuse it for bytes
+    it has already downloaded (see _response_is_pdf).
+    """
     import io
     import pdfplumber
-
-    try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=60) as client:
-            resp = await client.get(
-                url,
-                headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"},
-            )
-            resp.raise_for_status()
-            pdf_bytes = resp.content
-    except Exception as e:
-        logger.warning(f"PDF download failed for {url}: {e}")
-        return {"text": "", "title": url, "source_type": "unknown", "reason": fetch_errors.PDF_DOWNLOAD_FAILED}
 
     try:
         pages_text = []
@@ -763,6 +755,45 @@ async def _pdf_fetch(url: str) -> dict:
         return {"text": "", "title": title, "source_type": "pdf", "reason": fetch_errors.IMAGE_ONLY_PDF}
 
     return {"text": text[:MAX_CONTENT_CHARS], "title": title, "source_type": "pdf"}
+
+
+async def _pdf_fetch(url: str) -> dict:
+    """Download a PDF and extract text with pdfplumber."""
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=60) as client:
+            resp = await client.get(
+                url,
+                headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"},
+            )
+            resp.raise_for_status()
+            pdf_bytes = resp.content
+    except Exception as e:
+        logger.warning(f"PDF download failed for {url}: {e}")
+        return {"text": "", "title": url, "source_type": "unknown", "reason": fetch_errors.PDF_DOWNLOAD_FAILED}
+
+    return _pdf_extract(pdf_bytes, url)
+
+
+# Content types that mean "this body is a PDF". The URL-suffix dispatch in
+# _fetch_url_uncached only catches paths ending in .pdf; plenty of hosts serve
+# PDFs from extension-less URLs (arxiv.org/pdf/2402.01071) or mislabel the
+# type, so the generic path sniffs the response it already holds.
+_PDF_CONTENT_TYPES = frozenset({
+    "application/pdf",
+    "application/x-pdf",
+    "text/pdf",
+    "text/x-pdf",
+})
+
+
+def _response_is_pdf(resp) -> bool:
+    """True when an HTTP response body is a PDF rather than HTML."""
+    ctype = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
+    if ctype in _PDF_CONTENT_TYPES:
+        return True
+    # Some hosts label PDFs as octet-stream or even text/html. The %PDF- magic
+    # bytes are unambiguous, so they get the final say.
+    return (resp.content or b"")[:5] == b"%PDF-"
 
 
 def _curl_cffi_get(url: str):
@@ -842,10 +873,21 @@ async def _generic_fetch(url: str) -> dict:
     try:
         loop = asyncio.get_running_loop()
         resp = await loop.run_in_executor(None, _curl_cffi_get, url)
-        html = resp.text
+        # Not every PDF announces itself in the URL: arXiv serves application/pdf
+        # from extension-less paths like /pdf/2402.01071, and Unpaywall's
+        # url_for_pdf often does the same. Without this, PDF bytes reach
+        # trafilatura, extract to nothing, and surface as "reached the page but
+        # couldn't find readable article text" — a wall message for a file that
+        # was never walled. Sniffing costs no extra request: the bytes are here.
+        pdf_bytes = resp.content if _response_is_pdf(resp) else None
+        html = "" if pdf_bytes is not None else resp.text
     except Exception as e:
         logger.warning(f"Generic fetch failed for {url}: {e}")
         return {"text": "", "title": url, "source_type": "unknown", "reason": fetch_errors.FETCH_FAILED}
+
+    if pdf_bytes is not None:
+        logger.info("Generic fetch for %s returned a PDF (%d bytes); extracting as PDF", url, len(pdf_bytes))
+        return _pdf_extract(pdf_bytes, url)
 
     logger.debug(f"Fetched {url} — status={resp.status_code} len={len(html)}")
 
@@ -1112,6 +1154,8 @@ async def _academic_fetch(url: str, doi: str) -> dict | None:
     if oa_url:
         try:
             assert_public_url(oa_url)  # OA URL is attacker-influenceable via the API
+            # Suffix check is only a fast path; an extension-less OA PDF falls
+            # through to _generic_fetch, which sniffs the body and routes it.
             is_pdf = oa_url.split("?")[0].lower().endswith(".pdf")
             oa = await (_pdf_fetch(oa_url) if is_pdf else _generic_fetch(oa_url))
             if oa.get("text", "").strip():

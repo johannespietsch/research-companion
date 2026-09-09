@@ -1028,3 +1028,126 @@ class TestTweetVideoTranscript:
 
         assert "full spoken text" in result["text"]
         assert result["transcript_source"] == "whisper"
+
+
+class TestExtensionlessPdf:
+    """A PDF served from a URL without a .pdf suffix (arxiv.org/pdf/2402.01071)
+    used to reach trafilatura as binary, extract to nothing, and surface the
+    "JS-only or paywalled" wall message. The generic path sniffs the response
+    body instead, at no extra request."""
+
+    def _resp(self, *, content_type: str, body: bytes):
+        r = MagicMock()
+        r.headers = {"content-type": content_type}
+        r.content = body
+        r.status_code = 200
+        r.text = body.decode("latin-1")
+        return r
+
+    def test_detects_pdf_by_content_type(self):
+        from bot import fetcher
+        assert fetcher._response_is_pdf(
+            self._resp(content_type="application/pdf", body=b"%PDF-1.7 ...")
+        )
+        # charset parameters and casing must not defeat the match
+        assert fetcher._response_is_pdf(
+            self._resp(content_type="Application/PDF; charset=binary", body=b"junk")
+        )
+
+    def test_detects_pdf_by_magic_bytes_when_mislabelled(self):
+        from bot import fetcher
+        # Hosts that serve PDFs as octet-stream or even text/html.
+        assert fetcher._response_is_pdf(
+            self._resp(content_type="application/octet-stream", body=b"%PDF-1.4 body")
+        )
+        assert fetcher._response_is_pdf(
+            self._resp(content_type="text/html", body=b"%PDF-1.4 body")
+        )
+
+    def test_html_is_not_treated_as_pdf(self):
+        from bot import fetcher
+        assert not fetcher._response_is_pdf(
+            self._resp(content_type="text/html; charset=utf-8", body=b"<html><body>hi</body></html>")
+        )
+        # a page that merely mentions the magic string isn't a PDF
+        assert not fetcher._response_is_pdf(
+            self._resp(content_type="text/html", body=b"<p>files start with %PDF-</p>")
+        )
+
+    def test_generic_fetch_routes_pdf_body_to_pdf_extract(self, monkeypatch):
+        from bot import fetcher
+
+        url = "https://arxiv.org/pdf/2402.01071"
+        resp = self._resp(content_type="application/pdf", body=b"%PDF-1.7 binary")
+        monkeypatch.setattr(fetcher, "_curl_cffi_get", lambda u: resp)
+
+        seen = {}
+
+        def fake_extract(pdf_bytes, u):
+            seen["bytes"], seen["url"] = pdf_bytes, u
+            return {"text": "paper body " * 40, "title": "Chameleon", "source_type": "pdf"}
+
+        monkeypatch.setattr(fetcher, "_pdf_extract", fake_extract)
+        result = asyncio.run(fetcher._generic_fetch(url))
+
+        # Reuses the bytes already downloaded — no second request.
+        assert seen["bytes"] == b"%PDF-1.7 binary"
+        assert seen["url"] == url
+        assert result["source_type"] == "pdf"
+        assert result.get("reason") is None
+
+    def test_extensionless_pdf_no_longer_reports_a_wall(self, monkeypatch):
+        """End-to-end regression: the reported bug was NO_TEXT_EXTRACTED on a
+        perfectly readable arXiv PDF."""
+        from bot import fetcher
+
+        pdf_body = b"%PDF-1.7 binary"
+        resp = self._resp(content_type="application/pdf", body=pdf_body)
+        monkeypatch.setattr(fetcher, "assert_public_url", lambda u: None)
+        monkeypatch.setattr(fetcher, "_curl_cffi_get", lambda u: resp)
+        monkeypatch.setattr(
+            fetcher, "_pdf_extract",
+            lambda b, u: {"text": "real paper text " * 40, "title": "Chameleon", "source_type": "pdf"},
+        )
+
+        result = asyncio.run(fetcher._fetch_url_uncached("https://arxiv.org/pdf/2402.01071"))
+
+        assert result.get("reason") is None
+        assert result["source_type"] == "pdf"
+        assert result["text"].startswith("real paper text")
+
+    def test_suffix_pdf_still_uses_direct_download(self, monkeypatch):
+        """The .pdf fast path is unchanged — it must not start going through
+        the generic fetcher."""
+        from bot import fetcher
+
+        monkeypatch.setattr(fetcher, "assert_public_url", lambda u: None)
+
+        async def fake_pdf_fetch(u):
+            return {"text": "direct " * 40, "title": "Doc", "source_type": "pdf"}
+
+        async def boom(u):  # pragma: no cover - must not be reached
+            raise AssertionError("suffix PDF should not hit _generic_fetch")
+
+        monkeypatch.setattr(fetcher, "_pdf_fetch", fake_pdf_fetch)
+        monkeypatch.setattr(fetcher, "_generic_fetch", boom)
+        result = asyncio.run(fetcher._fetch_url_uncached("https://example.com/paper.pdf"))
+        assert result["source_type"] == "pdf"
+
+    def test_pdf_extract_reports_image_only_pdf(self, monkeypatch):
+        """Split-out extractor keeps the scanned-PDF reason code."""
+        from bot import fetcher, fetch_errors
+
+        pdf = MagicMock()
+        pdf.metadata = {"Title": "Scan"}
+        page = MagicMock()
+        page.extract_text.return_value = ""
+        pdf.pages = [page]
+        pdf.__enter__ = lambda s: pdf
+        pdf.__exit__ = lambda s, *a: False
+
+        with patch("pdfplumber.open", return_value=pdf):
+            result = fetcher._pdf_extract(b"%PDF-1.4", "https://example.com/scan")
+
+        assert result["reason"] == fetch_errors.IMAGE_ONLY_PDF
+        assert result["title"] == "Scan"
