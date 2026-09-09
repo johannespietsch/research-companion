@@ -26,6 +26,10 @@ pyjwt[crypto]>=2.8.0
 # web UI file uploads
 python-multipart>=0.0.9
 # MCP server (/mcp, Streamable HTTP) — filter.fyi as a tool for AI agents
-mcp>=1.13.0
+# Capped below 2: mcp 2.x renamed FastMCP -> MCPServer and moved the module,
+# so bot/mcp_server.py's `from mcp.server.fastmcp import FastMCP` dies at
+# import time and uvicorn never binds. An unpinned cold rebuild pulled 2.x
+# and crash-looped prod (2026-09-09). Lift only with the v2 migration.
+mcp>=1.13.0,<2
 # tests
 pytest>=8.0.0
