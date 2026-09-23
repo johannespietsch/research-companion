@@ -122,7 +122,18 @@ def _transcribe_hosted(file_path: str) -> str:
 
 def _transcribe_local(file_path: str) -> str:
     model = _get_model()
-    segments, info = model.transcribe(file_path, beam_size=5)
+    # condition_on_previous_text=True (the default) feeds each chunk's output
+    # back in as context for the next. If the opening seconds are quiet or
+    # ambiguous (e.g. a countdown intro), language detection can come back
+    # low-confidence and misfire, and that bad output then self-reinforces
+    # into a hallucination loop (a wall of ".") for the rest of the file.
+    # vad_filter skips non-speech stretches so a weak intro can't seed it.
+    segments, info = model.transcribe(
+        file_path,
+        beam_size=5,
+        vad_filter=True,
+        condition_on_previous_text=False,
+    )
     text = " ".join(s.text for s in segments).strip()
     logger.info(f"Transcribed {file_path} ({info.language}, {info.duration:.1f}s)")
     return text
