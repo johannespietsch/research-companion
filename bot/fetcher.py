@@ -71,7 +71,41 @@ def _lang_base(code: str) -> str:
     return (code or "").split("-")[0].lower()
 
 
-def _select_transcript(transcripts: list):
+def _youtube_spoken_language(url: str) -> str | None:
+    """The video's original spoken language per yt-dlp (`info['language']`,
+    e.g. 'en-US'), or None if the metadata pass fails or doesn't say."""
+    import yt_dlp
+
+    try:
+        with yt_dlp.YoutubeDL({"quiet": True, "skip_download": True}) as ydl:
+            info = ydl.extract_info(url, download=False) or {}
+        return info.get("language") or None
+    except Exception as e:
+        logger.info("spoken-language lookup failed for %s: %s", url, e)
+        return None
+
+
+def _original_generated_track(generated: list, spoken_language):
+    """Pick the ASR track in the spoken language when there are several.
+
+    YouTube auto-dubbing adds one auto-generated track per dubbed audio track,
+    all labelled "<Language> (auto-generated)" and listed alphabetically, so
+    the first one is usually Arabic (issue #128, video K9gwvAcz1do: 21 tracks).
+    The list itself can't tell the original apart, so ask `spoken_language()`
+    (a yt-dlp metadata call — only made in this case), then English, then the
+    first listed."""
+    if len(generated) == 1:
+        return generated[0]
+    lang = spoken_language() if spoken_language else None
+    for want in (lang, "en"):
+        if want:
+            match = next((t for t in generated if _lang_base(t.language_code) == _lang_base(want)), None)
+            if match:
+                return match
+    return generated[0]
+
+
+def _select_transcript(transcripts: list, spoken_language=None):
     """Choose which caption track to summarise from.
 
     Creators often upload many *manual translation* tracks (this video has 20+:
@@ -85,8 +119,13 @@ def _select_transcript(transcripts: list):
     itself. Only when there's no ASR track to anchor on do we fall back to a
     manual track — English first (the common original), else whatever's listed
     first — and finally any generated track.
+
+    With several ASR tracks (auto-dubbed videos), see
+    `_original_generated_track`; `spoken_language` is a zero-arg callable so
+    the lookup only runs when it's needed.
     """
-    generated = next((t for t in transcripts if t.is_generated), None)
+    all_generated = [t for t in transcripts if t.is_generated]
+    generated = _original_generated_track(all_generated, spoken_language) if all_generated else None
     manuals = [t for t in transcripts if not t.is_generated]
 
     original_lang = generated.language_code if generated else None
@@ -119,7 +158,9 @@ def _youtube_transcript(url: str, max_whisper_duration: int = WHISPER_MAX_DURATI
         # manual track (that summarised multi-subtitle videos in a random
         # language — issue #57).
         transcripts = list(api.list(video_id))
-        transcript = _select_transcript(transcripts)
+        transcript = _select_transcript(
+            transcripts, spoken_language=lambda: _youtube_spoken_language(url)
+        )
         if transcript is not None:
             fetched = transcript.fetch()
             text = " ".join(snippet.text for snippet in fetched)

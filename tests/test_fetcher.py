@@ -109,6 +109,65 @@ class TestYouTubeFallbackChain:
         assert "guten tag" in result["text"]
         assert result["language"] == "de"
 
+    def _autodub_tracks(self, codes=("ar", "bn", "de", "en", "fr")):
+        """Auto-dubbed video: one ASR track per dubbed language, alphabetical
+        by name, all is_generated=True (issue #128, K9gwvAcz1do)."""
+        return [
+            self._mock_transcript(language_code=c, is_generated=True, snippets=(f"asr-{c}",))
+            for c in codes
+        ]
+
+    def test_autodub_picks_spoken_language_from_yt_dlp(self):
+        """Issue #128: all tracks are generated, Arabic is listed first. The
+        German original must win when yt-dlp says the video is German."""
+        from bot import fetcher
+
+        with patch("youtube_transcript_api.YouTubeTranscriptApi") as TranscriptApi, \
+             patch.object(fetcher, "_youtube_oembed_title", return_value="t"), \
+             patch.object(fetcher, "_youtube_spoken_language", return_value="de-DE") as lookup:
+            TranscriptApi.return_value.list.return_value = self._autodub_tracks()
+            result = fetcher._youtube_transcript(YOUTUBE_URL)
+
+        assert "asr-de" in result["text"]
+        assert result["language"] == "de"
+        lookup.assert_called_once_with(YOUTUBE_URL)
+
+    def test_autodub_falls_back_to_english_when_lookup_fails(self):
+        from bot import fetcher
+
+        with patch("youtube_transcript_api.YouTubeTranscriptApi") as TranscriptApi, \
+             patch.object(fetcher, "_youtube_oembed_title", return_value="t"), \
+             patch.object(fetcher, "_youtube_spoken_language", return_value=None):
+            TranscriptApi.return_value.list.return_value = self._autodub_tracks()
+            result = fetcher._youtube_transcript(YOUTUBE_URL)
+
+        assert "asr-en" in result["text"]
+        assert "asr-ar" not in result["text"]
+
+    def test_autodub_takes_first_listed_without_lookup_or_english(self):
+        from bot import fetcher
+
+        with patch("youtube_transcript_api.YouTubeTranscriptApi") as TranscriptApi, \
+             patch.object(fetcher, "_youtube_oembed_title", return_value="t"), \
+             patch.object(fetcher, "_youtube_spoken_language", return_value=None):
+            TranscriptApi.return_value.list.return_value = self._autodub_tracks(("fr", "ja"))
+            result = fetcher._youtube_transcript(YOUTUBE_URL)
+
+        assert "asr-fr" in result["text"]
+
+    def test_single_generated_track_skips_language_lookup(self):
+        """The yt-dlp call costs seconds; only auto-dubbed videos need it."""
+        from bot import fetcher
+
+        de_auto = self._mock_transcript(language_code="de", is_generated=True)
+        with patch("youtube_transcript_api.YouTubeTranscriptApi") as TranscriptApi, \
+             patch.object(fetcher, "_youtube_oembed_title", return_value="t"), \
+             patch.object(fetcher, "_youtube_spoken_language") as lookup:
+            TranscriptApi.return_value.list.return_value = [de_auto]
+            fetcher._youtube_transcript(YOUTUBE_URL)
+
+        lookup.assert_not_called()
+
     def test_transcript_api_title_falls_back_to_placeholder(self):
         from bot import fetcher
 
