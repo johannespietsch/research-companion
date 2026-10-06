@@ -16,6 +16,9 @@ if [ -n "$TS_AUTHKEY" ]; then
   TS_STATE_DIR="${DATA_DIR:-/data}/tailscale"
   TS_SOCKET=/tmp/tailscaled.sock
   mkdir -p "$TS_STATE_DIR"
+  # The app sends YouTube traffic here (bot.config.YOUTUBE_PROXY); only set
+  # when tailscaled actually runs, so without a key fetches record 'direct'.
+  export YOUTUBE_PROXY="${YOUTUBE_PROXY:-socks5h://localhost:1055}"
   echo "[entrypoint] starting tailscaled (userspace, SOCKS5 localhost:1055)"
   tailscaled --tun=userspace-networking --socks5-server=localhost:1055 \
     --state="$TS_STATE_DIR/tailscaled.state" --socket="$TS_SOCKET" \
