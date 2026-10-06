@@ -25,11 +25,28 @@ if [ -n "$TS_AUTHKEY" ]; then
     >/tmp/tailscaled.log 2>&1 &
   (
     sleep 2
-    tailscale --socket="$TS_SOCKET" up --reset --auth-key="$TS_AUTHKEY" \
-      --hostname="${TS_HOSTNAME:-filter-fyi-backend}" --advertise-tags=tag:fly \
-      ${TS_EXIT_NODE:+--exit-node="$TS_EXIT_NODE"} --timeout=60s \
-      && echo "[entrypoint] tailscale up (exit node: ${TS_EXIT_NODE:-none})" \
-      || echo "[entrypoint] tailscale up failed — YouTube will go direct"
+    # Two steps: `up --exit-node=<hostname>` fails before login ("cannot
+    # resolve exit node by hostname while Tailscale is starting up"), so log
+    # in first, then set the exit node by name once peers are known. Errors
+    # are logged with the key redacted.
+    redact() { sed 's/tskey-[A-Za-z0-9-]*/tskey-REDACTED/g'; }
+    if out=$(tailscale --socket="$TS_SOCKET" up --reset --auth-key="$TS_AUTHKEY" \
+        --hostname="${TS_HOSTNAME:-filter-fyi-backend}" --advertise-tags=tag:fly \
+        --timeout=60s 2>&1); then
+      echo "[entrypoint] tailscale up"
+    else
+      echo "[entrypoint] tailscale up failed — YouTube will go direct: $(echo "$out" | redact)"
+      exit 0
+    fi
+    [ -n "$TS_EXIT_NODE" ] || exit 0
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      if out=$(tailscale --socket="$TS_SOCKET" set --exit-node="$TS_EXIT_NODE" 2>&1); then
+        echo "[entrypoint] tailscale exit node: $TS_EXIT_NODE"
+        exit 0
+      fi
+      sleep 3
+    done
+    echo "[entrypoint] setting exit node $TS_EXIT_NODE failed — YouTube will go direct: $(echo "$out" | redact)"
   ) &
 else
   echo "[entrypoint] TS_AUTHKEY unset — starting without Tailscale egress"
