@@ -101,6 +101,28 @@ _MONITOR_ENABLED = os.getenv("MONITOR_ENABLED", "true").lower() in ("1", "true",
 _MONITOR_INTERVAL_S = int(os.getenv("MONITOR_INTERVAL_S", "3600"))
 
 
+# YouTube egress monitor (#128): probe the home-Mac proxy on a timer and DM
+# ADMIN_TELEGRAM_CHAT_ID on down / still-down / recovered. Only runs when a
+# proxy is configured (the entrypoint sets YOUTUBE_PROXY once tailscaled runs).
+_EGRESS_MONITOR_ENABLED = os.getenv("EGRESS_MONITOR_ENABLED", "true").lower() in ("1", "true", "yes")
+_EGRESS_MONITOR_INTERVAL_S = int(os.getenv("EGRESS_MONITOR_INTERVAL_S", "300"))
+
+
+async def _egress_monitor_loop() -> None:
+    """Check the YouTube egress proxy every EGRESS_MONITOR_INTERVAL_S."""
+    from bot.egress_monitor import EgressMonitor, check_once
+
+    monitor = EgressMonitor()
+    while True:
+        try:
+            await asyncio.sleep(_EGRESS_MONITOR_INTERVAL_S)
+            await asyncio.to_thread(check_once, monitor)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Egress monitor check failed; retrying next interval")
+
+
 async def _daily_error_scan_loop() -> None:
     """Wake once a day at SCAN_HOUR_UTC and run scripts.scan_errors.run_scan."""
     from scripts.scan_errors import run_scan
@@ -271,6 +293,10 @@ async def lifespan(app: FastAPI):
     if _MONITOR_ENABLED:
         maintenance_tasks.append(asyncio.create_task(_monitor_loop()))
         logger.info("Channel monitor enabled (interval=%ds)", _MONITOR_INTERVAL_S)
+    from bot import config as _config
+    if _EGRESS_MONITOR_ENABLED and _config.YOUTUBE_PROXY:
+        maintenance_tasks.append(asyncio.create_task(_egress_monitor_loop()))
+        logger.info("Egress monitor enabled (interval=%ds)", _EGRESS_MONITOR_INTERVAL_S)
 
     # The MCP transport's session manager must run for the app's lifetime —
     # entering it here ties its task group to FastAPI's lifespan.

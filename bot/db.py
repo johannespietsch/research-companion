@@ -1435,6 +1435,21 @@ def estimate_avg_cost_per_call(purpose: str, lookback_days: int = 7) -> float:
 # Processed URLs audit log
 # ---------------------------------------------------------------------------
 
+def count_processed_urls_by_egress(egress: str, since_iso: str) -> int:
+    """How many processed_urls rows took `egress` since `since_iso`
+    ('YYYY-MM-DDTHH:MM:SS', UTC). Used by the egress monitor's recovery
+    message (#128); best-effort, 0 on any DB error."""
+    try:
+        with _get_conn() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM processed_urls WHERE egress = ? AND ts >= ?",
+                (egress, since_iso),
+            ).fetchone()
+        return int(row["n"] or 0)
+    except Exception:
+        return 0
+
+
 def record_processed_url(
     *,
     url: str,
