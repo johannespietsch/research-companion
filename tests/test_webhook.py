@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -206,6 +207,129 @@ class TestWebhookDedup:
         c.post("/webhook", json={"update_id": 101}, headers=hdr)
         _drain_webhook_tasks(main_mod)
         assert app_stub.process_update.await_count == 2
+
+
+class TestTelegramModeResolution:
+    """Which update transport we pick, and when we refuse to pick one.
+
+    The polling refusal is the one that matters operationally: python-telegram-bot
+    always calls deleteWebhook when polling starts, so a local run against the
+    production token unregisters the deployed webhook and the live bot goes
+    silent — with no error anywhere, because the app never sees the traffic and
+    Telegram is never asked to deliver. This happened on 2026-08-06.
+    """
+
+    def test_webhook_with_secret(self, main_mod):
+        mode, reason = main_mod._resolve_telegram_mode(
+            "https://example.com", "s3cret", False
+        )
+        assert mode == "webhook"
+        assert reason == ""
+
+    def test_webhook_without_secret_refuses(self, main_mod):
+        """Never register an unauthenticated webhook — anyone who learned the
+        URL could forge updates and act as any chat."""
+        mode, reason = main_mod._resolve_telegram_mode("https://example.com", "", False)
+        assert mode == "off"
+        assert "TELEGRAM_WEBHOOK_SECRET" in reason
+
+    def test_webhook_wins_over_allow_polling(self, main_mod):
+        """WEBHOOK_URL set in prod must not be overridden by a stray
+        ALLOW_POLLING in the environment."""
+        mode, _ = main_mod._resolve_telegram_mode(
+            "https://example.com", "s3cret", True
+        )
+        assert mode == "webhook"
+
+    def test_polling_without_optin_refuses(self, main_mod):
+        mode, reason = main_mod._resolve_telegram_mode(None, None, False)
+        assert mode == "off"
+        assert "ALLOW_POLLING" in reason
+
+    def test_polling_with_optin(self, main_mod):
+        mode, reason = main_mod._resolve_telegram_mode(None, None, True)
+        assert mode == "polling"
+        assert reason == ""
+
+    def test_empty_webhook_url_is_not_webhook_mode(self, main_mod):
+        """An unset env var arrives as "" via os.getenv, not None."""
+        mode, _ = main_mod._resolve_telegram_mode("", "s3cret", False)
+        assert mode == "off"
+
+
+class TestLifespanTelegramWiring:
+    """The decision table above is pure; these pin that lifespan acts on it."""
+
+    @pytest.fixture
+    def app_stub(self, main_mod, monkeypatch):
+        stub = MagicMock()
+        stub.initialize = AsyncMock()
+        stub.start = AsyncMock()
+        stub.stop = AsyncMock()
+        stub.shutdown = AsyncMock()
+        stub.bot.set_webhook = AsyncMock()
+        stub.updater.start_polling = AsyncMock()
+        stub.updater.stop = AsyncMock()
+        monkeypatch.setattr(main_mod, "telegram_app", stub)
+        # Keep the maintenance loops out of the way.
+        monkeypatch.setattr(main_mod, "_SCAN_ERRORS_ENABLED", False)
+        monkeypatch.setattr(main_mod, "_PRUNE_ENABLED", False)
+        monkeypatch.setattr(main_mod, "_DIGEST_ENABLED", False)
+        monkeypatch.setattr(main_mod, "_MONITOR_ENABLED", False)
+
+        # The MCP session manager is a module-level singleton whose .run() may
+        # only be entered once per process, so a second lifespan in the same
+        # test session would blow up on it. Irrelevant to Telegram wiring.
+        @asynccontextmanager
+        async def _noop_session_manager():
+            yield
+
+        # Patch the module-level name lifespan reads, not the FastMCP object —
+        # `session_manager` is a read-only property. The already-mounted ASGI
+        # sub-app keeps its own reference, so nothing else is affected.
+        monkeypatch.setattr(
+            main_mod, "mcp",
+            MagicMock(session_manager=MagicMock(run=_noop_session_manager)),
+        )
+        return stub
+
+    def test_refused_polling_never_touches_telegram(
+        self, main_mod, monkeypatch, app_stub
+    ):
+        """The whole point: no deleteWebhook, by way of no start_polling."""
+        monkeypatch.setattr(main_mod, "WEBHOOK_URL", None)
+        monkeypatch.setattr(main_mod, "ALLOW_POLLING", False)
+
+        with TestClient(main_mod.app) as c:
+            assert c.get("/health").status_code == 200  # web still serves
+
+        app_stub.updater.start_polling.assert_not_awaited()
+        app_stub.bot.set_webhook.assert_not_awaited()
+        # Shutdown must not stop an updater that was never started.
+        app_stub.updater.stop.assert_not_awaited()
+
+    def test_optin_starts_polling_and_stops_it(self, main_mod, monkeypatch, app_stub):
+        monkeypatch.setattr(main_mod, "WEBHOOK_URL", None)
+        monkeypatch.setattr(main_mod, "ALLOW_POLLING", True)
+
+        with TestClient(main_mod.app):
+            pass
+
+        app_stub.updater.start_polling.assert_awaited_once()
+        app_stub.updater.stop.assert_awaited_once()
+
+    def test_webhook_mode_registers_with_secret(self, main_mod, monkeypatch, app_stub):
+        monkeypatch.setattr(main_mod, "WEBHOOK_URL", "https://example.com/")
+        monkeypatch.setattr(main_mod, "WEBHOOK_SECRET", "s3cret")
+
+        with TestClient(main_mod.app):
+            pass
+
+        app_stub.bot.set_webhook.assert_awaited_once_with(
+            "https://example.com/webhook", secret_token="s3cret"
+        )
+        app_stub.updater.start_polling.assert_not_awaited()
+        app_stub.updater.stop.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

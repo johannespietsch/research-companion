@@ -5,9 +5,15 @@ Always run via uvicorn:
     uvicorn main:app --reload --host 0.0.0.0 --port 8080
 
 Modes (auto-detected from environment):
-  - No WEBHOOK_URL   → Telegram long-polling runs as a background task alongside the web server
+  - No WEBHOOK_URL   → Telegram long-polling, but only with ALLOW_POLLING set (see below)
   - WEBHOOK_URL set  → Telegram uses webhook; register at /webhook
   - No TELEGRAM_TOKEN → web UI only (no Telegram)
+
+Polling requires an explicit ALLOW_POLLING opt-in because python-telegram-bot
+*always* calls deleteWebhook when polling starts. Running locally against the
+production token therefore unregisters the live webhook and silently kills the
+deployed bot until the next restart re-runs this lifespan. See
+_resolve_telegram_mode().
 """
 
 import asyncio
@@ -39,11 +45,22 @@ from bot.error_logging import install as install_sqlite_log_handler  # noqa: E40
 install_sqlite_log_handler()
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
+
+# Keep bot tokens out of the logs. httpx logs every Bot API call at INFO with
+# the token in the URL path, which put the credential in plaintext in Fly logs.
+# Installed after every handler is attached — the filter binds to handlers.
+from bot.log_redaction import install as install_log_redaction  # noqa: E402
+
+install_log_redaction(extra_secrets=(TOKEN or "",))
+
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 # Shared secret echoed by Telegram in the X-Telegram-Bot-Api-Secret-Token header.
 # Without it, anyone who learns the webhook URL could POST forged updates and act
 # as any chat. Required whenever WEBHOOK_URL is set (see lifespan + /webhook).
 WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET")
+
+# Opt-in required to start long-polling. See _resolve_telegram_mode().
+ALLOW_POLLING = os.getenv("ALLOW_POLLING", "").lower() in ("1", "true", "yes")
 
 telegram_app = None
 if TOKEN:
@@ -167,6 +184,46 @@ async def _monitor_loop() -> None:
 _EXECUTOR_WORKERS = int(os.getenv("EXECUTOR_WORKERS", "16"))
 
 
+def _resolve_telegram_mode(
+    webhook_url: str | None, webhook_secret: str | None, allow_polling: bool
+) -> tuple[str, str]:
+    """Decide how (or whether) to receive Telegram updates.
+
+    Returns (mode, reason) where mode is one of "webhook", "polling" or "off".
+    `reason` is the operator-facing explanation, logged as an error when we
+    refuse. Pure so the decision table can be tested without a lifespan.
+
+    Both refusals fail closed — the web server still comes up, the bot just
+    stays silent. A silent bot is recoverable; the alternatives are not:
+
+    - webhook without a secret would let anyone who learns the URL forge
+      updates and act as any chat.
+    - polling without an explicit opt-in is the footgun that took the live bot
+      down: python-telegram-bot always calls deleteWebhook when polling starts
+      ("we just always call delete_webhook for polling" — Updater._bootstrap),
+      so a local `make dev` against the production token unregisters the
+      deployed webhook. Nothing restores it on shutdown, and prod looks
+      perfectly healthy while receiving nothing.
+    """
+    if webhook_url:
+        if not webhook_secret:
+            return "off", (
+                "WEBHOOK_URL is set but TELEGRAM_WEBHOOK_SECRET is missing — "
+                "refusing to register an unauthenticated webhook"
+            )
+        return "webhook", ""
+
+    if not allow_polling:
+        return "off", (
+            "No WEBHOOK_URL and ALLOW_POLLING is not set — refusing to start "
+            "long-polling. Polling deletes any webhook registered for this "
+            "token, so doing it with the production token silently kills the "
+            "deployed bot. Use a separate dev bot token from @BotFather, then "
+            "set ALLOW_POLLING=1 to run locally."
+        )
+    return "polling", ""
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     import concurrent.futures
@@ -178,24 +235,21 @@ async def lifespan(app: FastAPI):
     )
     logger.info("Default thread pool sized to %d workers", _EXECUTOR_WORKERS)
 
+    telegram_mode = "off"
     if telegram_app:
         await telegram_app.initialize()
-        if WEBHOOK_URL:
-            if not WEBHOOK_SECRET:
-                # Fail closed: registering an unauthenticated webhook would let
-                # anyone forge updates. Don't set it — the bot stays silent
-                # until TELEGRAM_WEBHOOK_SECRET is configured.
-                logger.error(
-                    "WEBHOOK_URL is set but TELEGRAM_WEBHOOK_SECRET is missing — "
-                    "refusing to register an unauthenticated webhook"
-                )
-            else:
-                webhook_endpoint = f"{WEBHOOK_URL.rstrip('/')}/webhook"
-                await telegram_app.bot.set_webhook(
-                    webhook_endpoint, secret_token=WEBHOOK_SECRET
-                )
-                logger.info("Telegram webhook set to %s", webhook_endpoint)
-        else:
+        telegram_mode, refusal = _resolve_telegram_mode(
+            WEBHOOK_URL, WEBHOOK_SECRET, ALLOW_POLLING
+        )
+        if refusal:
+            logger.error("%s", refusal)
+        elif telegram_mode == "webhook":
+            webhook_endpoint = f"{WEBHOOK_URL.rstrip('/')}/webhook"
+            await telegram_app.bot.set_webhook(
+                webhook_endpoint, secret_token=WEBHOOK_SECRET
+            )
+            logger.info("Telegram webhook set to %s", webhook_endpoint)
+        elif telegram_mode == "polling":
             # Dev / local: polling as a background task on uvicorn's event loop
             await telegram_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
             logger.info("Telegram polling started")
@@ -231,7 +285,9 @@ async def lifespan(app: FastAPI):
             pass
 
     if telegram_app:
-        if not WEBHOOK_URL:
+        # Only stop the updater if we actually started it — a refused polling
+        # start leaves it un-started, and stopping it then raises.
+        if telegram_mode == "polling":
             await telegram_app.updater.stop()
         await telegram_app.stop()
         await telegram_app.shutdown()

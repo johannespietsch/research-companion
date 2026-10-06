@@ -76,6 +76,12 @@ GROQ_API_KEY=your-groq-key
 # Optional -- set for production webhook mode
 WEBHOOK_URL=https://your-domain.com
 
+# Required to run local long-polling (i.e. when WEBHOOK_URL is unset).
+# Starting polling ALWAYS deletes whatever webhook is registered for the token,
+# so doing it with the production token silently kills the deployed bot until
+# its next restart. Use a separate dev bot from @BotFather, then opt in here.
+# ALLOW_POLLING=1
+
 # Required for the public /api/try endpoint -- the filter.fyi Cloudflare
 # Worker authenticates with a matching `x-filter-fyi-secret` header.
 FILTER_FYI_TRY_SECRET=long-random-string
@@ -103,8 +109,28 @@ FILTER_FYI_TRY_SECRET=long-random-string
 **Local development** (polling, no public URL needed):
 
 ```bash
-python main.py
+ALLOW_POLLING=1 make dev
 ```
+
+> **Use a dev bot token locally, not the production one.** python-telegram-bot
+> always calls `deleteWebhook` when polling starts, so polling with the prod
+> token unregisters the deployed webhook. The live bot then goes silent —
+> health checks stay green, Telegram reports no delivery error, and nothing
+> restores the webhook until the next deploy re-runs the lifespan. That's what
+> `ALLOW_POLLING` guards; without it the app boots web-only and logs why.
+>
+> To recover a webhook that's already been wiped, re-register from the running
+> machine (uses prod's own secret, never a local copy):
+>
+> ```bash
+> flyctl ssh console -a filter-fyi-backend -C "python -c \"
+> import os, json, urllib.request, urllib.parse
+> t, s = os.environ['TELEGRAM_TOKEN'], os.environ['TELEGRAM_WEBHOOK_SECRET']
+> url = os.environ['WEBHOOK_URL'].rstrip('/') + '/webhook'
+> data = urllib.parse.urlencode({'url': url, 'secret_token': s}).encode()
+> print(json.load(urllib.request.urlopen(f'https://api.telegram.org/bot{t}/setWebhook', data=data)))
+> \""
+> ```
 
 **Production** (webhook via FastAPI/uvicorn):
 
@@ -113,7 +139,7 @@ export WEBHOOK_URL=https://your-domain.com
 uvicorn main:app --host 0.0.0.0 --port 8080
 ```
 
-The mode is selected automatically -- if `WEBHOOK_URL` is set, it builds a FastAPI app with a `/webhook` endpoint and `/health` check. Otherwise it runs in long-polling mode.
+The mode is selected automatically -- if `WEBHOOK_URL` is set, it builds a FastAPI app with a `/webhook` endpoint and `/health` check. Otherwise it runs in long-polling mode, but only with `ALLOW_POLLING` set. Both refusals fail closed: the web server still serves, the bot just stays silent.
 
 ### Bot Commands
 
