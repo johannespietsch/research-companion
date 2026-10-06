@@ -1,3 +1,9 @@
+# Pinned binary sources (COPY --from can't expand ARGs, hence named stages).
+ARG TAILSCALE_VERSION=v1.102.5
+ARG DENO_VERSION=2.9.7
+FROM docker.io/tailscale/tailscale:${TAILSCALE_VERSION} AS tailscale
+FROM docker.io/denoland/deno:bin-${DENO_VERSION} AS deno
+
 FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -29,6 +35,19 @@ ARG LITESTREAM_VERSION=0.3.13
 ARG TARGETARCH=amd64
 RUN curl -fsSL "https://github.com/benbjohnson/litestream/releases/download/v${LITESTREAM_VERSION}/litestream-v${LITESTREAM_VERSION}-linux-${TARGETARCH}.tar.gz" \
       | tar -xz -C /usr/local/bin litestream
+
+# Tailscale — YouTube blocks Fly's datacenter IPs (captions → RequestBlocked,
+# yt-dlp → "confirm you're not a bot"), so YouTube traffic leaves via a home
+# exit node over Tailscale (#128). Userspace mode only: no TUN device, the
+# machine's routing is untouched, and only requests sent to tailscaled's
+# local SOCKS5 proxy use the tailnet. Started by docker-entrypoint.sh when
+# TS_AUTHKEY is set.
+COPY --from=tailscale /usr/local/bin/tailscaled /usr/local/bin/tailscale /usr/local/bin/
+
+# Deno — yt-dlp only enables deno as its JS runtime by default; the nodejs
+# above (v20) isn't picked up ("No supported JavaScript runtime"), so YouTube
+# extraction ran on the deprecated no-JS path with formats missing (#128).
+COPY --from=deno /deno /usr/local/bin/deno
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

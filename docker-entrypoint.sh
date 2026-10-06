@@ -6,6 +6,35 @@ set -e
 
 APP_CMD="uvicorn main:app --host 0.0.0.0 --port 8080"
 
+# Tailscale egress for YouTube (#128). Userspace tailscaled exposes a SOCKS5
+# proxy on localhost:1055 whose traffic exits via TS_EXIT_NODE (the home
+# MacBook); nothing else on the machine is routed through it. State lives on
+# the volume so the node keeps its identity across deploys and TS_AUTHKEY is
+# only consumed on first login. Runs in the background and never blocks or
+# fails the boot: if the tailnet is down, YouTube fetches fall back to direct.
+if [ -n "$TS_AUTHKEY" ]; then
+  TS_STATE_DIR="${DATA_DIR:-/data}/tailscale"
+  TS_SOCKET=/tmp/tailscaled.sock
+  mkdir -p "$TS_STATE_DIR"
+  # The app sends YouTube traffic here (bot.config.YOUTUBE_PROXY); only set
+  # when tailscaled actually runs, so without a key fetches record 'direct'.
+  export YOUTUBE_PROXY="${YOUTUBE_PROXY:-socks5h://localhost:1055}"
+  echo "[entrypoint] starting tailscaled (userspace, SOCKS5 localhost:1055)"
+  tailscaled --tun=userspace-networking --socks5-server=localhost:1055 \
+    --state="$TS_STATE_DIR/tailscaled.state" --socket="$TS_SOCKET" \
+    >/tmp/tailscaled.log 2>&1 &
+  (
+    sleep 2
+    tailscale --socket="$TS_SOCKET" up --reset --auth-key="$TS_AUTHKEY" \
+      --hostname="${TS_HOSTNAME:-filter-fyi-backend}" --advertise-tags=tag:fly \
+      ${TS_EXIT_NODE:+--exit-node="$TS_EXIT_NODE"} --timeout=60s \
+      && echo "[entrypoint] tailscale up (exit node: ${TS_EXIT_NODE:-none})" \
+      || echo "[entrypoint] tailscale up failed — YouTube will go direct"
+  ) &
+else
+  echo "[entrypoint] TS_AUTHKEY unset — starting without Tailscale egress"
+fi
+
 if [ -z "$LITESTREAM_REPLICA_URL" ]; then
   echo "[entrypoint] LITESTREAM_REPLICA_URL unset — starting without backup"
   exec $APP_CMD
