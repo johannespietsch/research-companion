@@ -537,6 +537,45 @@ class TestUrlCacheLayer:
 
         assert inner.call_count == 2, "too-long result must not be cached"
 
+    def test_description_only_video_is_not_cached(self):
+        """Issue #128: the pipeline fails description-only videos, usually
+        because of a transient IP block. Caching would keep failing the URL
+        after the block clears."""
+        from bot import fetcher, fetch_errors
+
+        with patch.object(fetcher, "_fetch_url_uncached", new_callable=AsyncMock) as inner:
+            inner.return_value = {
+                "text": "Masterclass\n\n" + "Long description. " * 200,
+                "title": "Masterclass",
+                "source_type": "youtube",
+                "reason": fetch_errors.WHISPER_FAILED,
+                "transcript_source": "description",
+            }
+
+            asyncio.run(fetcher.fetch_url("https://youtube.com/watch?v=yyyyyyyyyyy"))
+            asyncio.run(fetcher.fetch_url("https://youtube.com/watch?v=yyyyyyyyyyy"))
+
+        assert inner.call_count == 2, "description-only video must not be cached"
+
+    def test_social_post_with_untranscribed_video_is_cached(self):
+        """Tweets tag transcript_source=description too, but their post text
+        is used, so they keep caching like any other successful fetch."""
+        from bot import fetcher, fetch_errors
+
+        with patch.object(fetcher, "_fetch_url_uncached", new_callable=AsyncMock) as inner:
+            inner.return_value = {
+                "text": "@a (A):\n\nA real thread.",
+                "title": "Post by @a",
+                "source_type": "social",
+                "reason": fetch_errors.WHISPER_FAILED,
+                "transcript_source": "description",
+            }
+
+            asyncio.run(fetcher.fetch_url("https://x.com/a/status/1"))
+            asyncio.run(fetcher.fetch_url("https://x.com/a/status/1"))
+
+        assert inner.call_count == 1
+
     def test_different_urls_get_separate_entries(self):
         from bot import fetcher
 

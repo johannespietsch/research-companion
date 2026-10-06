@@ -153,6 +153,47 @@ class TestErrors:
         assert exc_info.value.code == pipeline.ERR_NO_TRANSCRIPT
         assert exc_info.value.fetched["reason"] == "video_too_long_for_whisper"
 
+    @pytest.mark.parametrize("source_type", ["youtube", "video"])
+    def test_long_description_only_video_raises_no_transcript(
+        self, pipeline, monkeypatch, source_type
+    ):
+        # Issue #128: YouTube blocked the transcript and Whisper failed, but
+        # the description was well over _MIN_ANALYZABLE_CHARS, so the pipeline
+        # produced a confident "full masterclass" brief from it. A video
+        # summarised from its description alone must fail, whatever its length.
+        def summarize_tripwire(*_a, **_k):
+            raise AssertionError("must not summarise a description-only video")
+        monkeypatch.setattr(pipeline, "summarize_content", summarize_tripwire)
+
+        async def description_only(url, **kwargs):
+            return {"text": "Masterclass\n\n" + "Chapter notes. " * 300,
+                    "title": "Masterclass", "source_type": source_type,
+                    "image_urls": [], "reason": "whisper_failed",
+                    "transcript_source": "description"}
+        monkeypatch.setattr(pipeline, "fetch_url", description_only)
+
+        from bot.analyzer import UsageContext
+        with pytest.raises(pipeline.PipelineError) as exc_info:
+            asyncio.run(pipeline.analyze_url("x", ctx=UsageContext()))
+        assert exc_info.value.code == pipeline.ERR_NO_TRANSCRIPT
+        assert exc_info.value.fetched["reason"] == "whisper_failed"
+
+    def test_social_post_with_untranscribed_video_still_analyses(
+        self, pipeline, monkeypatch
+    ):
+        # Tweets tag transcript_source=description when the embedded video
+        # can't be transcribed, but the post text itself is real content.
+        async def tweet(url, **kwargs):
+            return {"text": "@a (A):\n\n" + "A real thread. " * 30,
+                    "title": "Post by @a", "source_type": "social",
+                    "image_urls": [], "reason": "video_too_long_for_whisper",
+                    "transcript_source": "description"}
+        monkeypatch.setattr(pipeline, "fetch_url", tweet)
+
+        from bot.analyzer import UsageContext
+        result = asyncio.run(pipeline.analyze_url("x", ctx=UsageContext()))
+        assert result.analysis is not None
+
     def test_short_description_without_reason_still_analyses(
         self, pipeline, monkeypatch
     ):

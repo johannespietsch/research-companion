@@ -605,6 +605,8 @@ SUMMARY_MAX_CHARS = 100_000
 # SUMMARY_MAX_CHARS at the model's average chars/token, and well under the
 # Haiku 4.5 64k hard limit. Scaled per source below.
 _SUMMARY_MAX_OUTPUT_TOKENS = 32_000
+# Floor for short sources — see `_summary_output_tokens`.
+_SUMMARY_MIN_OUTPUT_TOKENS = 4_096
 
 
 def _published_at_for_prompt(published_at: str | None) -> str:
@@ -627,9 +629,14 @@ def _summary_output_tokens(text: str) -> int:
     verbatim input, so the model self-regulates and stops at end_turn well
     before the cap. Earlier ratios (//4, //2) were binding before the model
     finished and showed up as summaries ending mid-section. 1:1 makes
-    truncation a rare edge case."""
+    truncation a rare edge case.
+
+    The floor covers short sources, where 1:1 binds instead: a structured brief
+    (headings, bullets, metadata) has a fixed overhead that a ~1k-token budget
+    can't fit (issue #128: briefs of 2–5k-char inputs cut off mid-section).
+    It's a cap, not a spend — billing is on tokens actually written."""
     approx_input_tokens = len(text) // 4
-    return max(512, min(_SUMMARY_MAX_OUTPUT_TOKENS, approx_input_tokens))
+    return max(_SUMMARY_MIN_OUTPUT_TOKENS, min(_SUMMARY_MAX_OUTPUT_TOKENS, approx_input_tokens))
 
 
 def summarize_content(
