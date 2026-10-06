@@ -71,9 +71,18 @@ class TestSummarizeContent:
 
         small = analyzer._summary_output_tokens("x" * 400)      # tiny source
         large = analyzer._summary_output_tokens("x" * 400_000)  # long source
-        assert small == 512                                     # floor
+        assert small == analyzer._SUMMARY_MIN_OUTPUT_TOKENS     # floor
         assert large == analyzer._SUMMARY_MAX_OUTPUT_TOKENS     # cap
         assert small < large
+
+    def test_short_source_gets_room_for_a_structured_brief(self):
+        # Issue #128: a 4,757-char input got 1,189 tokens and the brief was
+        # cut off mid-section. Short sources must get the floor, not 1:1.
+        from bot import analyzer
+
+        assert analyzer._summary_output_tokens("x" * 4_757) == 4_096
+        # Above the floor, scaling is unchanged.
+        assert analyzer._summary_output_tokens("x" * 40_000) == 10_000
 
 
 class TestNormalizeSuggestions:

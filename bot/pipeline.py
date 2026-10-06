@@ -44,7 +44,7 @@ from bot.analyzer import (
 from bot.concurrency import CapacityError, heavy
 from bot.config import MAX_CONTENT_CHARS
 from bot.db import record_processed_url, save_item
-from bot.fetcher import fetch_url, whisper_cap_for
+from bot.fetcher import VIDEO_SOURCE_TYPES, fetch_url, whisper_cap_for
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +68,7 @@ ERR_BUSY = "busy"                            # shed: no heavy-work slot free (ov
 
 # Transcribed sources: a failed fetch here means "no transcript", not "no text"
 # — so the caller shows the transcript-specific message.
-_VIDEO_SOURCE_TYPES: frozenset[str] = frozenset({"youtube", "video", "audio"})
+_VIDEO_SOURCE_TYPES = VIDEO_SOURCE_TYPES
 
 # A degraded fetch (no transcript, too long for Whisper, etc.) flags itself
 # with `reason` but may still carry a thin fallback — e.g. a captionless video
@@ -196,11 +196,19 @@ async def analyze_url(
         source_type = fetched.get("source_type") or "article"
         reason = fetched.get("reason")
 
-        # Bail before analysing when there's nothing usable: either no text at all,
-        # or a degraded fetch (`reason` set) whose fallback is just a title-only
-        # stub. Both surface the fetch `reason` to the caller rather than running
-        # the analyser on a thin snippet — see _MIN_ANALYZABLE_CHARS.
-        if not text or (reason and len(text) < _MIN_ANALYZABLE_CHARS):
+        # Bail before analysing when there's nothing usable: no text at all, a
+        # degraded fetch (`reason` set) whose fallback is just a title-only stub
+        # (see _MIN_ANALYZABLE_CHARS), or a video that only yielded its title +
+        # description. The last one used to sail through and produce a confident
+        # brief of a video nobody transcribed (issue #128), so a video is never
+        # summarised from its description, however long that is. Social posts
+        # are exempt: their post text is real content even when an embedded
+        # video couldn't be transcribed.
+        description_only_video = (
+            source_type in _VIDEO_SOURCE_TYPES
+            and fetched.get("transcript_source") == "description"
+        )
+        if not text or description_only_video or (reason and len(text) < _MIN_ANALYZABLE_CHARS):
             # Distinguish video-with-no-transcript from generic extraction
             # failure so callers can surface the right UX.
             code = ERR_NO_TRANSCRIPT if source_type in _VIDEO_SOURCE_TYPES else ERR_NO_TEXT

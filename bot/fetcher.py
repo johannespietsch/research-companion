@@ -108,6 +108,11 @@ WHISPER_MAX_DURATION_ANON_S = 30 * 60        # 30 min — anonymous web tries
 WHISPER_MAX_DURATION_SIGNED_IN_S = int(2.5 * 60 * 60)
 
 
+# Source types whose content *is* the transcript. A description-only fetch of
+# one of these is a failure, not a thin result (issue #128).
+VIDEO_SOURCE_TYPES: frozenset[str] = frozenset({"youtube", "video", "audio"})
+
+
 def whisper_cap_for(*, signed_in: bool) -> int:
     """Default per-tier transcription duration ceiling (seconds)."""
     return WHISPER_MAX_DURATION_SIGNED_IN_S if signed_in else WHISPER_MAX_DURATION_ANON_S
@@ -1144,9 +1149,18 @@ async def fetch_url(
 
     result = await _fetch_url_uncached(url, max_whisper_duration=max_whisper_duration)
 
+    # A description-only video is never cached either: the pipeline fails it
+    # with no-transcript (issue #128), and the usual cause is transient (an IP
+    # block on captions or audio), so caching would pin the failure on the URL
+    # after the block clears. Social posts keep caching — their text is used.
+    description_only_video = (
+        result.get("transcript_source") == "description"
+        and result.get("source_type") in VIDEO_SOURCE_TYPES
+    )
     cacheable = (
         (result.get("text") or "").strip()
         and result.get("reason") != fetch_errors.VIDEO_TOO_LONG_FOR_WHISPER
+        and not description_only_video
     )
     if cacheable:
         try:
