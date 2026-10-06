@@ -12,6 +12,8 @@ from __future__ import annotations
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 
 YOUTUBE_URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 VIDEO_ID = "dQw4w9WgXcQ"
@@ -221,7 +223,7 @@ class TestYouTubeFallbackChain:
 
             result = fetcher._youtube_transcript(YOUTUBE_URL)
 
-        transcribe.assert_called_once_with(YOUTUBE_URL)
+        transcribe.assert_called_once_with(YOUTUBE_URL, proxy=None)
         assert "spoken words" in result["text"]
         assert result["source_type"] == "youtube"  # corrected back to youtube
 
@@ -547,6 +549,129 @@ class TestWallDetection:
         article = ("Detailed analysis of the topic at hand. " * 60) + " Subscribe to continue getting updates."
         assert len(article) > fetcher._WALL_SIGNATURE_MAX_CHARS
         assert fetcher._wall_reason(article) is None
+
+
+class TestYouTubeEgress:
+    """#128: YouTube traffic goes via YOUTUBE_PROXY (home exit node) when a
+    probe through it succeeds, else direct; the route is tagged as `egress`."""
+
+    PROXY = "socks5h://localhost:1055"
+
+    @pytest.fixture(autouse=True)
+    def _fresh_probe(self, monkeypatch):
+        from bot import fetcher
+        monkeypatch.setattr(fetcher, "_yt_probe_cache", None)
+
+    def _probe_ok(self):
+        return MagicMock(status_code=204)
+
+    def test_no_proxy_configured_goes_direct_without_probing(self, monkeypatch):
+        from bot import config, fetcher
+        monkeypatch.setattr(config, "YOUTUBE_PROXY", "")
+        with patch.object(fetcher.requests, "get") as get:
+            assert fetcher._youtube_egress() == (None, "direct")
+        get.assert_not_called()
+
+    def test_probe_success_uses_proxy(self, monkeypatch):
+        from bot import config, fetcher
+        monkeypatch.setattr(config, "YOUTUBE_PROXY", self.PROXY)
+        with patch.object(fetcher.requests, "get", return_value=self._probe_ok()) as get:
+            assert fetcher._youtube_egress() == (self.PROXY, "proxy")
+        assert get.call_args.kwargs["proxies"] == {"http": self.PROXY, "https": self.PROXY}
+
+    def test_probe_failure_falls_back_direct_and_warns(self, monkeypatch, caplog):
+        from bot import config, fetcher
+        monkeypatch.setattr(config, "YOUTUBE_PROXY", self.PROXY)
+        with patch.object(fetcher.requests, "get", side_effect=ConnectionError("refused")), \
+             caplog.at_level("WARNING", logger="bot.fetcher"):
+            assert fetcher._youtube_egress() == (None, "direct-fallback")
+        # WARNING → error_log → admin dashboard: that's the "Mac is down" alert.
+        assert any("YouTube proxy unreachable" in r.message for r in caplog.records)
+
+    def test_probe_non_204_falls_back_direct(self, monkeypatch):
+        from bot import config, fetcher
+        monkeypatch.setattr(config, "YOUTUBE_PROXY", self.PROXY)
+        with patch.object(fetcher.requests, "get", return_value=MagicMock(status_code=502)):
+            assert fetcher._youtube_egress() == (None, "direct-fallback")
+
+    def test_probe_result_is_cached_within_ttl(self, monkeypatch):
+        from bot import config, fetcher
+        monkeypatch.setattr(config, "YOUTUBE_PROXY", self.PROXY)
+        with patch.object(fetcher.requests, "get", return_value=self._probe_ok()) as get:
+            fetcher._youtube_egress()
+            fetcher._youtube_egress()
+        assert get.call_count == 1
+
+    def test_chain_routes_every_youtube_call_via_proxy(self, monkeypatch):
+        """Captions, oEmbed, and both yt-dlp helpers all get the proxy."""
+        from bot import fetcher
+        monkeypatch.setattr(fetcher, "_youtube_egress", lambda: (self.PROXY, "proxy"))
+
+        with patch("youtube_transcript_api.YouTubeTranscriptApi") as TranscriptApi, \
+             patch.object(fetcher, "_yt_dlp_extract") as extract, \
+             patch.object(fetcher, "_yt_dlp_transcribe") as transcribe:
+            TranscriptApi.return_value.list.side_effect = Exception("no captions")
+            extract.return_value = {"text": "T\nBy: c\n\ndesc", "title": "T",
+                                    "source_type": "youtube", "has_transcript": False,
+                                    "duration": 60}
+            transcribe.return_value = {"text": "T\n\nTranscript:\nhi", "title": "T",
+                                       "source_type": "video", "transcript": "hi"}
+            result = fetcher._youtube_transcript(YOUTUBE_URL)
+
+        proxy_config = TranscriptApi.call_args.kwargs["proxy_config"]
+        assert proxy_config.to_requests_dict() == {"http": self.PROXY, "https": self.PROXY}
+        extract.assert_called_once_with(YOUTUBE_URL, proxy=self.PROXY)
+        transcribe.assert_called_once_with(YOUTUBE_URL, proxy=self.PROXY)
+        assert result["egress"] == "proxy"
+
+    def test_fallback_chain_runs_direct_and_is_tagged(self, monkeypatch):
+        from bot import fetcher
+        monkeypatch.setattr(fetcher, "_youtube_egress", lambda: (None, "direct-fallback"))
+
+        with patch("youtube_transcript_api.YouTubeTranscriptApi") as TranscriptApi, \
+             patch.object(fetcher, "_youtube_oembed_title", return_value="t") as oembed:
+            TranscriptApi.return_value.list.return_value = [
+                MagicMock(language_code="en", is_generated=True,
+                          fetch=MagicMock(return_value=[MagicMock(text="hi")]))
+            ]
+            result = fetcher._youtube_transcript(YOUTUBE_URL)
+
+        assert TranscriptApi.call_args.kwargs["proxy_config"] is None
+        oembed.assert_called_once_with(YOUTUBE_URL, proxy=None)
+        assert result["egress"] == "direct-fallback"
+
+    def test_yt_dlp_gets_proxy_option_on_both_passes(self):
+        from bot import fetcher
+
+        seen_opts = []
+
+        class FakeYDL:
+            def __init__(self, opts): seen_opts.append(opts)
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def extract_info(self, url, download=False):
+                return {"title": "T", "uploader": "c", "description": "d", "duration": 60}
+            def download(self, urls): pass
+
+        with patch("yt_dlp.YoutubeDL", FakeYDL):
+            fetcher._yt_dlp_extract(YOUTUBE_URL, proxy=self.PROXY)
+            fetcher._yt_dlp_extract(YOUTUBE_URL)  # Vimeo/tweets: no proxy key
+
+        assert [o.get("proxy") for o in seen_opts] == [self.PROXY, self.PROXY, None, None]
+
+    def test_url_cache_does_not_store_egress(self):
+        """A cache hit makes no YouTube request, so it must not claim a route."""
+        from bot import fetcher
+
+        with patch.object(fetcher, "_fetch_url_uncached", new_callable=AsyncMock) as inner:
+            inner.return_value = {"text": "T\n\nTranscript:\nhi", "title": "T",
+                                  "source_type": "youtube", "egress": "proxy"}
+            first = asyncio.run(fetcher.fetch_url(YOUTUBE_URL))
+            second = asyncio.run(fetcher.fetch_url(YOUTUBE_URL))
+
+        assert first["egress"] == "proxy"
+        assert inner.call_count == 1
+        assert "egress" not in second
 
 
 class TestUrlCacheLayer:

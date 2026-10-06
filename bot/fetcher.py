@@ -10,6 +10,7 @@ import httpx
 import requests
 
 from bot import fetch_errors
+from bot import config
 from bot.config import CONTACT_EMAIL, MAX_CONTENT_CHARS
 from bot.ssrf import BlockedURLError, assert_public_url
 
@@ -22,7 +23,52 @@ def _youtube_thumbnail(video_id: str) -> str:
     return f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
 
 
-def _youtube_oembed_title(url: str) -> str | None:
+# YouTube egress (#128). One probe decides the route for a whole YouTube fetch
+# (captions, oEmbed, yt-dlp metadata/subs/audio): if a tiny request through
+# YOUTUBE_PROXY succeeds, everything goes via the home exit node; otherwise we
+# log a warning (→ error_log → admin dashboard) and go direct. The result is
+# cached briefly so a burst of fetches doesn't probe each time, and a down
+# proxy warns at most once per TTL.
+_YT_PROBE_URL = "https://www.youtube.com/generate_204"
+_YT_PROBE_TIMEOUT_S = 5
+_YT_PROBE_TTL_S = 60
+_yt_probe_cache: tuple[float, bool] | None = None  # (monotonic ts, proxy ok)
+
+EGRESS_PROXY = "proxy"
+EGRESS_DIRECT_FALLBACK = "direct-fallback"
+EGRESS_DIRECT = "direct"
+
+
+def _youtube_egress() -> tuple[str | None, str]:
+    """Return (proxy URL or None, egress label) for the next YouTube fetch."""
+    global _yt_probe_cache
+    import time
+
+    proxy = config.YOUTUBE_PROXY
+    if not proxy:
+        return None, EGRESS_DIRECT
+
+    now = time.monotonic()
+    if _yt_probe_cache is not None and now - _yt_probe_cache[0] < _YT_PROBE_TTL_S:
+        ok = _yt_probe_cache[1]
+    else:
+        try:
+            resp = requests.get(
+                _YT_PROBE_URL, proxies={"http": proxy, "https": proxy},
+                timeout=_YT_PROBE_TIMEOUT_S,
+            )
+            ok = resp.status_code == 204
+            if not ok:
+                logger.warning("YouTube proxy probe got HTTP %s — going direct", resp.status_code)
+        except Exception as e:
+            ok = False
+            logger.warning("YouTube proxy unreachable (%s) — going direct", type(e).__name__)
+        _yt_probe_cache = (now, ok)
+
+    return (proxy, EGRESS_PROXY) if ok else (None, EGRESS_DIRECT_FALLBACK)
+
+
+def _youtube_oembed_title(url: str, proxy: str | None = None) -> str | None:
     """Fetch a video's real title via YouTube's public oEmbed endpoint.
 
     The youtube_transcript_api path gives us the transcript but no metadata, so
@@ -37,6 +83,7 @@ def _youtube_oembed_title(url: str) -> str | None:
             params={"url": url, "format": "json"},
             timeout=10,
             headers={"User-Agent": "research-companion-bot/1.0"},
+            proxies={"http": proxy, "https": proxy} if proxy else None,
         )
         if resp.status_code != 200:
             return None
@@ -141,16 +188,28 @@ def _select_transcript(transcripts: list, spoken_language=None):
 
 
 def _youtube_transcript(url: str, max_whisper_duration: int = WHISPER_MAX_DURATION_ANON_S) -> dict:
+    """Run the YouTube chain over the route `_youtube_egress` picks, and tag
+    the result with that route for the processed_urls audit row."""
+    proxy, egress = _youtube_egress()
+    result = _youtube_transcript_via(url, max_whisper_duration, proxy)
+    result["egress"] = egress
+    return result
+
+
+def _youtube_transcript_via(url: str, max_whisper_duration: int, proxy: str | None) -> dict:
     from youtube_transcript_api import YouTubeTranscriptApi
+    from youtube_transcript_api.proxies import GenericProxyConfig
 
     match = _YT_PATTERNS.search(url)
     if not match:
-        return _yt_dlp_extract(url)
+        return _yt_dlp_extract(url, proxy=proxy)
 
     video_id = match.group(1)
     thumb = _youtube_thumbnail(video_id)
     try:
-        api = YouTubeTranscriptApi()
+        api = YouTubeTranscriptApi(
+            proxy_config=GenericProxyConfig(http_url=proxy, https_url=proxy) if proxy else None
+        )
         # Enumerate every available transcript and pick the one in the video's
         # spoken language (see _select_transcript) — never translate, so the LLM
         # summarises in the speaker's tongue. We don't force 'en' (that silently
@@ -164,7 +223,7 @@ def _youtube_transcript(url: str, max_whisper_duration: int = WHISPER_MAX_DURATI
         if transcript is not None:
             fetched = transcript.fetch()
             text = " ".join(snippet.text for snippet in fetched)
-            title = _youtube_oembed_title(url) or f"YouTube video ({video_id})"
+            title = _youtube_oembed_title(url, proxy=proxy) or f"YouTube video ({video_id})"
             return {
                 "text": f"{title}\n\nTranscript:\n{text}"[:MAX_CONTENT_CHARS],
                 "title": title,
@@ -176,7 +235,7 @@ def _youtube_transcript(url: str, max_whisper_duration: int = WHISPER_MAX_DURATI
     except Exception:
         logger.info(f"No transcript for {video_id}, falling back to yt-dlp")
 
-    extract = _yt_dlp_extract(url)
+    extract = _yt_dlp_extract(url, proxy=proxy)
     extract.setdefault("image_urls", []).append(thumb)
 
     # If yt-dlp also got us a transcript (or extraction died entirely), use what
@@ -197,7 +256,7 @@ def _youtube_transcript(url: str, max_whisper_duration: int = WHISPER_MAX_DURATI
             f"YouTube {video_id}: no subtitles, trying audio + Whisper "
             f"(duration {duration}s, cap {max_whisper_duration}s)"
         )
-        whisper = _yt_dlp_transcribe(url)
+        whisper = _yt_dlp_transcribe(url, proxy=proxy)
         if whisper.get("text"):
             whisper["source_type"] = "youtube"
             whisper.setdefault("image_urls", []).append(thumb)
@@ -514,7 +573,7 @@ def _vtt_to_text(raw: str) -> str:
     return " ".join(lines)
 
 
-def _yt_dlp_extract(url: str) -> dict:
+def _yt_dlp_extract(url: str, proxy: str | None = None) -> dict:
     """Extract metadata + best-effort subtitles from a video URL via yt-dlp.
 
     Two-pass: metadata first (cheap, hits a different YouTube endpoint and is
@@ -524,9 +583,13 @@ def _yt_dlp_extract(url: str) -> dict:
     *something* to work with.
 
     Returns: text, title, source_type, has_transcript (bool), duration (s).
+
+    `proxy` routes both passes (YouTube only, #128); None = direct.
     """
     import yt_dlp
     import tempfile, os
+
+    proxy_opts = {"proxy": proxy} if proxy else {}
 
     # Pass 1: metadata only. No subtitle/audio downloads — far less likely to 429.
     info = None
@@ -537,6 +600,7 @@ def _yt_dlp_extract(url: str) -> dict:
             "skip_download": True,
             "writesubtitles": False,
             "ignore_no_formats_error": True,
+            **proxy_opts,
         }) as ydl:
             info = ydl.extract_info(url, download=False)
     except Exception as e:
@@ -598,6 +662,7 @@ def _yt_dlp_extract(url: str) -> dict:
                 "subtitlesformat": "vtt",
                 "paths": {"home": tmpdir},
                 "outtmpl": os.path.join("%(id)s", "%(id)s.%(ext)s"),
+                **proxy_opts,
             }
             with yt_dlp.YoutubeDL(sub_opts) as ydl:
                 ydl.download([url])
@@ -633,8 +698,9 @@ def _yt_dlp_extract(url: str) -> dict:
     }
 
 
-def _yt_dlp_transcribe(url: str) -> dict:
-    """Download audio from a video URL via yt-dlp and transcribe with Whisper."""
+def _yt_dlp_transcribe(url: str, proxy: str | None = None) -> dict:
+    """Download audio from a video URL via yt-dlp and transcribe with Whisper.
+    `proxy` routes the download (YouTube only, #128); None = direct."""
     import yt_dlp
     import tempfile, os
 
@@ -653,6 +719,8 @@ def _yt_dlp_transcribe(url: str) -> dict:
         # ~64 kbps × this ≈ 7 h of audio, well past any real episode.
         "max_filesize": 200 * 1024 * 1024,
     }
+    if proxy:
+        ydl_opts["proxy"] = proxy
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
             ydl_opts["paths"] = {"home": tmpdir}
@@ -1081,7 +1149,9 @@ async def fetch_url(
     )
     if cacheable:
         try:
-            set_cached_fetch(url, result)
+            # `egress` describes this network fetch, not the content — a cache
+            # hit makes no YouTube request, so it must not inherit the route.
+            set_cached_fetch(url, {k: v for k, v in result.items() if k != "egress"})
         except Exception as e:
             logger.warning(f"url_cache write failed for {url}: {e}")
 

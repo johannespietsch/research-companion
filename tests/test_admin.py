@@ -309,17 +309,19 @@ def _stamp_url(db, *, days_ago: int = 0, **overrides) -> None:
         "error_code": "",
         "transcript_source": "",
         "latency_ms": 500,
+        "egress": "",
     }
     row.update(overrides)
     with db._get_conn() as conn:
         conn.execute(
             "INSERT INTO processed_urls (ts, url, title, source_type, "
             "user_id, anon_id, job_id, status, error_code, transcript_source, "
-            "latency_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "latency_ms, egress) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 ts, row["url"], row["title"], row["source_type"],
                 row["user_id"], row["anon_id"], row["job_id"], row["status"],
                 row["error_code"], row["transcript_source"], row["latency_ms"],
+                row["egress"],
             ),
         )
 
@@ -338,6 +340,7 @@ class TestUsageOverviewEmpty:
         assert body["by_source_type"] == []
         assert body["by_error_code"] == []
         assert body["transcript_sources"] == []
+        assert body["youtube_egress"] == []
         assert body["rows"] == []
         assert body["total_rows"] == 0
 
@@ -384,6 +387,25 @@ class TestUsageOverviewWithData:
         assert [r["error_code"] for r in rows] == ["fetch-failed", "no-transcript"]
         assert rows[0]["count"] == 3
         assert rows[1]["count"] == 2
+
+    def test_youtube_egress_split(self, db, admin_client, admin_headers):
+        # #128: how often YouTube went via the home exit node vs fell back.
+        for _ in range(3):
+            _stamp_url(db, source_type="youtube", egress="proxy")
+        _stamp_url(db, source_type="youtube", egress="direct-fallback")
+        # Cache hits / pre-column rows (egress '') and non-YouTube rows are
+        # excluded from the split.
+        _stamp_url(db, source_type="youtube", egress="")
+        _stamp_url(db, source_type="article", egress="")
+
+        body = admin_client.get(
+            "/api/admin/usage-overview", headers=admin_headers
+        ).json()
+        assert body["youtube_egress"] == [
+            {"egress": "proxy", "count": 3},
+            {"egress": "direct-fallback", "count": 1},
+        ]
+        assert {r["egress"] for r in body["rows"]} == {"proxy", "direct-fallback", ""}
 
     def test_transcript_sources_only_count_video_rows(
         self, db, admin_client, admin_headers

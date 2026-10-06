@@ -283,6 +283,7 @@ async def analyze_url(
             error_code=audit_error_code,
             transcript_source=fetched.get("transcript_source") or "",
             latency_ms=int((time.monotonic() - started) * 1000),
+            egress=fetched.get("egress") or "",
         )
 
 

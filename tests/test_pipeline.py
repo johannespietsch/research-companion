@@ -268,6 +268,18 @@ class TestProcessedUrlAudit:
         assert r["status"] == "ok"
         assert r["error_code"] == ""
         assert r["latency_ms"] >= 0
+        assert r["egress"] == ""  # not a YouTube fetch
+
+    def test_youtube_egress_lands_on_audit_row(self, pipeline, db, monkeypatch):
+        """#128: the route the fetcher took is recorded for the dashboard."""
+        async def via_proxy(url, **kwargs):
+            return {"text": "Transcript " * 50, "title": "T", "source_type": "youtube",
+                    "image_urls": [], "transcript_source": "youtube", "egress": "proxy"}
+        monkeypatch.setattr(pipeline, "fetch_url", via_proxy)
+
+        from bot.analyzer import UsageContext
+        asyncio.run(pipeline.analyze_url("https://youtu.be/x", ctx=UsageContext()))
+        assert self._all_rows(db)[0]["egress"] == "proxy"
 
     def test_fetch_failure_still_writes_row(self, pipeline, db, monkeypatch):
         """We don't have title/source_type when fetch itself crashes, but
