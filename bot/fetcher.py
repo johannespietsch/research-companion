@@ -118,13 +118,14 @@ def _lang_base(code: str) -> str:
     return (code or "").split("-")[0].lower()
 
 
-def _youtube_spoken_language(url: str) -> str | None:
+def _youtube_spoken_language(url: str, proxy: str | None = None) -> str | None:
     """The video's original spoken language per yt-dlp (`info['language']`,
     e.g. 'en-US'), or None if the metadata pass fails or doesn't say."""
     import yt_dlp
 
+    opts = {"quiet": True, "skip_download": True, **({"proxy": proxy} if proxy else {})}
     try:
-        with yt_dlp.YoutubeDL({"quiet": True, "skip_download": True}) as ydl:
+        with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False) or {}
         return info.get("language") or None
     except Exception as e:
@@ -218,7 +219,7 @@ def _youtube_transcript_via(url: str, max_whisper_duration: int, proxy: str | No
         # language — issue #57).
         transcripts = list(api.list(video_id))
         transcript = _select_transcript(
-            transcripts, spoken_language=lambda: _youtube_spoken_language(url)
+            transcripts, spoken_language=lambda: _youtube_spoken_language(url, proxy=proxy)
         )
         if transcript is not None:
             fetched = transcript.fetch()

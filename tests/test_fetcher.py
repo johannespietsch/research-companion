@@ -132,7 +132,7 @@ class TestYouTubeFallbackChain:
 
         assert "asr-de" in result["text"]
         assert result["language"] == "de"
-        lookup.assert_called_once_with(YOUTUBE_URL)
+        lookup.assert_called_once_with(YOUTUBE_URL, proxy=None)
 
     def test_autodub_falls_back_to_english_when_lookup_fails(self):
         from bot import fetcher
@@ -623,6 +623,33 @@ class TestYouTubeEgress:
         extract.assert_called_once_with(YOUTUBE_URL, proxy=self.PROXY)
         transcribe.assert_called_once_with(YOUTUBE_URL, proxy=self.PROXY)
         assert result["egress"] == "proxy"
+
+    def test_autodub_language_lookup_goes_via_proxy(self, monkeypatch):
+        """#131's yt-dlp spoken-language lookup is YouTube traffic too."""
+        from bot import fetcher
+        monkeypatch.setattr(fetcher, "_youtube_egress", lambda: (self.PROXY, "proxy"))
+
+        tracks = [
+            MagicMock(language_code=c, is_generated=True,
+                      fetch=MagicMock(return_value=[MagicMock(text=f"asr-{c}")]))
+            for c in ("ar", "en")
+        ]
+        seen_opts = []
+
+        class FakeYDL:
+            def __init__(self, opts): seen_opts.append(opts)
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def extract_info(self, url, download=False): return {"language": "en-US"}
+
+        with patch("youtube_transcript_api.YouTubeTranscriptApi") as TranscriptApi, \
+             patch.object(fetcher, "_youtube_oembed_title", return_value="t"), \
+             patch("yt_dlp.YoutubeDL", FakeYDL):
+            TranscriptApi.return_value.list.return_value = tracks
+            result = fetcher._youtube_transcript(YOUTUBE_URL)
+
+        assert "asr-en" in result["text"]
+        assert [o.get("proxy") for o in seen_opts] == [self.PROXY]
 
     def test_fallback_chain_runs_direct_and_is_tagged(self, monkeypatch):
         from bot import fetcher
