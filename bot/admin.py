@@ -410,8 +410,10 @@ def usage_overview(days: int, limit: int, offset: int) -> dict:
           "transcript_sources": [{source, count}, ...],   # for video URLs
                                                           # 'youtube' | 'whisper'
                                                           # | 'description' | 'none'
+          "youtube_egress": [{egress, count}, ...],       # 'proxy' | 'direct-fallback'
+                                                          # | 'direct' (#128)
           "rows": [{ts, url, title, source_type, user_id, anon_id, status,
-                    error_code, transcript_source, latency_ms}, ...],
+                    error_code, transcript_source, latency_ms, egress}, ...],
           "total_rows": int,    # for pagination
           "limit": int, "offset": int
         }
@@ -472,6 +474,20 @@ def usage_overview(days: int, limit: int, offset: int) -> dict:
             (since,),
         ).fetchall()
 
+        # YouTube egress split (#128): how often fetches went through the home
+        # exit node vs fell back to direct. '' = url_cache hit (no fetch) or a
+        # row from before the column existed — excluded.
+        egress_rows = conn.execute(
+            """
+            SELECT egress, COUNT(*) AS count
+            FROM processed_urls
+            WHERE ts >= ? AND source_type = 'youtube' AND egress != ''
+            GROUP BY egress
+            ORDER BY count DESC
+            """,
+            (since,),
+        ).fetchall()
+
         # Paginated list of recent rows. Total is window-wide for the
         # "showing X of N" UX in the table.
         total_rows_row = conn.execute(
@@ -481,7 +497,7 @@ def usage_overview(days: int, limit: int, offset: int) -> dict:
         list_rows = conn.execute(
             """
             SELECT id, ts, url, title, source_type, user_id, anon_id,
-                   status, error_code, transcript_source, latency_ms
+                   status, error_code, transcript_source, latency_ms, egress
             FROM processed_urls
             WHERE ts >= ?
             ORDER BY ts DESC, id DESC
@@ -520,6 +536,10 @@ def usage_overview(days: int, limit: int, offset: int) -> dict:
             {"source": r["source"], "count": r["count"]}
             for r in transcript_rows
         ],
+        "youtube_egress": [
+            {"egress": r["egress"], "count": r["count"]}
+            for r in egress_rows
+        ],
         "rows": [
             {
                 "id": r["id"],
@@ -533,6 +553,7 @@ def usage_overview(days: int, limit: int, offset: int) -> dict:
                 "error_code": r["error_code"],
                 "transcript_source": r["transcript_source"],
                 "latency_ms": r["latency_ms"],
+                "egress": r["egress"],
             }
             for r in list_rows
         ],

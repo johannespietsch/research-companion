@@ -518,6 +518,11 @@ def _init() -> None:
         conn.execute(_CREATE_LLM_CACHE_SQL)
         conn.execute(_CREATE_LLM_CACHE_HITS_SQL)
         conn.execute(_CREATE_PROCESSED_URLS_SQL)
+        # #128: which route a YouTube fetch took — 'proxy' (home exit node),
+        # 'direct-fallback' (proxy probe failed), 'direct' (no proxy
+        # configured). Empty for non-YouTube rows and url_cache hits.
+        _ensure_column(conn, "processed_urls", "egress",
+                       "egress TEXT NOT NULL DEFAULT ''")
         conn.execute(_CREATE_SUGGESTION_SIGNALS_SQL)
         conn.execute(_CREATE_SUBSCRIPTIONS_SQL)
         conn.execute(_CREATE_SUBSCRIPTION_ITEMS_SQL)
@@ -1442,6 +1447,7 @@ def record_processed_url(
     error_code: str = "",
     transcript_source: str = "",
     latency_ms: int = 0,
+    egress: str = "",
 ) -> None:
     """Log one URL that went through the pipeline. Best-effort — a DB blip
     here must NEVER break the analyse path, the audit log is observability,
@@ -1451,11 +1457,12 @@ def record_processed_url(
             conn.execute(
                 "INSERT INTO processed_urls "
                 "(url, title, source_type, user_id, anon_id, job_id, "
-                "status, error_code, transcript_source, latency_ms) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "status, error_code, transcript_source, latency_ms, egress) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     url, title, source_type, user_id, anon_id, job_id,
                     status, error_code, transcript_source, int(latency_ms),
+                    egress,
                 ),
             )
     except Exception:
