@@ -12,14 +12,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 # System deps:
 #   ffmpeg     — required by faster-whisper for audio/video decoding
-#   nodejs     — JS runtime yt-dlp uses to solve YouTube's signature challenges
-#                (without one, yt-dlp falls back to a deprecated path that 429s
-#                much more aggressively)
 #   ca-certs   — outbound TLS to Telegram / Anthropic / etc.
 #   curl       — useful for healthcheck debugging
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ffmpeg \
-      nodejs \
       ca-certificates \
       curl \
     && rm -rf /var/lib/apt/lists/*
@@ -44,9 +40,10 @@ RUN curl -fsSL "https://github.com/benbjohnson/litestream/releases/download/v${L
 # TS_AUTHKEY is set.
 COPY --from=tailscale /usr/local/bin/tailscaled /usr/local/bin/tailscale /usr/local/bin/
 
-# Deno — yt-dlp only enables deno as its JS runtime by default; the nodejs
-# above (v20) isn't picked up ("No supported JavaScript runtime"), so YouTube
-# extraction ran on the deprecated no-JS path with formats missing (#128).
+# Deno — the JS runtime yt-dlp uses to solve YouTube's signature challenges
+# (without one it falls back to a deprecated path with formats missing). yt-dlp
+# only enables deno by default; Debian's nodejs (v20) was never picked up, so
+# it's no longer installed (#128). Playwright ships its own node driver.
 COPY --from=deno /deno /usr/local/bin/deno
 
 COPY requirements.txt .
