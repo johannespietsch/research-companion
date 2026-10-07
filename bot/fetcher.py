@@ -39,31 +39,44 @@ EGRESS_DIRECT_FALLBACK = "direct-fallback"
 EGRESS_DIRECT = "direct"
 
 
+def probe_youtube_proxy() -> bool:
+    """Probe YOUTUBE_PROXY now (no cache read) and refresh the cache. Used by
+    `_youtube_egress` and by the background egress monitor. False when no
+    proxy is configured."""
+    global _yt_probe_cache
+    import time
+
+    proxy = config.YOUTUBE_PROXY
+    if not proxy:
+        return False
+    try:
+        resp = requests.get(
+            _YT_PROBE_URL, proxies={"http": proxy, "https": proxy},
+            timeout=_YT_PROBE_TIMEOUT_S,
+        )
+        ok = resp.status_code == 204
+        if not ok:
+            logger.warning("YouTube proxy probe got HTTP %s — going direct", resp.status_code)
+    except Exception as e:
+        ok = False
+        logger.warning("YouTube proxy unreachable (%s) — going direct", type(e).__name__)
+    _yt_probe_cache = (time.monotonic(), ok)
+    return ok
+
+
 def _youtube_egress() -> tuple[str | None, str]:
     """Return (proxy URL or None, egress label) for the next YouTube fetch."""
-    global _yt_probe_cache
     import time
 
     proxy = config.YOUTUBE_PROXY
     if not proxy:
         return None, EGRESS_DIRECT
 
-    now = time.monotonic()
-    if _yt_probe_cache is not None and now - _yt_probe_cache[0] < _YT_PROBE_TTL_S:
-        ok = _yt_probe_cache[1]
+    cached = _yt_probe_cache
+    if cached is not None and time.monotonic() - cached[0] < _YT_PROBE_TTL_S:
+        ok = cached[1]
     else:
-        try:
-            resp = requests.get(
-                _YT_PROBE_URL, proxies={"http": proxy, "https": proxy},
-                timeout=_YT_PROBE_TIMEOUT_S,
-            )
-            ok = resp.status_code == 204
-            if not ok:
-                logger.warning("YouTube proxy probe got HTTP %s — going direct", resp.status_code)
-        except Exception as e:
-            ok = False
-            logger.warning("YouTube proxy unreachable (%s) — going direct", type(e).__name__)
-        _yt_probe_cache = (now, ok)
+        ok = probe_youtube_proxy()
 
     return (proxy, EGRESS_PROXY) if ok else (None, EGRESS_DIRECT_FALLBACK)
 
