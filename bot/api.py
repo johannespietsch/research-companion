@@ -1024,6 +1024,7 @@ async def _run_job(
             "source_type": result.source_type,
             "image_urls": result.image_urls,
             "content": result.summary,
+            "source_words": result.source_words,
             "content_preview": result.summary[:TRY_PREVIEW_CHARS],
             "verdict": verdict,
             "analysis": analysis,

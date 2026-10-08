@@ -97,6 +97,9 @@ class PipelineResult:
     summary: str
     analysis: dict
     saved_id: int | None = None
+    # Words in the source text fed to the summarizer (before any appended
+    # image descriptions) — lets the UI say how much the brief condensed.
+    source_words: int | None = None
 
     @property
     def source_type(self) -> str:
@@ -219,6 +222,8 @@ async def analyze_url(
         if not ctx.source_type:
             ctx.source_type = source_type
 
+        source_words = len(text.split())
+
         # Inline image descriptions: append to text so they enter the summary
         # (and therefore the analyze input) deterministically. analyze_image()
         # is content-addressed-cached, so this is free on repeats.
@@ -263,10 +268,12 @@ async def analyze_url(
                 content=summary,
                 analysis=to_json_str(analysis),
                 user_note=user_note,
+                source_words=source_words,
             )
 
         return PipelineResult(
             fetched=fetched, summary=summary, analysis=analysis, saved_id=saved_id,
+            source_words=source_words,
         )
     except PipelineError as e:
         # Pull whatever the exception carries — for ERR_NO_TEXT / ERR_NO_TRANSCRIPT
@@ -344,6 +351,7 @@ async def analyze_text(
 
     started = time.monotonic()
     fetched: dict = {"title": title, "source_type": source_type, "text": text}
+    source_words = len(text.split())
     audit_status = "ok"
     audit_error_code = ""
     try:
@@ -367,10 +375,12 @@ async def analyze_text(
                 content=summary,
                 analysis=to_json_str(analysis),
                 user_note=user_note,
+                source_words=source_words,
             )
 
         return PipelineResult(
             fetched=fetched, summary=summary, analysis=analysis, saved_id=saved_id,
+            source_words=source_words,
         )
     except PipelineError as e:
         if e.fetched:

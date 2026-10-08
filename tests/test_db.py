@@ -201,6 +201,15 @@ class TestUpsertItemBySource:
         assert item["analysis"] == '{"main_idea": "fresh"}'
         assert item["user_note"] == "a note", "unrelated fields untouched"
 
+    def test_source_words_defaults_null_and_is_refreshed(self, db):
+        uid = db.get_or_create_user_by_telegram(1)
+        item_id = db.save_item(uid, "article", "https://ex.com/a", "c", "{}")
+        assert db.get_item(item_id, user_id=uid)["source_words"] is None
+        db.upsert_item_by_source(
+            uid, "article", "https://ex.com/a", "c2", "{}", source_words=8185,
+        )
+        assert db.get_item(item_id, user_id=uid)["source_words"] == 8185
+
     def test_scoped_to_user_and_source(self, db):
         u1 = db.get_or_create_user_by_telegram(1)
         u2 = db.get_or_create_user_by_telegram(2)
