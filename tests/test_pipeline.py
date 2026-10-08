@@ -87,6 +87,10 @@ class TestAnalyzeUrlBasics:
         assert rows[0]["source"] == "https://example.com/post"
         assert rows[0]["source_type"] == "article"
         assert rows[0]["user_note"] == "a note"
+        # Fixture text is 6 words — persisted so the UI can show how much the
+        # brief condensed the source.
+        assert rows[0]["source_words"] == 6
+        assert result.source_words == 6
 
     def test_anonymous_does_not_save(self, pipeline, db):
         from bot.analyzer import UsageContext
@@ -257,6 +261,14 @@ class TestImageStrategy:
         from bot.analyzer import UsageContext
         asyncio.run(pl.analyze_url("x", ctx=UsageContext()))
         assert "IMAGE DESCRIPTIONS" in captured["summary_input"]
+
+    def test_source_words_excludes_image_descriptions(self, with_images):
+        """The count is of the fetched source, not of our own appended
+        image descriptions."""
+        pl, _ = with_images
+        from bot.analyzer import UsageContext
+        result = asyncio.run(pl.analyze_url("x", ctx=UsageContext()))
+        assert result.source_words == 2  # "Article body"
 
     def test_youtube_excludes_images_by_default(self, with_images, monkeypatch):
         pl, captured = with_images
@@ -486,6 +498,15 @@ class TestAnalyzeText:
         assert result.source_type == "text"
         assert result.summary.startswith("SUMMARY(")
         assert result.analysis["verdict"] == "watch"
+
+    def test_counts_and_saves_source_words(self, pipeline, db):
+        from bot.analyzer import UsageContext
+        uid = db.get_or_create_user_by_telegram(1)
+        result = asyncio.run(pipeline.analyze_text(
+            "one two three four", ctx=UsageContext(user_id=uid), save_for_user_id=uid,
+        ))
+        assert result.source_words == 4
+        assert db.get_item(result.saved_id, user_id=uid)["source_words"] == 4
 
     def test_title_derived_from_first_line(self, pipeline):
         from bot.analyzer import UsageContext

@@ -495,6 +495,10 @@ def _init() -> None:
         else:
             conn.execute(_CREATE_USERS_SQL)
             conn.execute(_CREATE_ITEMS_SQL)
+        # Word count of the source text the summary was built from, so the UI
+        # can show "brief · N words (from an M-word transcript)". NULL = unknown
+        # (rows saved before this column, notes, uploads, claimed anon rows).
+        _ensure_column(conn, "items", "source_words", "source_words INTEGER")
         conn.execute(_CREATE_LINK_CODES_SQL)
         conn.execute(_CREATE_URL_CACHE_SQL)
         conn.execute(_CREATE_ERROR_LOG_SQL)
@@ -688,18 +692,22 @@ def save_item(
     user_note: str = "",
     *,
     file_path: str = "",
+    source_words: int | None = None,
 ) -> int:
     with _get_conn() as conn:
         cur = conn.execute(
             "INSERT INTO items (user_id, source_type, source, content, "
-            "analysis, user_note, file_path) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (user_id, source_type, source, content, analysis, user_note, file_path),
+            "analysis, user_note, file_path, source_words) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (user_id, source_type, source, content, analysis, user_note, file_path,
+             source_words),
         )
         return cur.lastrowid
 
 
 def upsert_item_by_source(
     user_id: int, source_type: str, source: str, content: str, analysis: str,
+    *, source_words: int | None = None,
 ) -> int:
     """Refresh a user's existing saved item for `source` in place, or create
     one if they don't have one yet. Unlike `save_item` (always inserts, so
@@ -718,20 +726,22 @@ def upsert_item_by_source(
         ).fetchone()
         if row is not None:
             conn.execute(
-                "UPDATE items SET source_type = ?, content = ?, analysis = ? WHERE id = ?",
-                (source_type, content, analysis, row["id"]),
+                "UPDATE items SET source_type = ?, content = ?, analysis = ?, "
+                "source_words = ? WHERE id = ?",
+                (source_type, content, analysis, source_words, row["id"]),
             )
             return row["id"]
         cur = conn.execute(
-            "INSERT INTO items (user_id, source_type, source, content, analysis) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (user_id, source_type, source, content, analysis),
+            "INSERT INTO items (user_id, source_type, source, content, analysis, "
+            "source_words) VALUES (?, ?, ?, ?, ?, ?)",
+            (user_id, source_type, source, content, analysis, source_words),
         )
         return cur.lastrowid
 
 
 _ITEM_COLS = (
-    "id, user_id, source_type, source, content, analysis, user_note, file_path, created_at"
+    "id, user_id, source_type, source, content, analysis, user_note, file_path, "
+    "source_words, created_at"
 )
 
 

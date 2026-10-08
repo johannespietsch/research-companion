@@ -458,6 +458,9 @@ class TestJobFlow:
 
         result = json.loads(db.get_job_record("job-content")["result"])
         assert result["content"] == "Neutral summary of the content."
+        # …plus the source's word count, so the label can say how much the
+        # brief condensed it.
+        assert isinstance(result["source_words"], int) and result["source_words"] > 0
         assert result["content_preview"] == "Neutral summary of the content."
 
     def test_run_job_analyzes_the_summary_not_raw_text(self, client, db, monkeypatch):
