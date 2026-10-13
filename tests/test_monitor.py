@@ -99,6 +99,21 @@ class TestResolveFeed:
         fake_get[feed] = FEED_XML
         assert resolve_feed("https://www.youtube.com/@handleonly")["feed_url"] == feed
 
+    def test_youtube_handle_prefers_own_channel_over_embedded_related_ids(self, fake_get):
+        # @MilkRoadMacro's page embeds other channels' "channelId"s ahead of its
+        # own canonical id; picking the first one subscribed the wrong channel
+        # (and collided with an unrelated existing subscription).
+        from bot.monitor import resolve_feed
+        own = "UC0tMvte4_cvUtkKf9APAvvA"
+        feed = f"https://www.youtube.com/feeds/videos.xml?channel_id={own}"
+        page = ('<html><head><link rel="canonical" '
+                f'href="https://www.youtube.com/channel/{own}"></head>'
+                '<script>{"channelId":"UCEaYvbpM1JI2HWKvnikBT-g"}'
+                '{"channelId":"UCWPil6c2lnmMbh2cJRwuHzQ"}</script></html>')
+        fake_get["https://www.youtube.com/@MilkRoadMacro"] = page
+        fake_get[feed] = FEED_XML
+        assert resolve_feed("https://www.youtube.com/@MilkRoadMacro")["feed_url"] == feed
+
     def test_page_without_feed_raises_user_facing_error(self, fake_get):
         from bot.monitor import FeedError, resolve_feed
         fake_get["https://ex.com/nothing"] = HTML_NO_FEED
