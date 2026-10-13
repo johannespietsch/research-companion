@@ -19,6 +19,15 @@ logger = logging.getLogger(__name__)
 _YT_PATTERNS = re.compile(r"(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})")
 
 
+_YT_CHANNEL_PATH = re.compile(r"^/(@|channel/|c/|user/)", re.IGNORECASE)
+
+
+def _is_youtube_channel_url(url: str) -> bool:
+    """A channel page (/@handle, /channel/UC…, /c/…, /user/…), including its
+    /videos, /shorts and /streams tabs — never a single video."""
+    return bool(_YT_CHANNEL_PATH.match(urlparse(url).path)) and not _YT_PATTERNS.search(url)
+
+
 def _youtube_thumbnail(video_id: str) -> str:
     return f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
 
@@ -1337,6 +1346,14 @@ async def _fetch_url_uncached(
     domain = urlparse(url).netloc.lower()
 
     if _domain_matches(domain, "youtube.com", "youtu.be"):
+        if _is_youtube_channel_url(url):
+            # No video to transcribe. Without this the URL fell through to
+            # yt-dlp, which returned the channel blurb and got summarised as if
+            # it were a transcript.
+            return {
+                "text": "", "title": url, "source_type": "youtube",
+                "reason": fetch_errors.YOUTUBE_CHANNEL,
+            }
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             None, _youtube_transcript, url, max_whisper_duration

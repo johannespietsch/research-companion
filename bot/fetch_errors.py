@@ -23,6 +23,7 @@ VIDEO_UNAVAILABLE = "video_unavailable"
 JS_REQUIRED = "js_required"
 PAYWALLED = "paywalled"
 BLOCKED_URL = "blocked_url"
+YOUTUBE_CHANNEL = "youtube_channel"
 
 
 _USER_MESSAGES: dict[str, str] = {
@@ -83,6 +84,11 @@ _USER_MESSAGES: dict[str, str] = {
     BLOCKED_URL: (
         "That URL can't be fetched — only public web addresses are supported. "
         "Private, local, or internal-network addresses are blocked."
+    ),
+    YOUTUBE_CHANNEL: (
+        "That's a YouTube channel, not a single video. Open the video you want "
+        "to look at and paste its link (youtube.com/watch?v=… or youtu.be/…). "
+        "To follow a channel's new videos, add it as a subscription instead."
     ),
 }
 
