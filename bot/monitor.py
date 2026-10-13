@@ -19,6 +19,10 @@ Cost bounds, in order of importance:
 - at most MAX_NEW_PER_POLL entries per subscription per cycle, and at most
   MAX_ANALYSES_PER_CYCLE across all subscriptions;
 - per-user subscription cap lives in the DB layer (MAX_SUBSCRIPTIONS_PER_USER).
+
+YouTube Shorts (``/shorts/`` URLs) are recorded as 'skipped_format' and never
+analyzed (#125): a ~60s clip can't support follow-up action advice, and they
+would otherwise eat the per-poll budget.
 """
 from __future__ import annotations
 
@@ -187,6 +191,11 @@ def resolve_feed(url: str) -> dict:
     return {"feed_url": feed_url, "title": title, "source_kind": kind}
 
 
+def is_short(url: str) -> bool:
+    """A YouTube Short, by URL form (what channel feeds actually hand us)."""
+    return "/shorts/" in urlparse(url).path
+
+
 def fetch_entries(feed_url: str) -> list[dict]:
     """The newest FEED_ENTRY_WINDOW entries of a feed: {url, title}."""
     resp = _get(feed_url)
@@ -217,6 +226,7 @@ async def poll_subscription(sub, *, analysis_budget: int) -> dict:
         mark_subscription_polled,
         record_subscription_entry,
         set_subscription_entry_result,
+        skip_pending_shorts,
     )
     from bot.pipeline import ERR_BUSY, PipelineError, analyze_url
 
@@ -228,13 +238,18 @@ async def poll_subscription(sub, *, analysis_budget: int) -> dict:
     # is recorded as seen-but-never-analyzed.
     status = "seeded" if first_poll else "pending"
     for e in entries:
+        # Shorts stay in the ledger (so they never look new later) but are
+        # never analyzed; first-poll entries are already 'seeded'.
+        entry_status = "skipped_format" if not first_poll and is_short(e["url"]) else status
         if record_subscription_entry(sub["id"], sub["user_id"], e["url"], e["title"],
-                                     status=status):
+                                     status=entry_status):
             stats["new"] += 1
     mark_subscription_polled(sub["id"])
     if first_poll:
         return stats
 
+    # Shorts queued before this rule existed would otherwise hold pending slots.
+    skip_pending_shorts(sub["id"])
     for entry in get_pending_subscription_entries(sub["id"], limit=MAX_NEW_PER_POLL):
         if stats["analyzed"] >= analysis_budget:
             break

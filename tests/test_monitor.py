@@ -272,6 +272,42 @@ class TestPollSubscription:
         assert stats["analyzed"] == 2
 
 
+class TestSkipShorts:
+    SHORT = "https://www.youtube.com/shorts/abc123"
+    VIDEO = "https://www.youtube.com/watch?v=xyz789"
+
+    def test_short_is_recorded_but_not_analyzed(self, polling):
+        polling.entries = []
+        polling.poll()  # seed
+        polling.entries = [{"url": self.SHORT, "title": "S"},
+                           {"url": self.VIDEO, "title": "V"}]
+        stats = polling.poll()
+        assert polling.analyzed == [self.VIDEO]
+        assert stats["analyzed"] == 1
+        assert polling.statuses()[self.SHORT] == "skipped_format"
+        assert polling.statuses()[self.VIDEO] == "done"
+
+    def test_shorts_do_not_consume_per_poll_budget(self, polling, monkeypatch):
+        from bot import monitor
+        monkeypatch.setattr(monitor, "MAX_NEW_PER_POLL", 2)
+        polling.entries = []
+        polling.poll()
+        polling.entries = (
+            [{"url": f"https://www.youtube.com/shorts/s{i}", "title": "S"} for i in range(5)]
+            + [{"url": f"https://www.youtube.com/watch?v=v{i}", "title": "V"} for i in range(2)]
+        )
+        assert polling.poll()["analyzed"] == 2
+
+    def test_previously_queued_short_is_retired(self, polling):
+        polling.entries = []
+        polling.poll()
+        polling.db.record_subscription_entry(
+            polling.sub_id, polling.user_id, self.SHORT, "S", status="pending")
+        polling.poll()
+        assert polling.analyzed == []
+        assert polling.statuses()[self.SHORT] == "skipped_format"
+
+
 class TestPollAllSubscriptions:
     def test_fan_out_and_contained_feed_failure(self, db, monkeypatch):
         from bot import monitor, pipeline
