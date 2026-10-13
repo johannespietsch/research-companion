@@ -1107,6 +1107,18 @@ def get_pending_subscription_entries(sub_id: int, limit: int = 10) -> list[sqlit
         ).fetchall()
 
 
+def skip_pending_shorts(sub_id: int) -> int:
+    """Retire already-queued /shorts/ entries (#125) so they never reach analysis."""
+    with _get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE subscription_items SET status = 'skipped_format', updated_at = ? "
+            "WHERE subscription_id = ? AND status = 'pending' "
+            "AND entry_url LIKE '%youtube.com/shorts/%'",
+            (_utcnow_iso(), sub_id),
+        )
+        return cur.rowcount
+
+
 def set_subscription_entry_result(
     entry_id: int, *, status: str, item_id: int | None = None, verdict: str = "",
 ) -> None:
