@@ -701,6 +701,45 @@ class TestYouTubeEgress:
         assert "egress" not in second
 
 
+class TestYouTubeChannelUrl:
+    """A pasted channel URL has no video to transcribe — say so instead of
+    summarising the channel blurb as a transcript."""
+
+    @pytest.mark.parametrize("url", [
+        "https://www.youtube.com/@MilkRoadMacro",
+        "https://youtube.com/@MilkRoadMacro/videos",
+        "https://www.youtube.com/channel/UCabcdefghijklmnopqrstuv",
+        "https://www.youtube.com/c/SomeName",
+        "https://www.youtube.com/user/SomeName",
+    ])
+    def test_channel_urls_are_detected(self, url):
+        from bot import fetcher
+        assert fetcher._is_youtube_channel_url(url)
+
+    @pytest.mark.parametrize("url", [
+        YOUTUBE_URL,
+        "https://youtu.be/dQw4w9WgXcQ",
+        "https://www.youtube.com/shorts/dQw4w9WgXcQ",
+    ])
+    def test_video_urls_are_not_channels(self, url):
+        from bot import fetcher
+        assert not fetcher._is_youtube_channel_url(url)
+
+    def test_channel_url_returns_hint_without_touching_youtube(self):
+        from bot import fetch_errors, fetcher
+
+        with patch.object(fetcher, "assert_public_url"), \
+             patch.object(fetcher, "_youtube_transcript") as yt:
+            result = asyncio.run(
+                fetcher._fetch_url_uncached("https://www.youtube.com/@MilkRoadMacro")
+            )
+
+        yt.assert_not_called()
+        assert result["text"] == ""
+        assert result["reason"] == fetch_errors.YOUTUBE_CHANNEL
+        assert "channel" in fetch_errors.user_message(result["reason"]).lower()
+
+
 class TestUrlCacheLayer:
     """`fetch_url` wraps `_fetch_url_uncached` with the url_cache."""
 
