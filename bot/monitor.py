@@ -51,15 +51,16 @@ _UA = "filter.fyi feed monitor (+https://filter.fyi)"
 
 _YT_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com"}
 _YT_FEED = "https://www.youtube.com/feeds/videos.xml?channel_id={cid}"
-# A YouTube channel page exposes its UC… id in several spots. We try the most
-# stable ones (canonical link / og:url always point at the /channel/UC… form
-# even from a handle page), so a markup tweak to any single field can't break
-# resolution.
+# A YouTube channel page exposes its UC… id in several spots. Order matters:
+# canonical link / og:url / externalId always describe the page's OWN channel,
+# while a bare "channelId" also appears for featured/related channels embedded
+# in the page (e.g. @MilkRoadMacro's page carries other channels' ids), so it
+# is only a last resort.
 _YT_CHANNEL_ID_RES = [
-    re.compile(r'"channelId"\s*:\s*"(UC[0-9A-Za-z_-]{22})"'),
-    re.compile(r'"externalId"\s*:\s*"(UC[0-9A-Za-z_-]{22})"'),
     re.compile(r'<link[^>]+rel="canonical"[^>]+href="https://www\.youtube\.com/channel/(UC[0-9A-Za-z_-]{22})"'),
     re.compile(r'<meta[^>]+property="og:url"[^>]+content="https://www\.youtube\.com/channel/(UC[0-9A-Za-z_-]{22})"'),
+    re.compile(r'"externalId"\s*:\s*"(UC[0-9A-Za-z_-]{22})"'),
+    re.compile(r'"channelId"\s*:\s*"(UC[0-9A-Za-z_-]{22})"'),
 ]
 # YouTube serves an EU "consent" interstitial to datacenter IPs (e.g. Fly),
 # which carries none of the channel markup. This cookie records the consent
