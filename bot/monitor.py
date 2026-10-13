@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from urllib.parse import urljoin, urlparse
 
 import feedparser
@@ -46,6 +47,12 @@ _MAX_BODY_BYTES = 5 * 1024 * 1024
 _UA = "filter.fyi feed monitor (+https://filter.fyi)"
 
 _YT_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com"}
+# YouTube's feeds/videos.xml returns transient 404s/5xx for valid channels (#129).
+# Waits between attempts; patched to zeros in tests.
+_YT_FEED_RETRY_DELAYS_S = (2.0, 5.0)
+# Consecutive transient feed failures before a subscription's poll failure is
+# logged as a warning rather than info.
+_YT_FEED_WARN_AFTER = 3
 _YT_FEED = "https://www.youtube.com/feeds/videos.xml?channel_id={cid}"
 # A YouTube channel page exposes its UC… id in several spots. We try the most
 # stable ones (canonical link / og:url always point at the /channel/UC… form
@@ -187,9 +194,30 @@ def resolve_feed(url: str) -> dict:
     return {"feed_url": feed_url, "title": title, "source_kind": kind}
 
 
+def _is_transient_feed_error(feed_url: str, exc: BaseException) -> bool:
+    """A 404/5xx from a YouTube feed, which YouTube serves intermittently for
+    channels that exist."""
+    if not (_is_youtube(feed_url) and isinstance(exc, httpx.HTTPStatusError)):
+        return False
+    status = exc.response.status_code
+    return status == 404 or status >= 500
+
+
+def _get_feed(feed_url: str) -> httpx.Response:
+    """_get, retried with backoff on transient YouTube feed errors."""
+    for delay in _YT_FEED_RETRY_DELAYS_S:
+        try:
+            return _get(feed_url)
+        except httpx.HTTPStatusError as exc:
+            if not _is_transient_feed_error(feed_url, exc):
+                raise
+            time.sleep(delay)
+    return _get(feed_url)
+
+
 def fetch_entries(feed_url: str) -> list[dict]:
     """The newest FEED_ENTRY_WINDOW entries of a feed: {url, title}."""
-    resp = _get(feed_url)
+    resp = _get_feed(feed_url)
     parsed = feedparser.parse(resp.content)
     out = []
     for e in parsed.entries[:FEED_ENTRY_WINDOW]:
@@ -260,6 +288,10 @@ async def poll_subscription(sub, *, analysis_budget: int) -> dict:
     return stats
 
 
+# Consecutive transient feed failures per subscription id, for this process.
+_transient_feed_failures: dict[int, int] = {}
+
+
 async def poll_all_subscriptions() -> dict:
     """One cycle over every subscription. Per-subscription failures are
     contained; the cycle-wide analysis ceiling bounds LLM spend."""
@@ -271,11 +303,20 @@ async def poll_all_subscriptions() -> dict:
         totals["subscriptions"] += 1
         try:
             stats = await poll_subscription(sub, analysis_budget=budget)
-        except Exception:
+        except Exception as exc:
             totals["feed_errors"] += 1
-            logger.warning("poll failed for subscription %s (%s)",
-                           sub["id"], sub["feed_url"], exc_info=True)
+            if _is_transient_feed_error(sub["feed_url"], exc):
+                failures = _transient_feed_failures.get(sub["id"], 0) + 1
+                _transient_feed_failures[sub["id"]] = failures
+                level = logging.WARNING if failures >= _YT_FEED_WARN_AFTER else logging.INFO
+                logger.log(level, "poll failed for subscription %s (%s): transient YouTube "
+                           "feed error, %d in a row", sub["id"], sub["feed_url"], failures,
+                           exc_info=level == logging.WARNING)
+            else:
+                logger.warning("poll failed for subscription %s (%s)",
+                               sub["id"], sub["feed_url"], exc_info=True)
             continue
+        _transient_feed_failures.pop(sub["id"], None)
         budget -= stats["analyzed"]
         totals["new"] += stats["new"]
         totals["analyzed"] += stats["analyzed"]

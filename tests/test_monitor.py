@@ -157,6 +157,66 @@ class TestFetchEntries:
         ]
 
 
+def _status_error(url: str, status: int):
+    import httpx
+    request = httpx.Request("GET", url)
+    return httpx.HTTPStatusError(
+        f"{status}", request=request, response=httpx.Response(status, request=request),
+    )
+
+
+class TestFetchEntriesRetry:
+    """#129: YouTube's feeds/videos.xml serves transient 404/5xx for valid channels."""
+
+    YT_FEED = "https://www.youtube.com/feeds/videos.xml?channel_id=UCabcdefghijklmnopqrstuv"
+
+    @pytest.fixture
+    def flaky_get(self, monkeypatch):
+        from bot import monitor
+        monkeypatch.setattr(monitor, "_YT_FEED_RETRY_DELAYS_S", (0, 0))
+        state = {"calls": 0, "failures": [], "body": FEED_XML}
+
+        def get(url):
+            state["calls"] += 1
+            if state["failures"]:
+                raise _status_error(url, state["failures"].pop(0))
+            return _resp(url, state["body"])
+
+        monkeypatch.setattr(monitor, "_get", get)
+        return state
+
+    def test_transient_youtube_errors_are_retried(self, flaky_get):
+        from bot.monitor import fetch_entries
+        flaky_get["failures"] = [404, 500]
+        entries = fetch_entries(self.YT_FEED)
+        assert flaky_get["calls"] == 3
+        assert [e["url"] for e in entries] == ["https://ex.com/post-a", "https://ex.com/post-b"]
+
+    def test_persistent_youtube_error_raises_after_retries(self, flaky_get):
+        import httpx
+        from bot.monitor import fetch_entries
+        flaky_get["failures"] = [404, 404, 404]
+        with pytest.raises(httpx.HTTPStatusError):
+            fetch_entries(self.YT_FEED)
+        assert flaky_get["calls"] == 3
+
+    def test_non_youtube_404_is_not_retried(self, flaky_get):
+        import httpx
+        from bot.monitor import fetch_entries
+        flaky_get["failures"] = [404]
+        with pytest.raises(httpx.HTTPStatusError):
+            fetch_entries("https://ex.com/feed.xml")
+        assert flaky_get["calls"] == 1
+
+    def test_youtube_403_is_not_retried(self, flaky_get):
+        import httpx
+        from bot.monitor import fetch_entries
+        flaky_get["failures"] = [403]
+        with pytest.raises(httpx.HTTPStatusError):
+            fetch_entries(self.YT_FEED)
+        assert flaky_get["calls"] == 1
+
+
 # ---------------------------------------------------------------------------
 # Poll cycle
 # ---------------------------------------------------------------------------
@@ -310,6 +370,45 @@ class TestPollAllSubscriptions:
         totals = asyncio.run(monitor.poll_all_subscriptions())
         assert totals["analyzed"] == 2
         assert sorted(analyzed) == sorted([ua, ub])  # one personalized run each
+
+    def test_transient_youtube_failures_warn_only_when_repeated(self, db, monkeypatch, caplog):
+        """#129: one flaky YouTube poll is info; N in a row is a warning; a
+        success resets the count."""
+        import logging
+
+        from bot import monitor
+
+        uid = db.upsert_user_by_email("yt@example.com")
+        feed = "https://www.youtube.com/feeds/videos.xml?channel_id=UCabcdefghijklmnopqrstuv"
+        db.add_subscription(uid, feed)
+        monkeypatch.setattr(monitor, "_transient_feed_failures", {})
+        outcome = {"fail": True}
+
+        def fetch(feed_url):
+            if outcome["fail"]:
+                raise _status_error(feed_url, 404)
+            return []
+
+        monkeypatch.setattr(monitor, "fetch_entries", fetch)
+
+        def poll_levels():
+            caplog.clear()
+            with caplog.at_level(logging.INFO, logger="bot.monitor"):
+                totals = asyncio.run(monitor.poll_all_subscriptions())
+            return totals, [r.levelno for r in caplog.records if "poll failed" in r.getMessage()]
+
+        for _ in range(monitor._YT_FEED_WARN_AFTER - 1):
+            totals, levels = poll_levels()
+            assert totals["feed_errors"] == 1
+            assert levels == [logging.INFO]
+        _, levels = poll_levels()
+        assert levels == [logging.WARNING]
+
+        outcome["fail"] = False
+        poll_levels()
+        outcome["fail"] = True
+        _, levels = poll_levels()
+        assert levels == [logging.INFO]  # count was reset by the success
 
 
 # ---------------------------------------------------------------------------
