@@ -100,9 +100,13 @@ def unsubscribe_url(user_id: int) -> str:
 _VERDICT_RANK = {"watch": 0, "skim": 1, "skip": 2}
 
 
-def _item_label(analysis: dict, source: str) -> str:
-    """Short human label for an item: its main idea, else the source URL.
-    (items don't store a title — same approach as the /api/library list.)"""
+def _item_label(title: str, analysis: dict, source: str) -> str:
+    """Short human label for an item: its stored title, else its main idea,
+    else the source URL. Older rows (saved before items.title existed) fall
+    back to main_idea — same approach as the /api/library list."""
+    title = (title or "").strip()
+    if title:
+        return title[:120]
     label = (analysis.get("main_idea") or "").strip()
     return label[:120] if label else (source or "untitled")
 
@@ -158,7 +162,7 @@ def build_digest(user_id: int, *, now: datetime | None = None) -> dict | None:
             "detail": (s.get("detail") or "").strip(),
             "effort": (s.get("effort") or "").strip(),
             "item_id": row["id"],
-            "source_label": _item_label(analysis, row["source"]),
+            "source_label": _item_label(row["title"], analysis, row["source"]),
         })
 
     # Each action is glanceable (#78): title, one-line detail, effort, and a
@@ -177,7 +181,7 @@ def build_digest(user_id: int, *, now: datetime | None = None) -> dict | None:
         })
 
     skipped = [
-        {"label": _item_label(analysis, row["source"]), "source": row["source"]}
+        {"label": _item_label(row["title"], analysis, row["source"]), "source": row["source"]}
         for rank, row, analysis in parsed
         if rank == _VERDICT_RANK["skip"]
     ]

@@ -147,7 +147,7 @@ async def search_library(query: str = "", limit: int = 20) -> list[dict]:
         out.append(
             {
                 "item_id": r["id"],
-                "title": analysis.get("title") or r["source"],
+                "title": r["title"] or analysis.get("main_idea") or r["source"],
                 "verdict": analysis.get("verdict", ""),
                 "source": r["source"],
                 "source_type": r["source_type"],
@@ -171,6 +171,7 @@ async def get_library_item(item_id: int) -> dict:
         analysis = {}
     return {
         "item_id": row["id"],
+        "title": row["title"] or analysis.get("main_idea") or row["source"],
         "source": row["source"],
         "source_type": row["source_type"],
         "created_at": row["created_at"],

@@ -667,6 +667,7 @@ async def _run_retrigger_job(
             content=result.summary,
             analysis=to_json_str(result.analysis),
             source_words=result.source_words,
+            title=result.title,
         )
 
     set_job_done(job_id, {

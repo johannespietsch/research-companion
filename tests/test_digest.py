@@ -40,8 +40,9 @@ def _suggestion(title="Do X", detail="Do X because Y", effort="~30 min", first_s
 
 
 def _add_item(db, user_id, *, verdict="watch", suggestions=None, main_idea="Main idea",
-              days_ago=0, source="https://ex.com/a"):
-    item_id = db.save_item(user_id, "article", source, "content", _analysis(verdict, suggestions, main_idea))
+              days_ago=0, source="https://ex.com/a", title=""):
+    item_id = db.save_item(user_id, "article", source, "content", _analysis(verdict, suggestions, main_idea),
+                           title=title)
     if days_ago:
         ts = (NOW - timedelta(days=days_ago)).strftime("%Y-%m-%dT%H:%M:%S")
         with db._get_conn() as conn:
@@ -94,6 +95,17 @@ class TestBuildDigest:
         d = build_digest(uid, now=NOW)
         assert [a["title"] for a in d["actions"]] == ["Real move"]
         assert [s["label"] for s in d["skipped"]] == ["Hype post"]
+
+    def test_labels_prefer_the_stored_title_over_main_idea(self, db, digest_env):
+        # A real source title should win over the AI-generated main_idea once
+        # it's actually persisted; untitled (legacy) rows keep the old fallback.
+        from bot.digest import build_digest
+        uid = db.upsert_user_by_email("u@example.com")
+        _add_item(db, uid, verdict="skip", main_idea="A generic summary opening",
+                  title="The Real Article Headline")
+        _add_item(db, uid, verdict="watch", suggestions=[_suggestion(title="Real move")])
+        d = build_digest(uid, now=NOW)
+        assert [s["label"] for s in d["skipped"]] == ["The Real Article Headline"]
 
     def test_no_suggestion_week_still_builds_with_empty_actions(self, db, digest_env):
         from bot.digest import build_digest, render_digest_text

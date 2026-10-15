@@ -226,6 +226,62 @@ class TestUpsertItemBySource:
 
 
 # ---------------------------------------------------------------------------
+# items.title — the source's own title (article headline, video title,
+# filename…), distinct from the AI-generated main_idea that used to be the
+# only thing display surfaces could fall back to.
+# ---------------------------------------------------------------------------
+
+class TestItemTitle:
+    def test_save_item_persists_title(self, db):
+        uid = db.get_or_create_user_by_telegram(1)
+        item_id = db.save_item(
+            uid, "article", "https://ex.com/a", "content", "{}", title="Hello RAG",
+        )
+        assert db.get_item(item_id, user_id=uid)["title"] == "Hello RAG"
+
+    def test_save_item_title_defaults_empty(self, db):
+        uid = db.get_or_create_user_by_telegram(1)
+        item_id = db.save_item(uid, "article", "https://ex.com/a", "content", "{}")
+        assert db.get_item(item_id, user_id=uid)["title"] == ""
+
+    def test_upsert_sets_title_on_create(self, db):
+        uid = db.get_or_create_user_by_telegram(1)
+        item_id = db.upsert_item_by_source(
+            uid, "article", "https://ex.com/a", "content", "{}", title="Hello RAG",
+        )
+        assert db.get_item(item_id, user_id=uid)["title"] == "Hello RAG"
+
+    def test_upsert_with_a_title_refreshes_it(self, db):
+        uid = db.get_or_create_user_by_telegram(1)
+        item_id = db.save_item(
+            uid, "article", "https://ex.com/a", "content", "{}", title="Old Title",
+        )
+        db.upsert_item_by_source(
+            uid, "article", "https://ex.com/a", "content v2", "{}", title="New Title",
+        )
+        assert db.get_item(item_id, user_id=uid)["title"] == "New Title"
+
+    def test_upsert_with_no_title_keeps_the_existing_one(self, db):
+        """A retrigger that only got a degraded fetch (empty title) must not
+        clobber a perfectly good title the original run already stored."""
+        uid = db.get_or_create_user_by_telegram(1)
+        item_id = db.save_item(
+            uid, "article", "https://ex.com/a", "content", "{}", title="Hello RAG",
+        )
+        db.upsert_item_by_source(
+            uid, "article", "https://ex.com/a", "content v2", "{}",
+        )
+        assert db.get_item(item_id, user_id=uid)["title"] == "Hello RAG"
+
+    def test_search_items_matches_on_title(self, db):
+        uid = db.get_or_create_user_by_telegram(1)
+        db.save_item(uid, "article", "https://ex.com/a", "content", "{}", title="Hello RAG")
+        results = db.search_items("RAG", user_id=uid)
+        assert len(results) == 1
+        assert results[0]["title"] == "Hello RAG"
+
+
+# ---------------------------------------------------------------------------
 # Link codes
 # ---------------------------------------------------------------------------
 

@@ -12,7 +12,7 @@ from bot.config import MAX_CONTENT_CHARS
 from bot.db import get_item, get_or_create_user_by_telegram, get_user_profile, save_item
 from bot.fetch_errors import user_message as fetch_error_message
 from bot.formatting import format_agent_brief, format_analysis
-from bot.pipeline import PipelineError, analyze_url
+from bot.pipeline import PipelineError, analyze_url, title_from_text
 from bot.storage import save_file_from_path
 from bot.transcriber import transcribe
 
@@ -115,6 +115,10 @@ async def _analyze_and_reply(
         analysis=to_json_str(analysis),
         user_note=user_note,
         file_path=file_path,
+        # `source` is already a real title for uploads (the filename); for
+        # notes/voice/video/photos there's no filename, so fall back to the
+        # first line of the (transcribed/described) text.
+        title=source or title_from_text(text),
     )
     await _reply_analysis(update.message, analysis, item_id)
 
