@@ -898,6 +898,7 @@ async def library_list(user_id: int, _: None = Depends(_require_try_secret)):
             "source": r["source"],
             "verdict": verdict,
             "title": r["title"] or fallback_title,
+            "author": r["author"],
             "created_at": r["created_at"],
         })
     return out

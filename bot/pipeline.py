@@ -110,6 +110,10 @@ class PipelineResult:
         return self.fetched.get("title") or ""
 
     @property
+    def author(self) -> str:
+        return self.fetched.get("author") or ""
+
+    @property
     def image_urls(self) -> list[str]:
         return self.fetched.get("image_urls") or []
 
@@ -270,6 +274,7 @@ async def analyze_url(
                 user_note=user_note,
                 source_words=source_words,
                 title=fetched.get("title") or "",
+                author=fetched.get("author") or "",
             )
 
         return PipelineResult(

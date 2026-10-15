@@ -282,6 +282,49 @@ class TestItemTitle:
 
 
 # ---------------------------------------------------------------------------
+# items.author — who made it (YouTube/Vimeo channel, X handle…), same
+# fetched-but-previously-discarded gap as title. Lets the library show who a
+# video/post is from instead of just its generic host (every YouTube video
+# otherwise shows the same "youtube.com").
+# ---------------------------------------------------------------------------
+
+class TestItemAuthor:
+    def test_save_item_persists_author(self, db):
+        uid = db.get_or_create_user_by_telegram(1)
+        item_id = db.save_item(
+            uid, "youtube", "https://youtube.com/watch?v=x", "content", "{}", author="Some Channel",
+        )
+        assert db.get_item(item_id, user_id=uid)["author"] == "Some Channel"
+
+    def test_save_item_author_defaults_empty(self, db):
+        uid = db.get_or_create_user_by_telegram(1)
+        item_id = db.save_item(uid, "article", "https://ex.com/a", "content", "{}")
+        assert db.get_item(item_id, user_id=uid)["author"] == ""
+
+    def test_upsert_with_no_author_keeps_the_existing_one(self, db):
+        """Same preserve-on-refresh rule as title: a retrigger that only got a
+        degraded fetch (empty author) must not clobber a good one already stored."""
+        uid = db.get_or_create_user_by_telegram(1)
+        item_id = db.save_item(
+            uid, "youtube", "https://youtube.com/watch?v=x", "content", "{}", author="Some Channel",
+        )
+        db.upsert_item_by_source(
+            uid, "youtube", "https://youtube.com/watch?v=x", "content v2", "{}",
+        )
+        assert db.get_item(item_id, user_id=uid)["author"] == "Some Channel"
+
+    def test_upsert_with_an_author_refreshes_it(self, db):
+        uid = db.get_or_create_user_by_telegram(1)
+        item_id = db.save_item(
+            uid, "youtube", "https://youtube.com/watch?v=x", "content", "{}", author="Old Channel",
+        )
+        db.upsert_item_by_source(
+            uid, "youtube", "https://youtube.com/watch?v=x", "content v2", "{}", author="New Channel",
+        )
+        assert db.get_item(item_id, user_id=uid)["author"] == "New Channel"
+
+
+# ---------------------------------------------------------------------------
 # Link codes
 # ---------------------------------------------------------------------------
 

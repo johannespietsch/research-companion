@@ -126,12 +126,36 @@ class TestLibrary:
         rows = r.json()
         assert len(rows) == 1
         row = rows[0]
-        assert set(row.keys()) == {"id", "source_type", "source", "verdict", "title", "created_at"}
+        assert set(row.keys()) == {"id", "source_type", "source", "verdict", "title", "author", "created_at"}
         assert row["verdict"] == "watch"
         # The source's own title ("Hello RAG"), not a slice of the AI-generated
         # main_idea ("RAG = retrieval-augmented generation.") — see conftest's
         # fake_fetch_url vs fake_analyze.
         assert row["title"] == "Hello RAG"
+        # conftest's fake_fetch_url is a plain article fetch with no byline.
+        assert row["author"] == ""
+
+    def test_list_surfaces_the_fetched_author_eg_a_youtube_channel(self, client, auth_headers, monkeypatch):
+        import bot.pipeline
+
+        async def fake_fetch_with_author(url, **kwargs):
+            return {
+                "text": "Transcript of a talk about retrieval-augmented generation.",
+                "title": "Hello RAG",
+                "author": "Some Channel",
+                "source_type": "youtube",
+                "image_urls": [],
+            }
+        monkeypatch.setattr(bot.pipeline, "fetch_url", fake_fetch_with_author)
+
+        uid = client.post("/api/users/upsert", json={"email": "a@b.com"}, headers=auth_headers).json()["user_id"]
+        client.post(
+            "/api/library/add",
+            json={"user_id": uid, "url": "https://youtube.com/watch?v=abc"},
+            headers=auth_headers,
+        )
+        row = client.get(f"/api/library?user_id={uid}", headers=auth_headers).json()[0]
+        assert row["author"] == "Some Channel"
 
     def test_list_falls_back_to_main_idea_for_legacy_rows_with_no_title(self, client, auth_headers, db):
         # Rows saved before items.title existed have title == "" — the list

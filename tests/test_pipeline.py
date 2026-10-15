@@ -91,6 +91,32 @@ class TestAnalyzeUrlBasics:
         # brief condensed the source.
         assert rows[0]["source_words"] == 6
         assert result.source_words == 6
+        # The fetched title/author ride along onto the saved item, not just
+        # the PipelineResult — this is what the library list reads from.
+        assert rows[0]["title"] == "RAG explained"
+        assert rows[0]["author"] == ""  # fixture's article fetch has no byline
+
+    def test_signed_in_save_persists_fetched_author(self, pipeline, db, monkeypatch):
+        """A video/social fetch's channel or handle rides along onto the saved
+        item too, same as title — this is what lets the library show who made
+        it instead of a generic host like "youtube.com" for every video."""
+        async def fake_fetch_youtube(url, **kwargs):
+            return {
+                "text": "Transcript of a talk about retrieval-augmented generation.",
+                "title": "Hello RAG",
+                "author": "Some Channel",
+                "source_type": "youtube",
+                "image_urls": [],
+            }
+        monkeypatch.setattr(pipeline, "fetch_url", fake_fetch_youtube)
+
+        from bot.analyzer import UsageContext
+        uid = db.get_or_create_user_by_telegram(1)
+        result = asyncio.run(pipeline.analyze_url(
+            "https://youtu.be/x", ctx=UsageContext(user_id=uid), save_for_user_id=uid,
+        ))
+        assert result.author == "Some Channel"
+        assert db.get_item(result.saved_id, user_id=uid)["author"] == "Some Channel"
 
     def test_anonymous_does_not_save(self, pipeline, db):
         from bot.analyzer import UsageContext

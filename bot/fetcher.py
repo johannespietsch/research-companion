@@ -90,14 +90,15 @@ def _youtube_egress() -> tuple[str | None, str]:
     return (proxy, EGRESS_PROXY) if ok else (None, EGRESS_DIRECT_FALLBACK)
 
 
-def _youtube_oembed_title(url: str, proxy: str | None = None) -> str | None:
-    """Fetch a video's real title via YouTube's public oEmbed endpoint.
+def _youtube_oembed_metadata(url: str, proxy: str | None = None) -> dict | None:
+    """Fetch a video's real title + channel name via YouTube's public oEmbed
+    endpoint.
 
     The youtube_transcript_api path gives us the transcript but no metadata, so
-    without this we fall back to a "YouTube video (<id>)" placeholder. oEmbed is
-    free, unauthenticated, and hits a different endpoint than the transcript API
-    (so it rarely shares its rate limits) — much cheaper than a full yt-dlp
-    metadata pass just to recover the title.
+    without this we fall back to a "YouTube video (<id>)" placeholder (and no
+    channel name at all). oEmbed is free, unauthenticated, and hits a
+    different endpoint than the transcript API (so it rarely shares its rate
+    limits) — much cheaper than a full yt-dlp metadata pass to recover both.
     """
     try:
         resp = requests.get(
@@ -109,10 +110,15 @@ def _youtube_oembed_title(url: str, proxy: str | None = None) -> str | None:
         )
         if resp.status_code != 200:
             return None
-        title = resp.json().get("title")
-        return title.strip() if isinstance(title, str) and title.strip() else None
+        data = resp.json()
+        title = data.get("title")
+        author = data.get("author_name")
+        return {
+            "title": title.strip() if isinstance(title, str) and title.strip() else None,
+            "author": author.strip() if isinstance(author, str) and author.strip() else "",
+        }
     except Exception as e:
-        logger.warning(f"YouTube oEmbed title fetch failed for {url}: {e}")
+        logger.warning(f"YouTube oEmbed metadata fetch failed for {url}: {e}")
         return None
 
 
@@ -251,10 +257,12 @@ def _youtube_transcript_via(url: str, max_whisper_duration: int, proxy: str | No
         if transcript is not None:
             fetched = transcript.fetch()
             text = " ".join(snippet.text for snippet in fetched)
-            title = _youtube_oembed_title(url, proxy=proxy) or f"YouTube video ({video_id})"
+            meta = _youtube_oembed_metadata(url, proxy=proxy) or {}
+            title = meta.get("title") or f"YouTube video ({video_id})"
             return {
                 "text": f"{title}\n\nTranscript:\n{text}"[:MAX_CONTENT_CHARS],
                 "title": title,
+                "author": meta.get("author") or "",
                 "source_type": "youtube",
                 "image_urls": [thumb],
                 "language": transcript.language_code,
@@ -376,6 +384,7 @@ def _vimeo_native_transcript(config: dict, video_id: str) -> dict | None:
     return {
         "text": f"{title}\n\nTranscript:\n{text}"[:MAX_CONTENT_CHARS],
         "title": title,
+        "author": (video_meta.get("owner") or {}).get("name") or "",
         "source_type": "video",
         "image_urls": image_urls,
         "language": track.get("lang"),
@@ -496,10 +505,12 @@ def _format_fxtwitter(tweet: dict, url: str) -> dict:
             or tweet.get("text", "")
         )
         text = f"X Article by @{handle}: {title}\n\n{body}"
-        return {"text": text[:MAX_CONTENT_CHARS], "title": title or f"Article by @{handle}", "source_type": "social", "image_urls": image_urls}
+        return {"text": text[:MAX_CONTENT_CHARS], "title": title or f"Article by @{handle}",
+                "author": author or f"@{handle}", "source_type": "social", "image_urls": image_urls}
 
     text = f"@{handle} ({author}):\n\n{tweet.get('text', '')}"
-    return {"text": text[:MAX_CONTENT_CHARS], "title": f"Post by @{handle}", "source_type": "social", "image_urls": image_urls}
+    return {"text": text[:MAX_CONTENT_CHARS], "title": f"Post by @{handle}",
+            "author": author or f"@{handle}", "source_type": "social", "image_urls": image_urls}
 
 
 def _format_syndication(data: dict, url: str) -> dict:
@@ -511,7 +522,8 @@ def _format_syndication(data: dict, url: str) -> dict:
         if m.get("type") == "photo" and m.get("media_url_https")
     ]
     text = f"@{handle} ({author}):\n\n{data.get('text', '')}"
-    return {"text": text[:MAX_CONTENT_CHARS], "title": f"Post by @{handle}", "source_type": "social", "image_urls": image_urls}
+    return {"text": text[:MAX_CONTENT_CHARS], "title": f"Post by @{handle}",
+            "author": author or f"@{handle}", "source_type": "social", "image_urls": image_urls}
 
 
 def _tweet_video_transcript(
@@ -718,6 +730,7 @@ def _yt_dlp_extract(url: str, proxy: str | None = None) -> dict:
     return {
         "text": text[:MAX_CONTENT_CHARS],
         "title": title,
+        "author": uploader,
         "source_type": source_type,
         "has_transcript": bool(subtitle_text),
         "duration": duration,
@@ -775,6 +788,7 @@ def _yt_dlp_transcribe(url: str, proxy: str | None = None) -> dict:
         return {
             "text": text[:MAX_CONTENT_CHARS],
             "title": title,
+            "author": uploader,
             "source_type": "video",
             "transcript": transcript,
         }

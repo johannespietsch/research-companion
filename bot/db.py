@@ -506,6 +506,11 @@ def _init() -> None:
         # for rows saved before this column; those surfaces keep their old
         # main_idea fallback.
         _ensure_column(conn, "items", "title", "title TEXT NOT NULL DEFAULT ''")
+        # Who made it (YouTube/Vimeo channel, X handle, filename's uploader…) —
+        # same "fetched but discarded" gap as title. Empty when the source type
+        # has no clear author (plain articles, pasted text) or for rows saved
+        # before this column; display surfaces fall back to the source's host.
+        _ensure_column(conn, "items", "author", "author TEXT NOT NULL DEFAULT ''")
         conn.execute(_CREATE_LINK_CODES_SQL)
         conn.execute(_CREATE_URL_CACHE_SQL)
         conn.execute(_CREATE_ERROR_LOG_SQL)
@@ -701,21 +706,22 @@ def save_item(
     file_path: str = "",
     source_words: int | None = None,
     title: str = "",
+    author: str = "",
 ) -> int:
     with _get_conn() as conn:
         cur = conn.execute(
             "INSERT INTO items (user_id, source_type, source, content, "
-            "analysis, user_note, file_path, source_words, title) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "analysis, user_note, file_path, source_words, title, author) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (user_id, source_type, source, content, analysis, user_note, file_path,
-             source_words, title),
+             source_words, title, author),
         )
         return cur.lastrowid
 
 
 def upsert_item_by_source(
     user_id: int, source_type: str, source: str, content: str, analysis: str,
-    *, source_words: int | None = None, title: str = "",
+    *, source_words: int | None = None, title: str = "", author: str = "",
 ) -> int:
     """Refresh a user's existing saved item for `source` in place, or create
     one if they don't have one yet. Unlike `save_item` (always inserts, so
@@ -733,25 +739,26 @@ def upsert_item_by_source(
             (user_id, source),
         ).fetchone()
         if row is not None:
-            # A re-run that only got a degraded fetch (empty title) must not
-            # clobber a perfectly good title the original run already stored.
+            # A re-run that only got a degraded fetch (empty title/author) must
+            # not clobber perfectly good values the original run already stored.
             conn.execute(
                 "UPDATE items SET source_type = ?, content = ?, analysis = ?, "
-                "source_words = ?, title = COALESCE(NULLIF(?, ''), title) WHERE id = ?",
-                (source_type, content, analysis, source_words, title, row["id"]),
+                "source_words = ?, title = COALESCE(NULLIF(?, ''), title), "
+                "author = COALESCE(NULLIF(?, ''), author) WHERE id = ?",
+                (source_type, content, analysis, source_words, title, author, row["id"]),
             )
             return row["id"]
         cur = conn.execute(
             "INSERT INTO items (user_id, source_type, source, content, analysis, "
-            "source_words, title) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (user_id, source_type, source, content, analysis, source_words, title),
+            "source_words, title, author) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (user_id, source_type, source, content, analysis, source_words, title, author),
         )
         return cur.lastrowid
 
 
 _ITEM_COLS = (
     "id, user_id, source_type, source, content, analysis, user_note, file_path, "
-    "source_words, title, created_at"
+    "source_words, title, author, created_at"
 )
 
 
