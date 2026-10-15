@@ -269,6 +269,7 @@ async def analyze_url(
                 analysis=to_json_str(analysis),
                 user_note=user_note,
                 source_words=source_words,
+                title=fetched.get("title") or "",
             )
 
         return PipelineResult(
@@ -376,6 +377,7 @@ async def analyze_text(
                 analysis=to_json_str(analysis),
                 user_note=user_note,
                 source_words=source_words,
+                title=title,
             )
 
         return PipelineResult(

@@ -499,6 +499,13 @@ def _init() -> None:
         # can show "brief · N words (from an M-word transcript)". NULL = unknown
         # (rows saved before this column, notes, uploads, claimed anon rows).
         _ensure_column(conn, "items", "source_words", "source_words INTEGER")
+        # The source's own title (article headline, video title, filename,
+        # first line of pasted text) — fetched at save time but previously
+        # discarded, which forced every display surface to fall back to a
+        # slice of the AI-generated main_idea instead of a real title. Empty
+        # for rows saved before this column; those surfaces keep their old
+        # main_idea fallback.
+        _ensure_column(conn, "items", "title", "title TEXT NOT NULL DEFAULT ''")
         conn.execute(_CREATE_LINK_CODES_SQL)
         conn.execute(_CREATE_URL_CACHE_SQL)
         conn.execute(_CREATE_ERROR_LOG_SQL)
@@ -693,21 +700,22 @@ def save_item(
     *,
     file_path: str = "",
     source_words: int | None = None,
+    title: str = "",
 ) -> int:
     with _get_conn() as conn:
         cur = conn.execute(
             "INSERT INTO items (user_id, source_type, source, content, "
-            "analysis, user_note, file_path, source_words) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "analysis, user_note, file_path, source_words, title) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (user_id, source_type, source, content, analysis, user_note, file_path,
-             source_words),
+             source_words, title),
         )
         return cur.lastrowid
 
 
 def upsert_item_by_source(
     user_id: int, source_type: str, source: str, content: str, analysis: str,
-    *, source_words: int | None = None,
+    *, source_words: int | None = None, title: str = "",
 ) -> int:
     """Refresh a user's existing saved item for `source` in place, or create
     one if they don't have one yet. Unlike `save_item` (always inserts, so
@@ -725,23 +733,25 @@ def upsert_item_by_source(
             (user_id, source),
         ).fetchone()
         if row is not None:
+            # A re-run that only got a degraded fetch (empty title) must not
+            # clobber a perfectly good title the original run already stored.
             conn.execute(
                 "UPDATE items SET source_type = ?, content = ?, analysis = ?, "
-                "source_words = ? WHERE id = ?",
-                (source_type, content, analysis, source_words, row["id"]),
+                "source_words = ?, title = COALESCE(NULLIF(?, ''), title) WHERE id = ?",
+                (source_type, content, analysis, source_words, title, row["id"]),
             )
             return row["id"]
         cur = conn.execute(
             "INSERT INTO items (user_id, source_type, source, content, analysis, "
-            "source_words) VALUES (?, ?, ?, ?, ?, ?)",
-            (user_id, source_type, source, content, analysis, source_words),
+            "source_words, title) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (user_id, source_type, source, content, analysis, source_words, title),
         )
         return cur.lastrowid
 
 
 _ITEM_COLS = (
     "id, user_id, source_type, source, content, analysis, user_note, file_path, "
-    "source_words, created_at"
+    "source_words, title, created_at"
 )
 
 
@@ -797,15 +807,15 @@ def search_items(query: str, user_id: int | None = None) -> list[sqlite3.Row]:
         if user_id is not None:
             return conn.execute(
                 f"SELECT {_ITEM_COLS} FROM items "
-                "WHERE user_id = ? AND (source LIKE ? OR content LIKE ? "
+                "WHERE user_id = ? AND (source LIKE ? OR title LIKE ? OR content LIKE ? "
                 "OR analysis LIKE ? OR user_note LIKE ?) ORDER BY id DESC",
-                (user_id, pattern, pattern, pattern, pattern),
+                (user_id, pattern, pattern, pattern, pattern, pattern),
             ).fetchall()
         return conn.execute(
             f"SELECT {_ITEM_COLS} FROM items "
-            "WHERE source LIKE ? OR content LIKE ? OR analysis LIKE ? "
+            "WHERE source LIKE ? OR title LIKE ? OR content LIKE ? OR analysis LIKE ? "
             "OR user_note LIKE ? ORDER BY id DESC",
-            (pattern, pattern, pattern, pattern),
+            (pattern, pattern, pattern, pattern, pattern),
         ).fetchall()
 
 
@@ -883,13 +893,14 @@ def save_suggestion(
 
 def get_saved_suggestions(user_id: int) -> list[sqlite3.Row]:
     """All of a user's shortlisted suggestions, newest first. Joins the source
-    item so the caller can render a back-link (source URL + the item's title,
-    which lives inside the item's analysis JSON)."""
+    item so the caller can render a back-link (source URL + the item's title —
+    the stored one if we have it, else the caller falls back into the item's
+    analysis JSON)."""
     cols = ", ".join(f"s.{c}" for c in _SAVED_SUGGESTION_COLS.replace(" ", "").split(","))
     with _get_conn() as conn:
         return conn.execute(
             f"SELECT {cols}, "
-            "       i.source AS source, i.analysis AS item_analysis "
+            "       i.source AS source, i.title AS item_title_raw, i.analysis AS item_analysis "
             "FROM saved_suggestions s JOIN items i ON i.id = s.item_id "
             "WHERE s.user_id = ? ORDER BY s.created_at DESC, s.id DESC",
             (user_id,),
@@ -947,11 +958,11 @@ def add_saved_suggestion_source(saved_id: int, user_id: int, item_id: int) -> bo
 
 def get_saved_suggestion_sources(user_id: int) -> dict[int, list[sqlite3.Row]]:
     """All extra sources for a user's Shortlist, keyed by saved_id. Each row
-    joins the item for its URL + stored analysis (the title lives inside)."""
+    joins the item for its URL + stored title/analysis."""
     with _get_conn() as conn:
         rows = conn.execute(
             "SELECT s.saved_id, s.item_id, i.source AS source, "
-            "       i.analysis AS item_analysis "
+            "       i.title AS item_title_raw, i.analysis AS item_analysis "
             "FROM saved_suggestion_sources s JOIN items i ON i.id = s.item_id "
             "WHERE s.user_id = ? ORDER BY s.id",
             (user_id,),

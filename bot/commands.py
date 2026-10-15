@@ -55,8 +55,8 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     for r in rows[:_LIST_LIMIT]:
         icon = _TYPE_ICONS.get(r["source_type"], "❓")
         date = (r["created_at"] or "")[:10]
-        source = html.escape((r["source"] or "—")[:60])
-        lines.append(f"{icon} <code>#{r['id']}</code> <i>{date}</i>  {source}")
+        label = html.escape((r["title"] or r["source"] or "—")[:60])
+        lines.append(f"{icon} <code>#{r['id']}</code> <i>{date}</i>  {label}")
 
     lines.append("\nUse /show &lt;id&gt; to read an entry.")
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
@@ -77,10 +77,14 @@ async def cmd_show(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     icon = _TYPE_ICONS.get(row["source_type"], "❓")
     source = html.escape(row["source"] or "—")
+    title = html.escape(row["title"]) if row["title"] else None
     date = row["created_at"] or ""
     note = html.escape(row["user_note"]) if row["user_note"] else None
 
-    header = f"{icon} <b>#{row['id']}</b>  <i>{date}</i>\n<code>{source}</code>"
+    header = f"{icon} <b>#{row['id']}</b>  <i>{date}</i>"
+    if title:
+        header += f"\n<b>{title}</b>"
+    header += f"\n<code>{source}</code>"
     if note:
         header += f"\n<i>Note: {note}</i>"
 
@@ -113,11 +117,11 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     for r in rows[:_LIST_LIMIT]:
         icon = _TYPE_ICONS.get(r["source_type"], "❓")
         date = (r["created_at"] or "")[:10]
-        source = html.escape((r["source"] or "—")[:50])
+        source = html.escape((r["title"] or r["source"] or "—")[:50])
 
         # Find the first field with a match and show a snippet
         snippet = ""
-        for field in ("source", "content", "analysis", "user_note"):
+        for field in ("source", "title", "content", "analysis", "user_note"):
             text = r[field] or ""
             idx = text.lower().find(query.lower())
             if idx >= 0:

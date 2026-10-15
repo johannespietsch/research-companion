@@ -26,6 +26,7 @@ from bot.pipeline import (
     PipelineError,
     analyze_text,
     analyze_url,
+    title_from_text,
 )
 from bot.auth import require_token
 from bot.concurrency import CapacityError, heavy
@@ -199,7 +200,8 @@ async def submit_text(
     user_id: int = Depends(require_token),
 ):
     analysis = analyze(text, ctx=UsageContext(user_id=user_id, source_type="note"))
-    save_item(user_id, "note", "", text, to_json_str(analysis), user_note)
+    save_item(user_id, "note", "", text, to_json_str(analysis), user_note,
+              title=title_from_text(text))
     return {
         "analysis": to_plain_text(analysis),
         "analysis_data": analysis,
@@ -280,7 +282,8 @@ async def submit_file(
         raise HTTPException(status_code=422, detail="Could not extract text from file")
 
     analysis = analyze(text, ctx=UsageContext(user_id=user_id, source_type=source_type))
-    save_item(user_id, source_type, name, text, to_json_str(analysis), user_note, file_path=stored_file_path)
+    save_item(user_id, source_type, name, text, to_json_str(analysis), user_note,
+              file_path=stored_file_path, title=name)
     return {
         "analysis": to_plain_text(analysis),
         "analysis_data": analysis,
@@ -767,14 +770,15 @@ async def saved_suggestions_list(user_id: int, _: None = Depends(_require_try_se
     extra_sources = get_saved_suggestion_sources(user_id)
     out = []
     for r in get_saved_suggestions(user_id):
-        _, item_title = _extract_verdict_and_title(r["item_analysis"])
+        _, fallback_title = _extract_verdict_and_title(r["item_analysis"])
+        item_title = r["item_title_raw"] or fallback_title
         sources = []
         for s in extra_sources.get(r["id"], []):
-            _, s_title = _extract_verdict_and_title(s["item_analysis"])
+            _, s_fallback_title = _extract_verdict_and_title(s["item_analysis"])
             sources.append({
                 "item_id": s["item_id"],
                 "source": s["source"],
-                "item_title": s_title,
+                "item_title": s["item_title_raw"] or s_fallback_title,
             })
         out.append({
             "id": r["id"],
@@ -887,13 +891,13 @@ async def library_list(user_id: int, _: None = Depends(_require_try_secret)):
     rows = get_all_items(user_id)
     out = []
     for r in rows:
-        verdict, title = _extract_verdict_and_title(r["analysis"])
+        verdict, fallback_title = _extract_verdict_and_title(r["analysis"])
         out.append({
             "id": r["id"],
             "source_type": r["source_type"],
             "source": r["source"],
             "verdict": verdict,
-            "title": title,
+            "title": r["title"] or fallback_title,
             "created_at": r["created_at"],
         })
     return out
@@ -1096,6 +1100,7 @@ async def claim(req: _ClaimRequest, _: None = Depends(_require_try_secret)):
             source=r.url,
             content=r.content_preview or "",
             analysis=to_json_str(analysis_obj),
+            title=r.title or "",
         )
         saved += 1
     return {"count": saved}

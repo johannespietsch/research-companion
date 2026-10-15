@@ -128,7 +128,19 @@ class TestLibrary:
         row = rows[0]
         assert set(row.keys()) == {"id", "source_type", "source", "verdict", "title", "created_at"}
         assert row["verdict"] == "watch"
-        assert "RAG" in row["title"]
+        # The source's own title ("Hello RAG"), not a slice of the AI-generated
+        # main_idea ("RAG = retrieval-augmented generation.") — see conftest's
+        # fake_fetch_url vs fake_analyze.
+        assert row["title"] == "Hello RAG"
+
+    def test_list_falls_back_to_main_idea_for_legacy_rows_with_no_title(self, client, auth_headers, db):
+        # Rows saved before items.title existed have title == "" — the list
+        # endpoint must still show something better than blank.
+        uid, item_id = self._user_with_one_item(client, auth_headers)
+        with db._get_conn() as conn:
+            conn.execute("UPDATE items SET title = '' WHERE id = ?", (item_id,))
+        row = client.get(f"/api/library?user_id={uid}", headers=auth_headers).json()[0]
+        assert row["title"] == "RAG = retrieval-augmented generation."
 
     def test_show_returns_full_item(self, client, auth_headers):
         uid, item_id = self._user_with_one_item(client, auth_headers)
