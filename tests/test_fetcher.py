@@ -32,7 +32,8 @@ class TestYouTubeFallbackChain:
         from bot import fetcher
 
         with patch("youtube_transcript_api.YouTubeTranscriptApi") as TranscriptApi, \
-             patch.object(fetcher, "_youtube_oembed_title", return_value="Real Title"):
+             patch.object(fetcher, "_youtube_oembed_metadata",
+                          return_value={"title": "Real Title", "author": "Some Channel"}):
             TranscriptApi.return_value.list.return_value = [
                 self._mock_transcript(snippets=("hello", "world")),
             ]
@@ -43,6 +44,9 @@ class TestYouTubeFallbackChain:
         assert any("ytimg.com" in u for u in result.get("image_urls", []))
         # Real video title surfaces instead of the "YouTube video (<id>)" placeholder.
         assert result["title"] == "Real Title"
+        # Channel name from the same oEmbed call, so the library can show who
+        # made it instead of just "youtube.com" for every video.
+        assert result["author"] == "Some Channel"
         assert result["language"] == "en"
 
     def test_prefers_manual_over_auto_generated_transcript(self):
@@ -53,7 +57,7 @@ class TestYouTubeFallbackChain:
         manual = self._mock_transcript(language_code="en", is_generated=False, snippets=("manual",))
         auto = self._mock_transcript(language_code="en", is_generated=True, snippets=("auto",))
         with patch("youtube_transcript_api.YouTubeTranscriptApi") as TranscriptApi, \
-             patch.object(fetcher, "_youtube_oembed_title", return_value="t"):
+             patch.object(fetcher, "_youtube_oembed_metadata", return_value={"title": "t", "author": ""}):
             # Order shouldn't matter — manual is selected regardless.
             TranscriptApi.return_value.list.return_value = [auto, manual]
             result = fetcher._youtube_transcript(YOUTUBE_URL)
@@ -73,7 +77,7 @@ class TestYouTubeFallbackChain:
         fr = self._mock_transcript(language_code="fr", is_generated=False, snippets=("french",))
         en_auto = self._mock_transcript(language_code="en", is_generated=True, snippets=("asr",))
         with patch("youtube_transcript_api.YouTubeTranscriptApi") as TranscriptApi, \
-             patch.object(fetcher, "_youtube_oembed_title", return_value="t"):
+             patch.object(fetcher, "_youtube_oembed_metadata", return_value={"title": "t", "author": ""}):
             TranscriptApi.return_value.list.return_value = [ar, fr, en, en_auto]
             result = fetcher._youtube_transcript(YOUTUBE_URL)
 
@@ -90,7 +94,7 @@ class TestYouTubeFallbackChain:
         fr = self._mock_transcript(language_code="fr", is_generated=False, snippets=("francais",))
         fr_auto = self._mock_transcript(language_code="fr", is_generated=True, snippets=("asr",))
         with patch("youtube_transcript_api.YouTubeTranscriptApi") as TranscriptApi, \
-             patch.object(fetcher, "_youtube_oembed_title", return_value="t"):
+             patch.object(fetcher, "_youtube_oembed_metadata", return_value={"title": "t", "author": ""}):
             TranscriptApi.return_value.list.return_value = [ar, fr, fr_auto]
             result = fetcher._youtube_transcript(YOUTUBE_URL)
 
@@ -104,7 +108,7 @@ class TestYouTubeFallbackChain:
 
         de_auto = self._mock_transcript(language_code="de", is_generated=True, snippets=("guten", "tag"))
         with patch("youtube_transcript_api.YouTubeTranscriptApi") as TranscriptApi, \
-             patch.object(fetcher, "_youtube_oembed_title", return_value="t"):
+             patch.object(fetcher, "_youtube_oembed_metadata", return_value={"title": "t", "author": ""}):
             TranscriptApi.return_value.list.return_value = [de_auto]
             result = fetcher._youtube_transcript(YOUTUBE_URL)
 
@@ -125,7 +129,7 @@ class TestYouTubeFallbackChain:
         from bot import fetcher
 
         with patch("youtube_transcript_api.YouTubeTranscriptApi") as TranscriptApi, \
-             patch.object(fetcher, "_youtube_oembed_title", return_value="t"), \
+             patch.object(fetcher, "_youtube_oembed_metadata", return_value={"title": "t", "author": ""}), \
              patch.object(fetcher, "_youtube_spoken_language", return_value="de-DE") as lookup:
             TranscriptApi.return_value.list.return_value = self._autodub_tracks()
             result = fetcher._youtube_transcript(YOUTUBE_URL)
@@ -138,7 +142,7 @@ class TestYouTubeFallbackChain:
         from bot import fetcher
 
         with patch("youtube_transcript_api.YouTubeTranscriptApi") as TranscriptApi, \
-             patch.object(fetcher, "_youtube_oembed_title", return_value="t"), \
+             patch.object(fetcher, "_youtube_oembed_metadata", return_value={"title": "t", "author": ""}), \
              patch.object(fetcher, "_youtube_spoken_language", return_value=None):
             TranscriptApi.return_value.list.return_value = self._autodub_tracks()
             result = fetcher._youtube_transcript(YOUTUBE_URL)
@@ -150,7 +154,7 @@ class TestYouTubeFallbackChain:
         from bot import fetcher
 
         with patch("youtube_transcript_api.YouTubeTranscriptApi") as TranscriptApi, \
-             patch.object(fetcher, "_youtube_oembed_title", return_value="t"), \
+             patch.object(fetcher, "_youtube_oembed_metadata", return_value={"title": "t", "author": ""}), \
              patch.object(fetcher, "_youtube_spoken_language", return_value=None):
             TranscriptApi.return_value.list.return_value = self._autodub_tracks(("fr", "ja"))
             result = fetcher._youtube_transcript(YOUTUBE_URL)
@@ -163,7 +167,7 @@ class TestYouTubeFallbackChain:
 
         de_auto = self._mock_transcript(language_code="de", is_generated=True)
         with patch("youtube_transcript_api.YouTubeTranscriptApi") as TranscriptApi, \
-             patch.object(fetcher, "_youtube_oembed_title", return_value="t"), \
+             patch.object(fetcher, "_youtube_oembed_metadata", return_value={"title": "t", "author": ""}), \
              patch.object(fetcher, "_youtube_spoken_language") as lookup:
             TranscriptApi.return_value.list.return_value = [de_auto]
             fetcher._youtube_transcript(YOUTUBE_URL)
@@ -174,7 +178,7 @@ class TestYouTubeFallbackChain:
         from bot import fetcher
 
         with patch("youtube_transcript_api.YouTubeTranscriptApi") as TranscriptApi, \
-             patch.object(fetcher, "_youtube_oembed_title", return_value=None):
+             patch.object(fetcher, "_youtube_oembed_metadata", return_value=None):
             TranscriptApi.return_value.list.return_value = [self._mock_transcript(snippets=("hi",))]
             result = fetcher._youtube_transcript(YOUTUBE_URL)
 
@@ -643,7 +647,7 @@ class TestYouTubeEgress:
             def extract_info(self, url, download=False): return {"language": "en-US"}
 
         with patch("youtube_transcript_api.YouTubeTranscriptApi") as TranscriptApi, \
-             patch.object(fetcher, "_youtube_oembed_title", return_value="t"), \
+             patch.object(fetcher, "_youtube_oembed_metadata", return_value={"title": "t", "author": ""}), \
              patch("yt_dlp.YoutubeDL", FakeYDL):
             TranscriptApi.return_value.list.return_value = tracks
             result = fetcher._youtube_transcript(YOUTUBE_URL)
@@ -656,7 +660,7 @@ class TestYouTubeEgress:
         monkeypatch.setattr(fetcher, "_youtube_egress", lambda: (None, "direct-fallback"))
 
         with patch("youtube_transcript_api.YouTubeTranscriptApi") as TranscriptApi, \
-             patch.object(fetcher, "_youtube_oembed_title", return_value="t") as oembed:
+             patch.object(fetcher, "_youtube_oembed_metadata", return_value={"title": "t", "author": ""}) as oembed:
             TranscriptApi.return_value.list.return_value = [
                 MagicMock(language_code="en", is_generated=True,
                           fetch=MagicMock(return_value=[MagicMock(text="hi")]))
