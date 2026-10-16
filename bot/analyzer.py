@@ -275,6 +275,8 @@ _PROMPT = """You are my personal AI research analyst.
 {profile_block}{signals_block}
 Analyze the following content and produce a structured analysis covering the required fields. Be concrete and specific to this person — `why_it_matters` should speak to their situation, not give generic advice.
 
+LANGUAGE: write every field (including suggestions) in the language of the "About the person" text above. If there is no such text or its language is unclear, write in English. NEVER switch to the language of the content below — the content may be in a language this person doesn't read; keep names, quotes and technical terms as they appear. The `verdict` value stays one of the fixed English keywords.
+
 The suggestions are the point of this analysis — make them the strongest part:
 - `grounded_in`: name the one specific claim/result/quote/section in this content the suggestions build on, so they're traceable to the source.
 - `suggestions`: 0 to 5 concrete next steps, ordered best-first, varied in ambition (a 30-minute quick win through a multi-week project). Each has a short `title`, a one-sentence `detail`, a concrete `first_step`, and an `effort` estimate. Every one must be specific to this person and genuinely worth their time — never generic advice.
