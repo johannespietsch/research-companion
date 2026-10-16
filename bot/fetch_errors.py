@@ -24,9 +24,17 @@ JS_REQUIRED = "js_required"
 PAYWALLED = "paywalled"
 BLOCKED_URL = "blocked_url"
 YOUTUBE_CHANNEL = "youtube_channel"
+# Retryable: a fresh video whose captions YouTube hasn't generated (or hasn't
+# finished generating in the spoken language) yet. Only returned when the
+# caller asked to defer (the channel monitor) — see fetcher.fetch_url.
+TRANSCRIPT_NOT_READY = "transcript_not_ready"
 
 
 _USER_MESSAGES: dict[str, str] = {
+    TRANSCRIPT_NOT_READY: (
+        "YouTube hasn't finished generating captions for this video yet. "
+        "Try again in an hour or so."
+    ),
     NO_TRANSCRIPT: (
         "This video has no subtitles or transcript available, so there's nothing "
         "to analyse. Try sharing a video with captions enabled."

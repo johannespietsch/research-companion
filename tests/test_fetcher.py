@@ -150,16 +150,61 @@ class TestYouTubeFallbackChain:
         assert "asr-en" in result["text"]
         assert "asr-ar" not in result["text"]
 
-    def test_autodub_takes_first_listed_without_lookup_or_english(self):
+    def test_autodub_never_takes_an_unconfirmed_track(self):
+        """Item 393: several ASR tracks, none in the spoken language or English
+        (the original's track isn't listed yet). Picking whichever is first
+        summarised an English video in Hebrew — fall through instead."""
         from bot import fetcher
 
         with patch("youtube_transcript_api.YouTubeTranscriptApi") as TranscriptApi, \
              patch.object(fetcher, "_youtube_oembed_metadata", return_value={"title": "t", "author": ""}), \
-             patch.object(fetcher, "_youtube_spoken_language", return_value=None):
-            TranscriptApi.return_value.list.return_value = self._autodub_tracks(("fr", "ja"))
+             patch.object(fetcher, "_youtube_spoken_language", return_value="en-US"), \
+             patch.object(fetcher, "_yt_dlp_extract") as extract:
+            TranscriptApi.return_value.list.return_value = self._autodub_tracks(("ar", "iw", "fr"))
+            extract.return_value = {"text": "t\n\nTranscript:\nfrom yt-dlp", "has_transcript": True}
             result = fetcher._youtube_transcript(YOUTUBE_URL)
 
-        assert "asr-fr" in result["text"]
+        extract.assert_called_once()
+        assert "asr-iw" not in result["text"] and "asr-ar" not in result["text"]
+        assert "from yt-dlp" in result["text"]
+
+    def test_unconfirmed_asr_still_accepts_an_english_manual_track(self):
+        from bot import fetcher
+
+        en_manual = self._mock_transcript(language_code="en", is_generated=False, snippets=("manual-en",))
+        tracks = self._autodub_tracks(("ar", "iw")) + [en_manual]
+        assert fetcher._select_transcript(tracks, spoken_language=lambda: "fr") is en_manual
+
+    def test_defer_returns_not_ready_instead_of_whisper_or_description(self):
+        from bot import fetch_errors, fetcher
+
+        with patch("youtube_transcript_api.YouTubeTranscriptApi") as TranscriptApi, \
+             patch.object(fetcher, "_youtube_oembed_metadata", return_value={"title": "t", "author": ""}), \
+             patch.object(fetcher, "_youtube_spoken_language", return_value="en-US"), \
+             patch.object(fetcher, "_yt_dlp_extract") as extract, \
+             patch.object(fetcher, "_yt_dlp_transcribe") as whisper:
+            TranscriptApi.return_value.list.return_value = self._autodub_tracks(("ar", "iw"))
+            extract.return_value = {"text": "t\n\ndescription", "has_transcript": False, "duration": 600, "title": "T"}
+            result = fetcher._youtube_transcript(YOUTUBE_URL, defer_if_not_ready=True)
+
+        assert result["reason"] == fetch_errors.TRANSCRIPT_NOT_READY
+        assert result["text"] == ""
+        whisper.assert_not_called()
+
+    def test_not_deferring_still_falls_back_to_whisper(self):
+        from bot import fetcher
+
+        with patch("youtube_transcript_api.YouTubeTranscriptApi") as TranscriptApi, \
+             patch.object(fetcher, "_youtube_oembed_metadata", return_value={"title": "t", "author": ""}), \
+             patch.object(fetcher, "_youtube_spoken_language", return_value="en-US"), \
+             patch.object(fetcher, "_yt_dlp_extract") as extract, \
+             patch.object(fetcher, "_yt_dlp_transcribe") as whisper:
+            TranscriptApi.return_value.list.return_value = self._autodub_tracks(("ar", "iw"))
+            extract.return_value = {"text": "t\n\ndescription", "has_transcript": False, "duration": 600}
+            whisper.return_value = {"text": "t\n\nTranscript:\nwhispered"}
+            result = fetcher._youtube_transcript(YOUTUBE_URL)
+
+        assert result["transcript_source"] == "whisper"
 
     def test_single_generated_track_skips_language_lookup(self):
         """The yt-dlp call costs seconds; only auto-dubbed videos need it."""

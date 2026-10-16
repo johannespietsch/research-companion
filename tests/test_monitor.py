@@ -19,6 +19,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
+from datetime import datetime, timezone
 
 FEED_XML = """<?xml version="1.0"?>
 <rss version="2.0"><channel><title>My Blog</title>
@@ -167,9 +168,18 @@ class TestFetchEntries:
         fake_get["https://ex.com/feed.xml"] = FEED_XML
         entries = fetch_entries("https://ex.com/feed.xml")
         assert entries == [
-            {"url": "https://ex.com/post-a", "title": "Post A"},
-            {"url": "https://ex.com/post-b", "title": "Post B"},
+            {"url": "https://ex.com/post-a", "title": "Post A", "published": ""},
+            {"url": "https://ex.com/post-b", "title": "Post B", "published": ""},
         ]
+
+    def test_published_time_is_iso_utc(self, fake_get):
+        from bot.monitor import fetch_entries
+        fake_get["https://ex.com/feed.xml"] = (
+            '<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom"><title>T</title>'
+            '<entry><title>V</title><link href="https://ex.com/v"/>'
+            '<published>2026-10-15T17:30:00+00:00</published></entry></feed>'
+        )
+        assert fetch_entries("https://ex.com/feed.xml")[0]["published"] == "2026-10-15T17:30:00"
 
 
 # ---------------------------------------------------------------------------
@@ -186,7 +196,7 @@ def polling(db, monkeypatch):
     Returns a context object tests mutate (feed entries, analyze behaviour)."""
     from bot import monitor, pipeline
 
-    ctx = SimpleNamespace(entries=[], analyzed=[], analyze_error=None, db=db)
+    ctx = SimpleNamespace(entries=[], analyzed=[], analyze_error=None, analyze_kwargs=[], db=db)
     uid = db.upsert_user_by_email("u@example.com")
     sub_id = db.add_subscription(uid, "https://ex.com/feed.xml", title="My Blog")
     ctx.user_id, ctx.sub_id = uid, sub_id
@@ -197,6 +207,7 @@ def polling(db, monkeypatch):
         if ctx.analyze_error is not None:
             raise ctx.analyze_error
         ctx.analyzed.append(url)
+        ctx.analyze_kwargs.append(kw)
         return _fake_result()
 
     monkeypatch.setattr(pipeline, "analyze_url", fake_analyze_url)
@@ -221,7 +232,7 @@ class TestPollSubscription:
     def test_first_poll_seeds_without_analyzing(self, polling):
         polling.entries = [{"url": "https://ex.com/old", "title": "Old"}]
         stats = polling.poll()
-        assert stats == {"new": 1, "analyzed": 0, "errors": 0, "busy": False}
+        assert stats == {"new": 1, "analyzed": 0, "errors": 0, "deferred": 0, "busy": False}
         assert polling.analyzed == []
         assert polling.statuses() == {"https://ex.com/old": "seeded"}
 
@@ -443,3 +454,60 @@ class TestSubscriptionEndpoints:
         with db._get_conn() as conn:
             assert conn.execute("SELECT COUNT(*) FROM subscriptions").fetchone()[0] == 0
             assert conn.execute("SELECT COUNT(*) FROM subscription_items").fetchone()[0] == 0
+
+
+class TestAwaitingCaptions:
+    NOW = datetime(2026, 10, 15, 19, 0, 0, tzinfo=timezone.utc)
+    YT = "https://www.youtube.com/watch?v=o4LR0MkyhTc"
+
+    def test_fresh_youtube_video_waits(self):
+        from bot.monitor import awaiting_captions
+        assert awaiting_captions(self.YT, "2026-10-15T17:30:00", now=self.NOW)
+
+    def test_old_video_does_not_wait(self):
+        from bot.monitor import awaiting_captions
+        assert not awaiting_captions(self.YT, "2026-10-15T15:30:00", now=self.NOW)
+
+    def test_unknown_publish_time_does_not_wait(self):
+        from bot.monitor import awaiting_captions
+        assert not awaiting_captions(self.YT, "", now=self.NOW)
+        assert not awaiting_captions(self.YT, "garbage", now=self.NOW)
+
+    def test_non_youtube_never_waits(self):
+        from bot.monitor import awaiting_captions
+        assert not awaiting_captions("https://ex.com/post", "2026-10-15T18:59:00", now=self.NOW)
+
+
+class TestTranscriptDeferral:
+    def _seed_then_new(self, polling, published):
+        polling.entries = []
+        polling.poll()  # seed
+        polling.entries = [{"url": "https://www.youtube.com/watch?v=abcdefghijk",
+                            "title": "V", "published": published}]
+
+    def test_fresh_video_is_analyzed_with_defer_flag(self, polling):
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+        self._seed_then_new(polling, now)
+        polling.poll()
+        assert polling.analyze_kwargs[-1]["defer_if_not_ready"] is True
+
+    def test_old_video_is_analyzed_without_defer_flag(self, polling):
+        self._seed_then_new(polling, "2020-01-01T00:00:00")
+        polling.poll()
+        assert polling.analyze_kwargs[-1]["defer_if_not_ready"] is False
+
+    def test_not_ready_stays_pending_and_is_retried(self, polling):
+        from bot.pipeline import ERR_TRANSCRIPT_NOT_READY, PipelineError
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+        self._seed_then_new(polling, now)
+        polling.analyze_error = PipelineError(ERR_TRANSCRIPT_NOT_READY, message="later")
+        stats = polling.poll()
+        assert stats["deferred"] == 1 and stats["errors"] == 0 and stats["analyzed"] == 0
+        assert polling.statuses()["https://www.youtube.com/watch?v=abcdefghijk"] == "pending"
+        # Captions appear → next cycle picks the same entry up.
+        polling.analyze_error = None
+        stats = polling.poll()
+        assert stats["analyzed"] == 1
+        assert polling.statuses()["https://www.youtube.com/watch?v=abcdefghijk"] == "done"

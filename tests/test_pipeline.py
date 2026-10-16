@@ -381,6 +381,28 @@ class TestProcessedUrlAudit:
         assert rows[0]["error_code"] == "fetch-failed"
         assert rows[0]["title"] == ""  # no fetched payload available
 
+    def test_transcript_not_ready_defers_without_an_audit_row(self, pipeline, db, monkeypatch):
+        """A deferral isn't an outcome — the monitor retries hourly, so an
+        audit row each time would flood the Usage counts with fake errors."""
+        seen = {}
+
+        async def not_ready(url, **kw):
+            seen.update(kw)
+            return {"text": "", "title": "Fresh", "source_type": "youtube",
+                    "reason": "transcript_not_ready"}
+        monkeypatch.setattr(pipeline, "fetch_url", not_ready)
+
+        from bot.analyzer import UsageContext
+        with pytest.raises(pipeline.PipelineError) as ei:
+            asyncio.run(pipeline.analyze_url(
+                "https://www.youtube.com/watch?v=abcdefghijk", ctx=UsageContext(),
+                defer_if_not_ready=True,
+            ))
+
+        assert ei.value.code == pipeline.ERR_TRANSCRIPT_NOT_READY
+        assert seen["defer_if_not_ready"] is True
+        assert self._all_rows(db) == []
+
     def test_no_text_failure_keeps_title_from_fetched(
         self, pipeline, db, monkeypatch
     ):

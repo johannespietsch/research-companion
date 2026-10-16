@@ -41,6 +41,7 @@ from bot.analyzer import (
     summarize_content,
     to_json_str,
 )
+from bot import fetch_errors
 from bot.concurrency import CapacityError, heavy
 from bot.config import MAX_CONTENT_CHARS
 from bot.db import record_processed_url, save_item
@@ -64,6 +65,7 @@ ERR_FETCH_FAILED = "fetch-failed"            # network / timeout / connector err
 ERR_NO_TEXT = "extraction-failed"            # fetch ok but yielded empty text
 ERR_NO_TRANSCRIPT = "no-transcript"          # video-with-no-transcript variant of NO_TEXT
 ERR_ANALYZE_FAILED = "analyze-failed"        # LLM call failed mid-chain
+ERR_TRANSCRIPT_NOT_READY = "transcript-not-ready"  # retryable: captions not generated yet (deferring callers only)
 ERR_BUSY = "busy"                            # shed: no heavy-work slot free (overload)
 
 # Transcribed sources: a failed fetch here means "no transcript", not "no text"
@@ -129,6 +131,7 @@ async def analyze_url(
     on_step: Optional[Callable[[str], None]] = None,
     capacity_timeout: float | None = None,
     skip_cache: bool = False,
+    defer_if_not_ready: bool = False,
 ) -> PipelineResult:
     """Run the full URL → analysis chain.
 
@@ -159,6 +162,12 @@ async def analyze_url(
     (both still get overwritten with the fresh result). For normal traffic
     this is always False; the admin retrigger endpoint sets it to force a
     clean re-fetch + re-analyse of a URL whose cached result is known bad.
+
+    `defer_if_not_ready=True` is for callers that can try again later (the
+    channel monitor, on a just-published video): a YouTube video with no
+    usable captions yet raises `PipelineError(ERR_TRANSCRIPT_NOT_READY)`
+    instead of being transcribed by Whisper. Nothing is audited for such a
+    deferral — it isn't an outcome, just "not yet".
     """
     def _step(label: str) -> None:
         if on_step is not None:
@@ -188,12 +197,14 @@ async def analyze_url(
     fetched: dict = {}
     audit_status = "ok"
     audit_error_code = ""
+    audit = True
 
     try:
         _step("fetching")
         try:
             fetched = await fetch_url(
-                url, max_whisper_duration=max_whisper_duration, skip_cache=skip_cache
+                url, max_whisper_duration=max_whisper_duration, skip_cache=skip_cache,
+                defer_if_not_ready=defer_if_not_ready,
             )
         except Exception as e:
             logger.exception("pipeline: fetch_url crashed for %s", url)
@@ -202,6 +213,10 @@ async def analyze_url(
         text = (fetched.get("text") or "").strip()
         source_type = fetched.get("source_type") or "article"
         reason = fetched.get("reason")
+
+        if reason == fetch_errors.TRANSCRIPT_NOT_READY:
+            audit = False
+            raise PipelineError(ERR_TRANSCRIPT_NOT_READY, fetched=fetched)
 
         # Bail before analysing when there's nothing usable: no text at all, a
         # degraded fetch (`reason` set) whose fallback is just a title-only stub
@@ -293,19 +308,20 @@ async def analyze_url(
     finally:
         # Free the slot before the audit write so a waiter can start sooner.
         heavy.release()
-        record_processed_url(
-            url=url,
-            title=fetched.get("title") or "",
-            source_type=fetched.get("source_type") or "",
-            user_id=ctx.user_id,
-            anon_id=ctx.anon_id,
-            job_id=ctx.job_id,
-            status=audit_status,
-            error_code=audit_error_code,
-            transcript_source=fetched.get("transcript_source") or "",
-            latency_ms=int((time.monotonic() - started) * 1000),
-            egress=fetched.get("egress") or "",
-        )
+        if audit:
+            record_processed_url(
+                url=url,
+                title=fetched.get("title") or "",
+                source_type=fetched.get("source_type") or "",
+                user_id=ctx.user_id,
+                anon_id=ctx.anon_id,
+                job_id=ctx.job_id,
+                status=audit_status,
+                error_code=audit_error_code,
+                transcript_source=fetched.get("transcript_source") or "",
+                latency_ms=int((time.monotonic() - started) * 1000),
+                egress=fetched.get("egress") or "",
+            )
 
 
 def title_from_text(text: str) -> str:
