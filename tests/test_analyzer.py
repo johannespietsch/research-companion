@@ -140,3 +140,25 @@ class TestActionSchema:
         assert "suggestions" in analyzer._TOOL_SCHEMA["required"]
         item = analyzer._TOOL_SCHEMA["properties"]["suggestions"]["items"]
         assert set(item["required"]) == set(analyzer.SUGGESTION_FIELDS)
+
+
+class TestAnalyzeOutputLanguage:
+    def test_prompt_pins_language_to_profile_not_source(self):
+        """A wrong-language transcript (or a foreign-language source) must not
+        drag the overview/suggestions into a language the reader can't use (#393)."""
+        from bot import analyzer
+
+        assert "LANGUAGE:" in analyzer._PROMPT
+        assert "write in English" in analyzer._PROMPT
+        assert "NEVER switch to the language of the content" in analyzer._PROMPT
+
+    def test_prompt_change_invalidates_analyze_cache(self):
+        from bot import analyzer
+
+        before = analyzer._cache_key_analyze("t", "p", "m")
+        original = analyzer._PROMPT
+        try:
+            analyzer._PROMPT = original.replace("LANGUAGE:", "LANG:")
+            assert analyzer._cache_key_analyze("t", "p", "m") != before
+        finally:
+            analyzer._PROMPT = original
