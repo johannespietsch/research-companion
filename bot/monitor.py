@@ -23,11 +23,18 @@ Cost bounds, in order of importance:
 YouTube Shorts (``/shorts/`` URLs) are recorded as 'skipped_format' and never
 analyzed (#125): a ~60s clip can't support follow-up action advice, and they
 would otherwise eat the per-poll budget.
+
+A YouTube video published less than CAPTIONS_GRACE ago whose captions aren't
+confirmed yet (e.g. only auto-dubbed tracks are listed, not the spoken-language
+one) is left 'pending' and retried next cycle rather than summarised from the
+wrong track or transcribed by Whisper.
 """
 from __future__ import annotations
 
+import calendar
 import logging
 import re
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urljoin, urlparse
 
 import feedparser
@@ -44,6 +51,12 @@ FEED_ENTRY_WINDOW = 25
 MAX_NEW_PER_POLL = 3
 # Hard ceiling on LLM-bearing work per poll cycle across all subscriptions.
 MAX_ANALYSES_PER_CYCLE = 12
+# A YouTube video this young may not have its captions yet (the spoken-language
+# track in particular can lag the auto-dubbed ones by an hour or more). While
+# inside this window a video without usable captions is left pending for the
+# next poll instead of being transcribed from the wrong track / by Whisper;
+# after it, the normal fallbacks apply. The poll interval is the retry cadence.
+CAPTIONS_GRACE = timedelta(hours=3)
 
 _FETCH_TIMEOUT_S = 20
 _MAX_BODY_BYTES = 5 * 1024 * 1024
@@ -198,7 +211,8 @@ def is_short(url: str) -> bool:
 
 
 def fetch_entries(feed_url: str) -> list[dict]:
-    """The newest FEED_ENTRY_WINDOW entries of a feed: {url, title}."""
+    """The newest FEED_ENTRY_WINDOW entries of a feed: {url, title, published}
+    (`published` is ISO UTC, or "" when the feed doesn't say)."""
     resp = _get(feed_url)
     parsed = feedparser.parse(resp.content)
     out = []
@@ -206,8 +220,30 @@ def fetch_entries(feed_url: str) -> list[dict]:
         link = (getattr(e, "link", "") or "").strip()
         if not link:
             continue
-        out.append({"url": link, "title": (getattr(e, "title", "") or "").strip()})
+        stamp = getattr(e, "published_parsed", None) or getattr(e, "updated_parsed", None)
+        published = (
+            datetime.fromtimestamp(calendar.timegm(stamp), timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+            if stamp else ""
+        )
+        out.append({
+            "url": link,
+            "title": (getattr(e, "title", "") or "").strip(),
+            "published": published,
+        })
     return out
+
+
+def awaiting_captions(entry_url: str, published_at: str, *, now: datetime | None = None) -> bool:
+    """True for a YouTube entry published within CAPTIONS_GRACE — young enough
+    that missing captions mean "not yet", not "never". Unknown publish time
+    (old rows, feeds without dates) → False, i.e. the normal fallbacks."""
+    if not _is_youtube(entry_url) or not published_at:
+        return False
+    try:
+        published = datetime.strptime(published_at, "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return False
+    return (now or datetime.now(timezone.utc)) - published < CAPTIONS_GRACE
 
 
 # ---------------------------------------------------------------------------
@@ -217,7 +253,7 @@ def fetch_entries(feed_url: str) -> list[dict]:
 async def poll_subscription(sub, *, analysis_budget: int) -> dict:
     """One subscription: register new entries, analyze up to the budget.
 
-    Returns {"new": n, "analyzed": n, "errors": n, "busy": bool}.
+    Returns {"new": n, "analyzed": n, "errors": n, "deferred": n, "busy": bool}.
     """
     import asyncio
 
@@ -229,9 +265,9 @@ async def poll_subscription(sub, *, analysis_budget: int) -> dict:
         set_subscription_entry_result,
         skip_pending_shorts,
     )
-    from bot.pipeline import ERR_BUSY, PipelineError, analyze_url
+    from bot.pipeline import ERR_BUSY, ERR_TRANSCRIPT_NOT_READY, PipelineError, analyze_url
 
-    stats = {"new": 0, "analyzed": 0, "errors": 0, "busy": False}
+    stats = {"new": 0, "analyzed": 0, "errors": 0, "deferred": 0, "busy": False}
     entries = await asyncio.to_thread(fetch_entries, sub["feed_url"])
 
     first_poll = not sub["last_polled_at"]
@@ -243,7 +279,7 @@ async def poll_subscription(sub, *, analysis_budget: int) -> dict:
         # never analyzed; first-poll entries are already 'seeded'.
         entry_status = "skipped_format" if not first_poll and is_short(e["url"]) else status
         if record_subscription_entry(sub["id"], sub["user_id"], e["url"], e["title"],
-                                     status=entry_status):
+                                     status=entry_status, published_at=e.get("published", "")):
             stats["new"] += 1
     mark_subscription_polled(sub["id"])
     if first_poll:
@@ -259,6 +295,7 @@ async def poll_subscription(sub, *, analysis_budget: int) -> dict:
                 entry["entry_url"],
                 ctx=UsageContext(user_id=sub["user_id"]),
                 save_for_user_id=sub["user_id"],
+                defer_if_not_ready=awaiting_captions(entry["entry_url"], entry["published_at"]),
             )
             set_subscription_entry_result(
                 entry["id"], status="done", item_id=result.saved_id,
@@ -271,6 +308,11 @@ async def poll_subscription(sub, *, analysis_budget: int) -> dict:
                 # monitoring is the load that sheds first.
                 stats["busy"] = True
                 break
+            if e.code == ERR_TRANSCRIPT_NOT_READY:
+                # Captions still coming for a fresh video: stay pending; the
+                # next poll retries until CAPTIONS_GRACE runs out.
+                stats["deferred"] += 1
+                continue
             set_subscription_entry_result(entry["id"], status="error")
             stats["errors"] += 1
     return stats

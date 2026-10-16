@@ -542,6 +542,11 @@ def _init() -> None:
         conn.execute(_CREATE_SUGGESTION_SIGNALS_SQL)
         conn.execute(_CREATE_SUBSCRIPTIONS_SQL)
         conn.execute(_CREATE_SUBSCRIPTION_ITEMS_SQL)
+        # When the feed says the entry was published (ISO, UTC; '' if unknown
+        # or recorded before this column) — lets the monitor wait for a fresh
+        # video's captions instead of summarising a wrong-language track.
+        _ensure_column(conn, "subscription_items", "published_at",
+                       "published_at TEXT NOT NULL DEFAULT ''")
         for stmt in _CREATE_INDEXES_SQL:
             conn.execute(stmt)
 
@@ -1101,16 +1106,17 @@ def mark_subscription_polled(sub_id: int) -> None:
 
 def record_subscription_entry(
     sub_id: int, user_id: int, entry_url: str, entry_title: str = "",
-    *, status: str = "pending",
+    *, status: str = "pending", published_at: str = "",
 ) -> bool:
     """Register one feed entry as seen. Returns False if it was already known
     (the cross-poll dedupe)."""
     with _get_conn() as conn:
         cur = conn.execute(
             "INSERT OR IGNORE INTO subscription_items "
-            "(subscription_id, user_id, entry_url, entry_title, status) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (sub_id, user_id, entry_url[:2048], (entry_title or "")[:300], status),
+            "(subscription_id, user_id, entry_url, entry_title, status, published_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (sub_id, user_id, entry_url[:2048], (entry_title or "")[:300], status,
+             published_at or ""),
         )
         return cur.rowcount > 0
 
@@ -1118,7 +1124,7 @@ def record_subscription_entry(
 def get_pending_subscription_entries(sub_id: int, limit: int = 10) -> list[sqlite3.Row]:
     with _get_conn() as conn:
         return conn.execute(
-            "SELECT id, subscription_id, user_id, entry_url, entry_title "
+            "SELECT id, subscription_id, user_id, entry_url, entry_title, published_at "
             "FROM subscription_items WHERE subscription_id = ? AND status = 'pending' "
             "ORDER BY id DESC LIMIT ?",
             (sub_id, limit),

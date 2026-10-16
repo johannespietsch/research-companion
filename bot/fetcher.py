@@ -167,14 +167,18 @@ def _youtube_spoken_language(url: str, proxy: str | None = None) -> str | None:
 
 
 def _original_generated_track(generated: list, spoken_language):
-    """Pick the ASR track in the spoken language when there are several.
+    """Pick the ASR track in the spoken language when there are several, or
+    None when we can't confirm which one that is.
 
     YouTube auto-dubbing adds one auto-generated track per dubbed audio track,
     all labelled "<Language> (auto-generated)" and listed alphabetically, so
     the first one is usually Arabic (issue #128, video K9gwvAcz1do: 21 tracks).
     The list itself can't tell the original apart, so ask `spoken_language()`
-    (a yt-dlp metadata call — only made in this case), then English, then the
-    first listed."""
+    (a yt-dlp metadata call — only made in this case), then English. We never
+    fall back to "whichever is listed first": on a fresh video the original's
+    track can be missing from the list while dubs are already there, and
+    summarising an arbitrary dub (item 393: Hebrew for an English video) is
+    worse than waiting or transcribing the audio."""
     if len(generated) == 1:
         return generated[0]
     lang = spoken_language() if spoken_language else None
@@ -183,7 +187,7 @@ def _original_generated_track(generated: list, spoken_language):
             match = next((t for t in generated if _lang_base(t.language_code) == _lang_base(want)), None)
             if match:
                 return match
-    return generated[0]
+    return None
 
 
 def _select_transcript(transcripts: list, spoken_language=None):
@@ -203,11 +207,17 @@ def _select_transcript(transcripts: list, spoken_language=None):
 
     With several ASR tracks (auto-dubbed videos), see
     `_original_generated_track`; `spoken_language` is a zero-arg callable so
-    the lookup only runs when it's needed.
+    the lookup only runs when it's needed. If ASR tracks exist but none can be
+    confirmed as the spoken language, only an English manual track is
+    acceptable — otherwise None, so the caller transcribes the audio (or, for
+    the monitor, waits for the track to appear).
     """
     all_generated = [t for t in transcripts if t.is_generated]
     generated = _original_generated_track(all_generated, spoken_language) if all_generated else None
     manuals = [t for t in transcripts if not t.is_generated]
+
+    if all_generated and generated is None:
+        return next((t for t in manuals if _lang_base(t.language_code) == "en"), None)
 
     original_lang = generated.language_code if generated else None
     if original_lang:
@@ -221,16 +231,25 @@ def _select_transcript(transcripts: list, spoken_language=None):
     return english_manual or (manuals[0] if manuals else None) or generated
 
 
-def _youtube_transcript(url: str, max_whisper_duration: int = WHISPER_MAX_DURATION_ANON_S) -> dict:
+def _youtube_transcript(
+    url: str,
+    max_whisper_duration: int = WHISPER_MAX_DURATION_ANON_S,
+    defer_if_not_ready: bool = False,
+) -> dict:
     """Run the YouTube chain over the route `_youtube_egress` picks, and tag
     the result with that route for the processed_urls audit row."""
     proxy, egress = _youtube_egress()
-    result = _youtube_transcript_via(url, max_whisper_duration, proxy)
+    result = _youtube_transcript_via(url, max_whisper_duration, proxy, defer_if_not_ready)
     result["egress"] = egress
     return result
 
 
-def _youtube_transcript_via(url: str, max_whisper_duration: int, proxy: str | None) -> dict:
+def _youtube_transcript_via(
+    url: str,
+    max_whisper_duration: int,
+    proxy: str | None,
+    defer_if_not_ready: bool = False,
+) -> dict:
     from youtube_transcript_api import YouTubeTranscriptApi
     from youtube_transcript_api.proxies import GenericProxyConfig
 
@@ -285,6 +304,19 @@ def _youtube_transcript_via(url: str, max_whisper_duration: int, proxy: str | No
         # surface ERR_NO_TRANSCRIPT. Tag for the audit log.
         extract.setdefault("transcript_source", "none")
         return extract
+
+    if defer_if_not_ready:
+        # The caller can wait (channel monitor, fresh video): no confirmed-
+        # language captions yet, so don't spend Whisper on it or settle for a
+        # description — report "not ready" and let it retry later.
+        logger.info("YouTube %s: transcript not ready, deferring", video_id)
+        return {
+            "text": "",
+            "title": extract.get("title") or url,
+            "source_type": "youtube",
+            "reason": fetch_errors.TRANSCRIPT_NOT_READY,
+            "transcript_source": "none",
+        }
 
     duration = extract.get("duration") or 0
     if duration and duration <= max_whisper_duration:
@@ -1159,6 +1191,7 @@ async def fetch_url(
     *,
     max_whisper_duration: int = WHISPER_MAX_DURATION_ANON_S,
     skip_cache: bool = False,
+    defer_if_not_ready: bool = False,
 ) -> dict:
     """Public entry point. Wraps `_fetch_url_uncached` with a per-URL cache so
     repeat submissions, retries, and concurrent fetches of the same URL don't
@@ -1175,6 +1208,11 @@ async def fetch_url(
     forever otherwise — e.g. a fetcher bug cached a degraded result before the
     fix shipped) but still overwrites the entry with the fresh result, so the
     next normal request benefits too. Used by the admin retrigger endpoint.
+
+    `defer_if_not_ready=True` (the channel monitor, for videos young enough
+    that captions may still be coming) makes a YouTube video without usable
+    captions return `reason=TRANSCRIPT_NOT_READY` and empty text instead of
+    falling back to Whisper or the description. Empty text is never cached.
     """
     from bot.db import get_cached_fetch, set_cached_fetch
 
@@ -1183,7 +1221,9 @@ async def fetch_url(
         logger.info(f"url_cache hit for {url}")
         return cached
 
-    result = await _fetch_url_uncached(url, max_whisper_duration=max_whisper_duration)
+    result = await _fetch_url_uncached(
+        url, max_whisper_duration=max_whisper_duration, defer_if_not_ready=defer_if_not_ready
+    )
 
     # A description-only video is never cached either: the pipeline fails it
     # with no-transcript (issue #128), and the usual cause is transient (an IP
@@ -1344,7 +1384,10 @@ async def _academic_fetch(url: str, doi: str) -> dict | None:
 
 
 async def _fetch_url_uncached(
-    url: str, *, max_whisper_duration: int = WHISPER_MAX_DURATION_ANON_S
+    url: str,
+    *,
+    max_whisper_duration: int = WHISPER_MAX_DURATION_ANON_S,
+    defer_if_not_ready: bool = False,
 ) -> dict:
     """The actual routing logic — keep this as the only place that knows the
     source-specific fetchers. `fetch_url` is the cache layer in front."""
@@ -1370,7 +1413,7 @@ async def _fetch_url_uncached(
             }
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
-            None, _youtube_transcript, url, max_whisper_duration
+            None, _youtube_transcript, url, max_whisper_duration, defer_if_not_ready
         )
 
     if _domain_matches(domain, "streamyard.com"):
