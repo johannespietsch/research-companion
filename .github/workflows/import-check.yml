@@ -1,0 +1,34 @@
+# Reproduces the 2026-09-09 outage (#121): a cold rebuild resolved `mcp` 2.x,
+# which renamed FastMCP -> MCPServer, so uvicorn never bound and the machine
+# crash-looped. `make test` couldn't catch it because the dev venv had an
+# old `mcp` already installed. requirements.lock closes the drift that
+# caused that specific break, but this still builds the real image and runs
+# the suite inside it so any future import/boot failure fails the PR instead
+# of surfacing after deploy.
+name: Import Check
+on:
+  pull_request:
+jobs:
+  import-check:
+    name: Build image and run tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t filterfyi-importcheck .
+
+      - name: Verify main and MCP server import
+        run: |
+          docker run --rm --entrypoint python \
+            -e ANTHROPIC_API_KEY=dummy-key-for-import-check \
+            filterfyi-importcheck -c "import main; print('IMPORT MAIN OK')"
+          docker run --rm --entrypoint python \
+            -e ANTHROPIC_API_KEY=dummy-key-for-import-check \
+            filterfyi-importcheck -c "from bot.mcp_server import build_mcp_asgi_app, mcp; print('MCP SERVER IMPORT OK')"
+
+      - name: Run test suite inside the image
+        run: |
+          docker run --rm --entrypoint python \
+            -e ANTHROPIC_API_KEY=dummy-key-for-import-check \
+            filterfyi-importcheck -m pytest tests/ -q

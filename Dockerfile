@@ -46,8 +46,8 @@ COPY --from=tailscale /usr/local/bin/tailscaled /usr/local/bin/tailscale /usr/lo
 # it's no longer installed (#128). Playwright ships its own node driver.
 COPY --from=deno /deno /usr/local/bin/deno
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY requirements.lock .
+RUN pip install --no-cache-dir -r requirements.lock
 
 # Playwright Chromium for the StreamYard interceptor.
 # `--with-deps` runs its own apt-get install for the right system libs.

@@ -37,15 +37,24 @@ A Telegram bot that acts as a personal AI research analyst. Send it links, artic
 - ffmpeg (required by faster-whisper for audio/video transcription)
 - A Telegram bot token from [@BotFather](https://t.me/BotFather)
 - At least one AI API key (Anthropic or OpenAI)
+- **Apple Silicon or Linux** — `onnxruntime` (via `faster-whisper`) and
+  `cryptography` (via `pyjwt[crypto]`) dropped Intel-macOS wheels upstream,
+  so `make install` cannot complete on an Intel Mac (see #121). Use a
+  different machine for local dev/test; CI and prod are unaffected.
 
 ### Installation
 
 ```bash
 git clone <repo-url>
-cd research-companion
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+cd filter-fyi-backend
+make install
 ```
+
+`make install` creates `.venv` with Python 3.11 and installs from
+`requirements.lock` — the fully pinned, hashed file that also builds the
+Docker image, so local and prod run the same versions (see #121). Edit
+`requirements.in` (the loose, hand-maintained bounds) and run `make lock` to
+regenerate the lock after adding or upgrading a dependency.
 
 ### Configuration
 
@@ -403,7 +412,8 @@ If `PROFILE.md` is absent or empty the bot falls back to a generic prompt, so pe
 research-companion/
 ├── main.py              # Entry point: polling (dev) or webhook (prod)
 ├── kb.py                # CLI knowledge base browser
-├── requirements.txt     # Python dependencies
+├── requirements.in      # Python dependencies (loose bounds, hand-edited)
+├── requirements.lock    # Fully pinned + hashed lock, installed by venv and Docker
 ├── .env                 # Environment variables (not committed)
 ├── PROFILE.md.example   # Profile template — copy to PROFILE.md and edit freely
 ├── research.db          # SQLite database (created at runtime, not committed)
