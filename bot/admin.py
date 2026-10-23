@@ -24,6 +24,10 @@ Currently exposes:
     `retrigger_endpoint()` and `GET /api/admin/retrigger/{job_id}`.
   GET /api/admin/retrigger/{job_id}
     Poll a retrigger job's status/result. See `retrigger_status()`.
+  POST /api/admin/reanalyze
+    Re-run only the analysis of one saved item from its stored brief (works for
+    pasted-text items, which retrigger can't re-fetch). Poll via the retrigger
+    status route. See `reanalyze_endpoint()`.
 """
 from __future__ import annotations
 
@@ -38,7 +42,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel
 
-from bot.analyzer import UsageContext, to_json_str
+from bot.analyzer import UsageContext, analyze, to_json_str
 from bot.pipeline import PipelineError, analyze_url
 
 # llm_calls lives on the same Fly SQLite as everything else; bot.db's private
@@ -46,9 +50,11 @@ from bot.pipeline import PipelineError, analyze_url
 from bot.db import (
     _get_conn,
     create_job,
+    get_item,
     get_job_record,
     set_job_done,
     set_job_error,
+    update_item_analysis,
     upsert_item_by_source,
 )
 
@@ -710,6 +716,75 @@ async def retrigger_endpoint(
     job_id = str(uuid.uuid4())
     create_job(job_id)
     task = asyncio.create_task(_run_retrigger_job(job_id, url, req.user_id, req.anon_id))
+    _retrigger_tasks.add(task)
+    task.add_done_callback(_retrigger_tasks.discard)
+
+    return {"job_id": job_id}
+
+
+# ---------------------------------------------------------------------------
+# Reanalyze — retrigger for items that have no URL to re-fetch
+# ---------------------------------------------------------------------------
+#
+# Pasted-text items record the placeholder "(pasted text)" instead of a URL and
+# never keep the raw text, so `retrigger` can't re-fetch them. The analysis
+# step runs on the stored brief anyway (`items.content`), so re-running just
+# that step, past llm_cache and under the owner's profile and model tier, is
+# enough to pick up an analyzer fix (prompt, language). It can't repair a bad
+# summary, because the summary is exactly what we no longer have the source for.
+
+
+class ReanalyzeRequest(BaseModel):
+    item_id: int
+
+
+async def _run_reanalyze_job(job_id: str, item_id: int) -> None:
+    """Background body of a reanalyze: analyse the item's stored brief and
+    replace `items.analysis` in place. Outcome goes to `jobs` like retrigger."""
+    item = get_item(item_id)
+    if item is None:
+        set_job_error(job_id, "not-found", f"item {item_id} not found")
+        return
+    brief = (item["content"] or "").strip()
+    if not brief:
+        set_job_error(job_id, "no-content", "item has no stored brief to analyse")
+        return
+
+    ctx = UsageContext(user_id=item["user_id"], source_type=item["source_type"] or "")
+    try:
+        loop = asyncio.get_running_loop()
+        analysis = await loop.run_in_executor(
+            None, lambda: analyze(brief, ctx=ctx, skip_cache=True)
+        )
+    except Exception as e:
+        logger.exception("admin reanalyze job %s crashed for item %s", job_id, item_id)
+        set_job_error(job_id, "analyze-failed", str(e)[:200])
+        return
+
+    update_item_analysis(item_id, to_json_str(analysis))
+    set_job_done(job_id, {
+        "status": "ok",
+        "item_id": item_id,
+        "source_type": item["source_type"],
+        "verdict": analysis.get("verdict"),
+        "main_idea_preview": (analysis.get("main_idea") or "")[:200],
+        "item_updated": True,
+    })
+
+
+@router.post("/reanalyze", status_code=202)
+async def reanalyze_endpoint(
+    req: ReanalyzeRequest,
+    _: None = Depends(_require_admin_secret),
+) -> dict:
+    """Kick off a background re-analysis of one saved item. Returns `{job_id}`;
+    poll `GET /api/admin/retrigger/{job_id}` (same `jobs` table and shape)."""
+    if get_item(req.item_id) is None:
+        raise HTTPException(status_code=404, detail={"error": "not-found"})
+
+    job_id = str(uuid.uuid4())
+    create_job(job_id)
+    task = asyncio.create_task(_run_reanalyze_job(job_id, req.item_id))
     _retrigger_tasks.add(task)
     task.add_done_callback(_retrigger_tasks.discard)
 
