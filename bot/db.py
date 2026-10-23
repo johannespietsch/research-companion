@@ -813,6 +813,15 @@ def get_item(item_id: int, user_id: int | None = None) -> sqlite3.Row | None:
         ).fetchone()
 
 
+def update_item_analysis(item_id: int, analysis: str) -> bool:
+    """Replace only the stored analysis of an item (content, title, note and
+    created_at stay). Returns False when the item doesn't exist. Used by the
+    admin reanalyze endpoint."""
+    with _get_conn() as conn:
+        cur = conn.execute("UPDATE items SET analysis = ? WHERE id = ?", (analysis, item_id))
+        return cur.rowcount > 0
+
+
 def search_items(query: str, user_id: int | None = None) -> list[sqlite3.Row]:
     pattern = f"%{query}%"
     with _get_conn() as conn:

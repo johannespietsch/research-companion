@@ -727,3 +727,114 @@ class TestRunRetriggerJob:
         with db._get_conn() as conn:
             row = conn.execute("SELECT anon_id FROM processed_urls").fetchone()
         assert row["anon_id"] == "admin-retrigger"
+
+
+# ---------------------------------------------------------------------------
+# Reanalyze (items with no URL to re-fetch, e.g. pasted text)
+# ---------------------------------------------------------------------------
+
+class TestReanalyze:
+    @pytest.fixture
+    def seen(self, monkeypatch):
+        """Stub `analyze` and record how it was called."""
+        import bot.admin
+
+        calls = []
+
+        def fake_analyze(text, user_id=None, *, ctx=None, skip_cache=False):
+            calls.append({"text": text, "ctx": ctx, "skip_cache": skip_cache})
+            return {
+                "main_idea": "fresh idea", "why_it_matters": "y", "category": "c",
+                "suggestions": [], "time_required": "5m", "verdict": "skim",
+            }
+
+        monkeypatch.setattr(bot.admin, "analyze", fake_analyze)
+        return calls
+
+    def _run(self, db, item_id, job_id="job-r"):
+        import asyncio
+        import bot.admin
+
+        db.create_job(job_id)
+        asyncio.run(bot.admin._run_reanalyze_job(job_id, item_id))
+        return db.get_job_record(job_id)
+
+    def _text_item(self, db, tg=1, content="Stored brief.", note="my note"):
+        uid = db.get_or_create_user_by_telegram(tg)
+        item_id = db.save_item(
+            uid, "text", "", content, '{"main_idea": "stale"}', note, title="Pasted",
+        )
+        return uid, item_id
+
+    def test_missing_secret_rejected(self, retrigger_client):
+        assert retrigger_client.post("/api/admin/reanalyze", json={"item_id": 1}).status_code == 401
+
+    def test_unknown_item_404s(self, db, retrigger_client, admin_headers):
+        r = retrigger_client.post(
+            "/api/admin/reanalyze", json={"item_id": 999}, headers=admin_headers,
+        )
+        assert r.status_code == 404
+
+    def test_returns_job_id_for_existing_item(self, db, retrigger_client, admin_headers, seen):
+        _, item_id = self._text_item(db)
+        r = retrigger_client.post(
+            "/api/admin/reanalyze", json={"item_id": item_id}, headers=admin_headers,
+        )
+        assert r.status_code == 202
+        assert isinstance(r.json().get("job_id"), str)
+
+    def test_reanalyses_stored_brief_past_cache_as_owner(self, db, retrigger_client, seen):
+        uid, item_id = self._text_item(db)
+        rec = self._run(db, item_id)
+        assert rec["status"] == "done"
+        assert seen[0]["text"] == "Stored brief."
+        assert seen[0]["skip_cache"] is True
+        assert seen[0]["ctx"].user_id == uid, "must run under the owner's profile and tier"
+
+    def test_updates_only_the_analysis(self, db, retrigger_client, seen):
+        import json
+
+        uid, item_id = self._text_item(db)
+        self._run(db, item_id)
+        item = db.get_item(item_id, user_id=uid)
+        assert json.loads(item["analysis"])["main_idea"] == "fresh idea"
+        assert item["content"] == "Stored brief."
+        assert item["user_note"] == "my note"
+        assert item["title"] == "Pasted"
+        assert len(db.get_all_items(user_id=uid)) == 1
+
+    def test_does_not_touch_other_users_items(self, db, retrigger_client, seen):
+        _, item_id = self._text_item(db, tg=1)
+        other, other_id = self._text_item(db, tg=2)
+        self._run(db, item_id)
+        assert db.get_item(other_id, user_id=other)["analysis"] == '{"main_idea": "stale"}'
+
+    def test_poll_via_retrigger_status_route(self, db, retrigger_client, admin_headers, seen):
+        _, item_id = self._text_item(db)
+        self._run(db, item_id, job_id="job-poll")
+        body = retrigger_client.get(
+            "/api/admin/retrigger/job-poll", headers=admin_headers
+        ).json()
+        assert body["status"] == "done"
+        assert body["result"]["item_id"] == item_id
+        assert body["result"]["verdict"] == "skim"
+
+    def test_item_without_brief_is_an_error(self, db, retrigger_client, seen):
+        _, item_id = self._text_item(db, content="   ")
+        rec = self._run(db, item_id)
+        assert rec["status"] == "error"
+        assert rec["error"] == "no-content"
+        assert seen == []
+
+    def test_analyze_failure_keeps_old_analysis(self, db, retrigger_client, monkeypatch):
+        import bot.admin
+
+        def boom(*a, **k):
+            raise RuntimeError("model down")
+
+        monkeypatch.setattr(bot.admin, "analyze", boom)
+        uid, item_id = self._text_item(db)
+        rec = self._run(db, item_id)
+        assert rec["status"] == "error"
+        assert rec["error"] == "analyze-failed"
+        assert db.get_item(item_id, user_id=uid)["analysis"] == '{"main_idea": "stale"}'
