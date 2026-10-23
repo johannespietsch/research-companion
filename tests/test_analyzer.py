@@ -143,14 +143,49 @@ class TestActionSchema:
 
 
 class TestAnalyzeOutputLanguage:
-    def test_prompt_pins_language_to_profile_not_source(self):
-        """A wrong-language transcript (or a foreign-language source) must not
-        drag the overview/suggestions into a language the reader can't use (#393)."""
+    """The output language is decided in code from the profile, not inferred by
+    the model: it followed a nationality or city mentioned in an English profile
+    instead of the language the profile is written in."""
+
+    def _prompt(self, profile: str) -> str:
         from bot import analyzer
 
-        assert "LANGUAGE:" in analyzer._PROMPT
-        assert "write in English" in analyzer._PROMPT
-        assert "NEVER switch to the language of the content" in analyzer._PROMPT
+        rule, reminder = analyzer._language_blocks(profile)
+        return analyzer._PROMPT.format(
+            profile_block=f"\nAbout the person you are analysing for:\n{profile}\n",
+            signals_block="", text="SOURCE TEXT",
+            language_rule=rule, language_reminder=reminder,
+        )
+
+    def test_english_profile_pins_english_despite_nationality_cues(self):
+        prompt = self._prompt(
+            "I'm a Polish AI engineer based in Lisbon. Day to day I build and "
+            "evaluate LLM-powered features, maintain our retrieval pipelines and "
+            "review pull requests. I want practical, concrete next steps that I "
+            "can try within a week."
+        )
+        assert "write every field (including suggestions) in English" in prompt
+        assert prompt.rstrip().endswith("whatever language the content above is in.")
+
+    def test_german_written_profile_pins_german(self):
+        prompt = self._prompt(
+            "Ich bin KI-Ingenieur. Täglich baue und bewerte ich Funktionen auf Basis von "
+            "LLMs, pflege unsere Retrieval-Pipelines und prüfe Pull Requests. Ich möchte "
+            "konkrete Vorschläge, die ich innerhalb einer Woche ausprobieren kann."
+        )
+        assert "in German" in prompt
+        assert "in English" not in prompt
+
+    def test_unclear_profile_falls_back_to_prompt_only_rule(self):
+        from bot import analyzer
+
+        rule, reminder = analyzer._language_blocks("I like AI")
+        assert rule == analyzer._LANGUAGE_RULE_UNKNOWN
+        assert reminder == ""
+        assert "write in English" in rule
+
+    def test_prompt_formats_without_leftover_placeholders(self):
+        assert "{language_" not in self._prompt("I want concise, practical suggestions for my work.")
 
     def test_prompt_change_invalidates_analyze_cache(self):
         from bot import analyzer
@@ -158,7 +193,7 @@ class TestAnalyzeOutputLanguage:
         before = analyzer._cache_key_analyze("t", "p", "m")
         original = analyzer._PROMPT
         try:
-            analyzer._PROMPT = original.replace("LANGUAGE:", "LANG:")
+            analyzer._PROMPT = original.replace("{language_rule}", "{language_rule} ")
             assert analyzer._cache_key_analyze("t", "p", "m") != before
         finally:
             analyzer._PROMPT = original

@@ -6,6 +6,8 @@ import time
 from dataclasses import dataclass
 from dotenv import load_dotenv
 
+from bot.language import detect_language
+
 load_dotenv()
 
 logger = logging.getLogger(__name__)
@@ -275,7 +277,7 @@ _PROMPT = """You are my personal AI research analyst.
 {profile_block}{signals_block}
 Analyze the following content and produce a structured analysis covering the required fields. Be concrete and specific to this person — `why_it_matters` should speak to their situation, not give generic advice.
 
-LANGUAGE: write every field (including suggestions) in the language of the "About the person" text above. If there is no such text or its language is unclear, write in English. NEVER switch to the language of the content below — the content may be in a language this person doesn't read; keep names, quotes and technical terms as they appear. The `verdict` value stays one of the fixed English keywords.
+{language_rule}
 
 The suggestions are the point of this analysis — make them the strongest part:
 - `grounded_in`: name the one specific claim/result/quote/section in this content the suggestions build on, so they're traceable to the source.
@@ -283,7 +285,35 @@ The suggestions are the point of this analysis — make them the strongest part:
   QUALITY OVER QUANTITY. Do not pad to hit a number. If the content is purely informational or news with no follow-up genuinely worth the reader's time, return an EMPTY `suggestions` array — we always respect the reader's time.
 
 CONTENT:
-{text}"""
+{text}{language_reminder}"""
+
+# Output language is decided in code (bot/language.py): left to the model, it
+# infers a language from biographical cues in the profile (a stated nationality,
+# a city of residence) rather than from the language it is written in.
+_LANGUAGE_RULE_KNOWN = (
+    "LANGUAGE: write every field (including suggestions) in {language}. Do not "
+    "switch to the language of the content below — the content may be in a "
+    "language this person doesn't read; keep names, quotes and technical terms as "
+    "they appear. The `verdict` value stays one of the fixed English keywords."
+)
+# Profile language unclear (very short, non-Latin script, mixed): prompt-only
+# fallback, English unless the profile text itself is in another language.
+_LANGUAGE_RULE_UNKNOWN = (
+    'LANGUAGE: write every field (including suggestions) in the language of the "About the person" text above. If there is no such text or its language is unclear, write in English. NEVER switch to the language of the content below — the content may be in a language this person doesn\'t read; keep names, quotes and technical terms as they appear. The `verdict` value stays one of the fixed English keywords.'
+)
+_LANGUAGE_REMINDER_KNOWN = "\n\nREMINDER: write every field in {language}, whatever language the content above is in."
+
+
+def _language_blocks(profile: str) -> tuple[str, str]:
+    """(rule, reminder) prompt fragments for the analyze prompt."""
+    language = detect_language(profile)
+    if language is None:
+        return _LANGUAGE_RULE_UNKNOWN, ""
+    return (
+        _LANGUAGE_RULE_KNOWN.format(language=language),
+        _LANGUAGE_REMINDER_KNOWN.format(language=language),
+    )
+
 
 _OPENAI_JSON_SUFFIX = (
     "\n\nRespond with a single JSON object containing these keys: "
@@ -518,7 +548,11 @@ def analyze(
 
     profile_block = f"\nAbout the person you are analysing for:\n{profile}\n" if profile else ""
     signals_block = f"\n{signals}\n" if signals else ""
-    prompt = _PROMPT.format(profile_block=profile_block, signals_block=signals_block, text=text)
+    language_rule, language_reminder = _language_blocks(profile)
+    prompt = _PROMPT.format(
+        profile_block=profile_block, signals_block=signals_block, text=text,
+        language_rule=language_rule, language_reminder=language_reminder,
+    )
 
     # Traces feed the eval pipeline — they must capture the full
     # personalization context the model saw, signals included.
