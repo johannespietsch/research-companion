@@ -3,7 +3,9 @@
 Reads the `error_log` table populated by bot.error_logging, groups by
 fingerprint, asks Claude to bucket each group as
   - known_user_limit  → already covered by bot/fetch_errors.py, ignore
-  - bug               → file a GH issue (dedup by fingerprint marker)
+  - bug               → file a GH issue, unless it is already tracked (by fingerprint
+                        marker, or by Claude matching it against open issues); an
+                        already-tracked bug gets a "happened again" comment instead
   - noise             → ignore
 
 Run locally:
@@ -95,7 +97,17 @@ Categorize each error group as exactly one of:
   client-side disconnects, expected `Blocked user` warnings, image analysis
   failures on individual social-media images (best-effort already).
 
-For "bug" groups also draft:
+You are also given "open_issues" (number, title, body excerpt). For every "bug"
+group, check whether one of them already covers the same underlying problem — the
+same root cause/code path, even if the subscription id, URL, status code (404 vs 500)
+or wording differs, or the issue was written by a human. If so set:
+  - "duplicate_of": that issue's number
+  - "observation": one or two sentences on what this occurrence adds or how it
+    differs (e.g. "now a 500 instead of 404, subscription 6, ~04:13 UTC"). Do not
+    repeat what the issue already says.
+Only use a number from "open_issues"; otherwise omit "duplicate_of".
+
+For "bug" groups that are NOT duplicates also draft:
   - "issue_title": short imperative ("Fix X when Y")
   - "issue_body": one paragraph explanation referencing the affected file/logger
     and what to investigate. Do NOT include the fingerprint — the caller adds it.
@@ -105,8 +117,8 @@ Respond with a JSON array, one object per input group, same order, with keys:
 """
 
 
-def _classify(groups: list[dict]) -> list[dict]:
-    """Send error groups to Claude, parse classifications back."""
+def _classify(groups: list[dict], open_issues: list[dict] | None = None) -> list[dict]:
+    """Send error groups (plus open issues, for dedup) to Claude, parse classifications back."""
     if not groups:
         return []
     import anthropic
@@ -124,6 +136,8 @@ def _classify(groups: list[dict]) -> list[dict]:
         for g in groups
     ]
     prompt = _CLASSIFY_PROMPT.format(reasons=", ".join(_KNOWN_USER_REASONS_HINT))
+    content = "Groups to classify:\n\n" + json.dumps(payload, indent=2)
+    content += "\n\nopen_issues:\n\n" + json.dumps(open_issues or [], indent=2)
 
     resp = client.messages.create(
         model="claude-haiku-4-5-20251001",
@@ -131,7 +145,7 @@ def _classify(groups: list[dict]) -> list[dict]:
         system=prompt,
         messages=[{
             "role": "user",
-            "content": "Groups to classify:\n\n" + json.dumps(payload, indent=2),
+            "content": content,
         }],
     )
     text = "".join(b.text for b in resp.content if hasattr(b, "text"))
@@ -168,6 +182,67 @@ def _gh_search_existing(fingerprint: str, token: str | None) -> int | None:
         return None
     items = resp.json().get("items", [])
     return items[0]["number"] if items else None
+
+
+def _gh_list_open_issues(token: str | None, limit: int = 100) -> list[dict]:
+    """Open issues (no PRs) as compact dicts the classifier can match groups against."""
+    if not token:
+        return []
+    resp = httpx.get(
+        f"https://api.github.com/repos/{GH_REPO}/issues",
+        params={"state": "open", "per_page": limit},
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+        timeout=20,
+    )
+    if resp.status_code != 200:
+        log.warning("GH list issues failed (%s): %s", resp.status_code, resp.text[:200])
+        return []
+    return [
+        {"number": i["number"], "title": i["title"], "body": (i.get("body") or "")[:500]}
+        for i in resp.json()
+        if "pull_request" not in i
+    ]
+
+
+# Don't re-comment on the same issue for the same fingerprint more often than this:
+# a nightly flake would otherwise add a comment every day.
+_RECURRENCE_COOLDOWN = timedelta(days=7)
+
+
+def _gh_comment_recurrence(number: int, group: dict, observation: str | None,
+                           token: str | None) -> bool:
+    """Add a "happened again" comment to an already-tracked issue. True if posted."""
+    if not token:
+        return False
+    marker = f"<!-- fingerprint: {group['fingerprint']} -->"
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+    url = f"https://api.github.com/repos/{GH_REPO}/issues/{number}/comments"
+
+    resp = httpx.get(url, params={"per_page": 100}, headers=headers, timeout=20)
+    if resp.status_code == 200:
+        cutoff = datetime.now(timezone.utc) - _RECURRENCE_COOLDOWN
+        for c in resp.json():
+            if marker in (c.get("body") or "") and datetime.fromisoformat(
+                c["created_at"].replace("Z", "+00:00")
+            ) > cutoff:
+                log.info("  → issue #%d already has a recent recurrence comment, skipping", number)
+                return False
+
+    body = (
+        f"{marker}\n\n"
+        f"### Happened again\n\n"
+        + (f"{observation}\n\n" if observation else "")
+        + f"**Logger:** `{group['logger']}` · **Level:** {group['level']}  \n"
+        f"**Occurrences (last 24h):** {group['count']}  \n"
+        f"**First seen:** {group['first_ts']} · **Last seen:** {group['last_ts']}\n\n"
+        f"### Sample messages\n```\n" + "\n---\n".join(group["messages"]) + "\n```\n"
+        "\n_Added automatically by `scripts/scan_errors.py`._"
+    )
+    resp = httpx.post(url, headers=headers, json={"body": body}, timeout=20)
+    if resp.status_code >= 300:
+        log.error("GH comment failed (%s): %s", resp.status_code, resp.text[:400])
+        return False
+    return True
 
 
 def _gh_create_issue(title: str, body: str, token: str | None) -> int | None:
@@ -225,20 +300,24 @@ def run_scan(*, since_hours: int = 24, dry_run: bool = False,
     filed = 0
     skipped_existing = 0
 
-    if groups:
-        classifications = _classify(groups)
+    commented = 0
 
-        # Mint one installation token per run only if there's a bug to act on.
+    if groups:
+        # Mint one installation token per run; it's needed both to show Claude the
+        # open issues (so it can spot duplicates) and to file/comment afterwards.
         token: str | None = None
-        if any(c.get("classification") == "bug" for c in classifications):
-            from scripts import github_app
-            if github_app.configured():
-                try:
-                    token = github_app.installation_token(GH_REPO)
-                except Exception:
-                    log.exception("Failed to mint GitHub App installation token")
-            else:
-                log.warning("GitHub App not configured (GH_APP_ID / GH_APP_PRIVATE_KEY)")
+        from scripts import github_app
+        if github_app.configured():
+            try:
+                token = github_app.installation_token(GH_REPO)
+            except Exception:
+                log.exception("Failed to mint GitHub App installation token")
+        else:
+            log.warning("GitHub App not configured (GH_APP_ID / GH_APP_PRIVATE_KEY)")
+
+        open_issues = _gh_list_open_issues(token)
+        known_numbers = {i["number"] for i in open_issues}
+        classifications = _classify(groups, open_issues)
 
         for group, cls in zip(groups, classifications):
             verdict = cls.get("classification", "noise")
@@ -248,9 +327,17 @@ def run_scan(*, since_hours: int = 24, dry_run: bool = False,
                 continue
 
             existing = _gh_search_existing(group["fingerprint"], token)
+            observation = None
+            if not existing:
+                dup = cls.get("duplicate_of")
+                if isinstance(dup, int) and dup in known_numbers:
+                    existing = dup
+                    observation = cls.get("observation")
             if existing:
-                log.info("  → already tracked in issue #%d, skipping", existing)
+                log.info("  → already tracked in issue #%d", existing)
                 skipped_existing += 1
+                if not dry_run and _gh_comment_recurrence(existing, group, observation, token):
+                    commented += 1
                 continue
 
             title = cls.get("issue_title") or f"Investigate {group['logger']}: {group['messages'][0][:60]}"
@@ -265,8 +352,8 @@ def run_scan(*, since_hours: int = 24, dry_run: bool = False,
                 log.info("  → filed issue #%d", number)
                 filed += 1
 
-    log.info("Done: filed=%d skipped_existing=%d total_groups=%d",
-             filed, skipped_existing, len(groups))
+    log.info("Done: filed=%d commented=%d skipped_existing=%d total_groups=%d",
+             filed, commented, skipped_existing, len(groups))
 
     pruned = 0
     if prune_older_than_days > 0:
@@ -279,6 +366,7 @@ def run_scan(*, since_hours: int = 24, dry_run: bool = False,
     return {
         "groups": len(groups),
         "filed": filed,
+        "commented": commented,
         "skipped_existing": skipped_existing,
         "pruned": pruned,
     }
