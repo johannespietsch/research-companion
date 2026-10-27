@@ -20,6 +20,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
 from collections import Counter
 from datetime import datetime, timedelta, timezone
@@ -103,8 +104,9 @@ same root cause/code path, even if the subscription id, URL, status code (404 vs
 or wording differs, or the issue was written by a human. If so set:
   - "duplicate_of": that issue's number
   - "observation": one or two sentences on what this occurrence adds or how it
-    differs (e.g. "now a 500 instead of 404, subscription 6, ~04:13 UTC"). Do not
-    repeat what the issue already says.
+    differs (e.g. "now a 500 instead of 404, ~04:13 UTC"). Do not repeat what the issue
+    already says, and never include ids, URLs or channel/user identifiers — the
+    observation is posted publicly.
 Only use a number from "open_issues"; otherwise omit "duplicate_of".
 
 For "bug" groups that are NOT duplicates also draft:
@@ -204,17 +206,25 @@ def _gh_list_open_issues(token: str | None, limit: int = 100) -> list[dict]:
     ]
 
 
-# Don't re-comment on the same issue for the same fingerprint more often than this:
-# a nightly flake would otherwise add a comment every day.
+# Don't re-comment on the same issue more often than this: a nightly flake would
+# otherwise add a comment every day.
 _RECURRENCE_COOLDOWN = timedelta(days=7)
+_RECURRENCE_MARKER = "<!-- scan-recurrence -->"
+
+_URL_RE = re.compile(r"https?://\S+")
 
 
-def _gh_comment_recurrence(number: int, group: dict, observation: str | None,
+def _scrub(text: str) -> str:
+    """Keep URLs (channel ids etc.) out of public issue comments; details stay in the logs."""
+    return _URL_RE.sub("<url>", text)
+
+
+def _gh_comment_recurrence(number: int, items: list[tuple[dict, str | None]],
                            token: str | None) -> bool:
-    """Add a "happened again" comment to an already-tracked issue. True if posted."""
-    if not token:
+    """Add ONE "happened again" comment to an already-tracked issue, covering every
+    error group (e.g. one per subscribed channel) that maps to it. True if posted."""
+    if not token or not items:
         return False
-    marker = f"<!-- fingerprint: {group['fingerprint']} -->"
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
     url = f"https://api.github.com/repos/{GH_REPO}/issues/{number}/comments"
 
@@ -222,21 +232,27 @@ def _gh_comment_recurrence(number: int, group: dict, observation: str | None,
     if resp.status_code == 200:
         cutoff = datetime.now(timezone.utc) - _RECURRENCE_COOLDOWN
         for c in resp.json():
-            if marker in (c.get("body") or "") and datetime.fromisoformat(
+            if _RECURRENCE_MARKER in (c.get("body") or "") and datetime.fromisoformat(
                 c["created_at"].replace("Z", "+00:00")
             ) > cutoff:
                 log.info("  → issue #%d already has a recent recurrence comment, skipping", number)
                 return False
 
+    groups = [g for g, _ in items]
+    observations = list(dict.fromkeys(_scrub(o) for _, o in items if o))
+    messages = list(dict.fromkeys(_scrub(m) for g in groups for m in g["messages"]))[:3]
+    fps = ",".join(g["fingerprint"] for g in groups)
     body = (
-        f"{marker}\n\n"
+        f"{_RECURRENCE_MARKER}\n<!-- fingerprints: {fps} -->\n\n"
         f"### Happened again\n\n"
-        + (f"{observation}\n\n" if observation else "")
-        + f"**Logger:** `{group['logger']}` · **Level:** {group['level']}  \n"
-        f"**Occurrences (last 24h):** {group['count']}  \n"
-        f"**First seen:** {group['first_ts']} · **Last seen:** {group['last_ts']}\n\n"
-        f"### Sample messages\n```\n" + "\n---\n".join(group["messages"]) + "\n```\n"
-        "\n_Added automatically by `scripts/scan_errors.py`._"
+        + "".join(f"- {o}\n" for o in observations)
+        + ("\n" if observations else "")
+        + f"**Occurrences (last 24h):** {sum(g['count'] for g in groups)} "
+        f"across {len(groups)} error group(s)  \n"
+        f"**First seen:** {min(g['first_ts'] for g in groups)} · "
+        f"**Last seen:** {max(g['last_ts'] for g in groups)}\n\n"
+        f"### Sample messages\n```\n" + "\n---\n".join(messages) + "\n```\n"
+        "\n_Added automatically by `scripts/scan_errors.py`. Per-item details are in the app logs._"
     )
     resp = httpx.post(url, headers=headers, json={"body": body}, timeout=20)
     if resp.status_code >= 300:
@@ -301,6 +317,7 @@ def run_scan(*, since_hours: int = 24, dry_run: bool = False,
     skipped_existing = 0
 
     commented = 0
+    recurrences: dict[int, list[tuple[dict, str | None]]] = {}
 
     if groups:
         # Mint one installation token per run; it's needed both to show Claude the
@@ -336,8 +353,7 @@ def run_scan(*, since_hours: int = 24, dry_run: bool = False,
             if existing:
                 log.info("  → already tracked in issue #%d", existing)
                 skipped_existing += 1
-                if not dry_run and _gh_comment_recurrence(existing, group, observation, token):
-                    commented += 1
+                recurrences.setdefault(existing, []).append((group, observation))
                 continue
 
             title = cls.get("issue_title") or f"Investigate {group['logger']}: {group['messages'][0][:60]}"
@@ -351,6 +367,11 @@ def run_scan(*, since_hours: int = 24, dry_run: bool = False,
             if number:
                 log.info("  → filed issue #%d", number)
                 filed += 1
+
+    if not dry_run:
+        for number, items in recurrences.items():
+            if _gh_comment_recurrence(number, items, token):
+                commented += 1
 
     log.info("Done: filed=%d commented=%d skipped_existing=%d total_groups=%d",
              filed, commented, skipped_existing, len(groups))
