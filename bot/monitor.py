@@ -331,8 +331,12 @@ async def poll_all_subscriptions() -> dict:
             stats = await poll_subscription(sub, analysis_budget=budget)
         except Exception:
             totals["feed_errors"] += 1
-            logger.warning("poll failed for subscription %s (%s)",
-                           sub["id"], sub["feed_url"], exc_info=True)
+            # Generic WARNING message so the error scanner clusters every channel's
+            # failure into one group; the per-subscription details go to INFO
+            # (stdout logs only, not error_log / GitHub).
+            logger.info("poll failed detail: subscription %s (%s)",
+                        sub["id"], sub["feed_url"])
+            logger.warning("poll failed for a YouTube feed subscription", exc_info=True)
             continue
         budget -= stats["analyzed"]
         totals["new"] += stats["new"]
