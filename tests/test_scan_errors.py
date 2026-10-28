@@ -71,3 +71,22 @@ def test_many_groups_for_one_issue_post_a_single_comment(monkeypatch):
 
 def test_scrub_strips_urls():
     assert "youtube" not in scan_errors._scrub("poll failed (https://www.youtube.com/feeds/videos.xml?channel_id=X)")
+
+
+def test_scrub_collapses_ids_and_url_parens():
+    out = scan_errors._scrub("poll failed for subscription 9 (https://x.test/f?id=1)")
+    assert out == "poll failed for subscription <n> (<url>)"
+
+
+def test_comment_collapses_per_subscription_observations(monkeypatch):
+    posted = {}
+    monkeypatch.setattr(scan_errors.httpx, "get", lambda *a, **k: MagicMock(status_code=200, json=lambda: []))
+    monkeypatch.setattr(scan_errors.httpx, "post",
+                        lambda url, headers, json, timeout: posted.update(json) or MagicMock(status_code=201))
+    items = [({"fingerprint": f"f{i}", "logger": "l", "level": "WARNING", "count": 2,
+               "first_ts": "a", "last_ts": "b", "messages": [f"poll failed for subscription {i}"]},
+              f"Subscription {i} returning 404") for i in range(9)]
+    assert scan_errors._gh_comment_recurrence(129, items, "tok")
+    body = posted["body"]
+    assert body.count("returning 404") == 1
+    assert "**Occurrences (last 24h):** 18" in body

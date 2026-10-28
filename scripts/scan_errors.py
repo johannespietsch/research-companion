@@ -103,10 +103,10 @@ group, check whether one of them already covers the same underlying problem — 
 same root cause/code path, even if the subscription id, URL, status code (404 vs 500)
 or wording differs, or the issue was written by a human. If so set:
   - "duplicate_of": that issue's number
-  - "observation": one or two sentences on what this occurrence adds or how it
-    differs (e.g. "now a 500 instead of 404, ~04:13 UTC"). Do not repeat what the issue
-    already says, and never include ids, URLs or channel/user identifiers — the
-    observation is posted publicly.
+  - "observation": ONLY if this occurrence genuinely differs from what the issue
+    already describes (e.g. "now a 500 instead of 404"); otherwise omit it. Never
+    say that it matches/is consistent with the issue, never mention the issue number,
+    and never include ids, URLs or channel/user identifiers — it is posted publicly.
 Only use a number from "open_issues"; otherwise omit "duplicate_of".
 
 For "bug" groups that are NOT duplicates also draft:
@@ -211,12 +211,14 @@ def _gh_list_open_issues(token: str | None, limit: int = 100) -> list[dict]:
 _RECURRENCE_COOLDOWN = timedelta(days=7)
 _RECURRENCE_MARKER = "<!-- scan-recurrence -->"
 
-_URL_RE = re.compile(r"https?://\S+")
+_URL_RE = re.compile(r"https?://[^\s)]+")
+_ID_RE = re.compile(r"\b(subscriptions?|channels?|users?|chats?)\s+\d+", re.I)
+_MAX_OBSERVATIONS = 3
 
 
 def _scrub(text: str) -> str:
     """Keep URLs (channel ids etc.) out of public issue comments; details stay in the logs."""
-    return _URL_RE.sub("<url>", text)
+    return _ID_RE.sub(r"\1 <n>", _URL_RE.sub("<url>", text))
 
 
 def _gh_comment_recurrence(number: int, items: list[tuple[dict, str | None]],
@@ -240,6 +242,9 @@ def _gh_comment_recurrence(number: int, items: list[tuple[dict, str | None]],
 
     groups = [g for g, _ in items]
     observations = list(dict.fromkeys(_scrub(o) for _, o in items if o))
+    if len(observations) > _MAX_OBSERVATIONS:
+        extra = len(observations) - _MAX_OBSERVATIONS
+        observations = observations[:_MAX_OBSERVATIONS] + [f"…and {extra} more variation(s)"]
     messages = list(dict.fromkeys(_scrub(m) for g in groups for m in g["messages"]))[:3]
     fps = ",".join(g["fingerprint"] for g in groups)
     body = (
