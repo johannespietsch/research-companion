@@ -19,9 +19,34 @@ class TestSummarizeContent:
             raise RuntimeError("model down")
 
         monkeypatch.setattr(analyzer, "_get_client", boom)
-        # Input longer than the cap → fallback returns exactly the capped slice.
-        out = analyzer.summarize_content("x" * (analyzer.SUMMARY_MAX_CHARS + 5000))
-        assert out == "x" * analyzer.SUMMARY_MAX_CHARS
+        # Single-part input: fallback returns the source slice itself.
+        src = "x" * analyzer._SUMMARY_PART_CHARS
+        assert analyzer.summarize_content(src) == src
+
+    def test_long_source_is_briefed_part_by_part(self, monkeypatch):
+        from bot import analyzer
+
+        seen = []
+
+        def fake_part(text, **kw):
+            seen.append(len(text))
+            return f"brief-{len(seen)}"
+
+        monkeypatch.setattr(analyzer, "_summarize_part", fake_part)
+        text = " ".join(["word"] * 70_000)  # ~350k chars
+        out = analyzer.summarize_content(text)
+        assert len(seen) == 4
+        assert all(n <= analyzer._SUMMARY_PART_CHARS for n in seen)
+        assert out.startswith("## Part 1 of 4\n\nbrief-1")
+        assert "## Part 4 of 4\n\nbrief-4" in out
+
+    def test_split_loses_no_words(self):
+        from bot import analyzer
+
+        text = "\n\n".join(f"para {i} " + "w " * 400 for i in range(600))
+        parts = analyzer._split_for_summary(text)
+        assert all(len(p) <= analyzer._SUMMARY_PART_CHARS for p in parts)
+        assert " ".join(" ".join(parts).split()) == " ".join(text.split())
 
     def test_uses_streaming_on_anthropic(self, monkeypatch):
         """Long-transcript briefs request a large max_tokens, which the Anthropic

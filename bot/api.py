@@ -1030,6 +1030,7 @@ async def _run_job(
             "image_urls": result.image_urls,
             "content": result.summary,
             "source_words": result.source_words,
+            "source_total_words": result.source_total_words,
             "content_preview": result.summary[:TRY_PREVIEW_CHARS],
             "verdict": verdict,
             "analysis": analysis,
