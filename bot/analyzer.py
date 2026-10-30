@@ -6,6 +6,7 @@ import time
 from dataclasses import dataclass
 from dotenv import load_dotenv
 
+from bot.config import VIP_MAX_CONTENT_CHARS
 from bot.language import detect_language
 
 load_dotenv()
@@ -633,10 +634,18 @@ SOURCE METADATA:
 CONTENT:
 {text}"""
 
-# Upper bound on a stored brief. Matches MAX_CONTENT_CHARS so a faithful brief
-# can be as long as the source (the summary is still a derived brief — the
-# prompt strips filler and reorganises — it's just not artificially capped).
-SUMMARY_MAX_CHARS = 100_000
+# Upper bound on a stored brief. Matches the largest source we accept (a VIP's,
+# see config.VIP_MAX_CONTENT_CHARS) so a faithful brief can be as long as the
+# source (the summary is still a derived brief — the prompt strips filler and
+# reorganises — it's just not artificially capped). A single LLM call can't
+# actually reach this: it's bounded by _SUMMARY_MAX_OUTPUT_TOKENS.
+SUMMARY_MAX_CHARS = VIP_MAX_CONTENT_CHARS
+# Sources longer than this are briefed part by part (see `summarize_content`):
+# one call's output budget (_SUMMARY_MAX_OUTPUT_TOKENS ≈ 128k chars at ~4
+# chars/token) would otherwise force a multi-hour transcript into a brief
+# shorter than the "every distinct claim" rule needs, and ~100k chars keeps each
+# part's 1:1 output budget under the cap.
+_SUMMARY_PART_CHARS = 100_000
 # Anthropic output-token ceiling we'll request. Sized to comfortably reach
 # SUMMARY_MAX_CHARS at the model's average chars/token, and well under the
 # Haiku 4.5 64k hard limit. Scaled per source below.
@@ -675,7 +684,54 @@ def _summary_output_tokens(text: str) -> int:
     return max(_SUMMARY_MIN_OUTPUT_TOKENS, min(_SUMMARY_MAX_OUTPUT_TOKENS, approx_input_tokens))
 
 
+def _split_for_summary(text: str, part_chars: int = _SUMMARY_PART_CHARS) -> list[str]:
+    """Split `text` into roughly equal parts of at most `part_chars`, cutting at
+    a paragraph/line/sentence/space boundary near each target so a part doesn't
+    start mid-sentence."""
+    n = -(-len(text) // part_chars)  # ceil
+    target = -(-len(text) // n)
+    parts: list[str] = []
+    start = 0
+    while len(text) - start > part_chars:
+        end = start + target
+        window_lo = max(start + target // 2, end - 2_000)
+        cut = -1
+        for sep in ("\n\n", "\n", ". ", " "):
+            cut = text.rfind(sep, window_lo, min(end + 2_000, len(text)))
+            if cut != -1:
+                end = cut + len(sep)
+                break
+        parts.append(text[start:end].strip())
+        start = end
+    parts.append(text[start:].strip())
+    return [p for p in parts if p]
+
+
 def summarize_content(
+    text: str,
+    *,
+    ctx: UsageContext | None = None,
+    published_at: str | None = None,
+    skip_cache: bool = False,
+) -> str:
+    """Distil a source into a stored brief. Sources over `_SUMMARY_PART_CHARS`
+    (hours-long transcripts) are briefed part by part, each part at full
+    detail, and joined under "Part i of N" headings; each part is cached on its
+    own, so a retry after a failure only redoes the parts that didn't finish.
+    """
+    text = (text or "").strip()
+    if len(text) <= _SUMMARY_PART_CHARS:
+        return _summarize_part(text, ctx=ctx, published_at=published_at, skip_cache=skip_cache)
+    parts = _split_for_summary(text)
+    briefs = [
+        f"## Part {i} of {len(parts)}\n\n"
+        + _summarize_part(part, ctx=ctx, published_at=published_at, skip_cache=skip_cache)
+        for i, part in enumerate(parts, 1)
+    ]
+    return "\n\n".join(briefs)[:SUMMARY_MAX_CHARS]
+
+
+def _summarize_part(
     text: str,
     *,
     ctx: UsageContext | None = None,

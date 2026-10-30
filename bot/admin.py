@@ -673,6 +673,7 @@ async def _run_retrigger_job(
             content=result.summary,
             analysis=to_json_str(result.analysis),
             source_words=result.source_words,
+            source_total_words=result.source_total_words,
             title=result.title,
             author=result.author,
         )

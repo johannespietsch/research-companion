@@ -272,7 +272,7 @@ class TestYouTubeFallbackChain:
 
             result = fetcher._youtube_transcript(YOUTUBE_URL)
 
-        transcribe.assert_called_once_with(YOUTUBE_URL, proxy=None)
+        transcribe.assert_called_once_with(YOUTUBE_URL, proxy=None, max_duration=1800)
         assert "spoken words" in result["text"]
         assert result["source_type"] == "youtube"  # corrected back to youtube
 
@@ -517,7 +517,7 @@ class TestVimeoFallbackChain:
             }
             result = fetcher._vimeo_transcript(VIMEO_URL)
 
-        transcribe.assert_called_once_with(VIMEO_URL)
+        transcribe.assert_called_once_with(VIMEO_URL, max_duration=1800)
         assert "spoken words" in result["text"]
         assert result["transcript_source"] == "whisper"
 
@@ -670,7 +670,7 @@ class TestYouTubeEgress:
         proxy_config = TranscriptApi.call_args.kwargs["proxy_config"]
         assert proxy_config.to_requests_dict() == {"http": self.PROXY, "https": self.PROXY}
         extract.assert_called_once_with(YOUTUBE_URL, proxy=self.PROXY)
-        transcribe.assert_called_once_with(YOUTUBE_URL, proxy=self.PROXY)
+        transcribe.assert_called_once_with(YOUTUBE_URL, proxy=self.PROXY, max_duration=1800)
         assert result["egress"] == "proxy"
 
     def test_autodub_language_lookup_goes_via_proxy(self, monkeypatch):
@@ -1174,7 +1174,7 @@ class TestDirectAudioUrls:
             transcribe.return_value = {"text": "t", "title": "Pod", "source_type": "video"}
             result = fetcher._transcribe_audio_url("https://cdn.example/ep.mp3",
                                                    max_whisper_duration=1800)
-        transcribe.assert_called_once_with("https://cdn.example/ep.mp3")
+        transcribe.assert_called_once_with("https://cdn.example/ep.mp3", max_duration=1800)
         assert result["source_type"] == "audio"  # corrected from transcribe's "video"
 
 
@@ -1318,7 +1318,7 @@ class TestTweetVideoTranscript:
             }
             result = fetcher._tweet_video_transcript(formatted, tweet, TWEET_URL, 30 * 60)
 
-        transcribe.assert_called_once_with(TWEET_URL)
+        transcribe.assert_called_once_with(TWEET_URL, max_duration=1800)
         assert "Check out this video" in result["text"]
         assert "spoken content here" in result["text"]
         assert result["transcript_source"] == "whisper"

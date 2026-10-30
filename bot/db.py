@@ -499,6 +499,10 @@ def _init() -> None:
         # can show "brief · N words (from an M-word transcript)". NULL = unknown
         # (rows saved before this column, notes, uploads, claimed anon rows).
         _ensure_column(conn, "items", "source_words", "source_words INTEGER")
+        # Words in the source before it was cut to the size limit; NULL unless
+        # something was dropped (then > source_words). Drives the "truncated"
+        # indicator on the dashboard and result page.
+        _ensure_column(conn, "items", "source_total_words", "source_total_words INTEGER")
         # The source's own title (article headline, video title, filename,
         # first line of pasted text) — fetched at save time but previously
         # discarded, which forced every display surface to fall back to a
@@ -710,23 +714,25 @@ def save_item(
     *,
     file_path: str = "",
     source_words: int | None = None,
+    source_total_words: int | None = None,
     title: str = "",
     author: str = "",
 ) -> int:
     with _get_conn() as conn:
         cur = conn.execute(
             "INSERT INTO items (user_id, source_type, source, content, "
-            "analysis, user_note, file_path, source_words, title, author) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "analysis, user_note, file_path, source_words, source_total_words, "
+            "title, author) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (user_id, source_type, source, content, analysis, user_note, file_path,
-             source_words, title, author),
+             source_words, source_total_words, title, author),
         )
         return cur.lastrowid
 
 
 def upsert_item_by_source(
     user_id: int, source_type: str, source: str, content: str, analysis: str,
-    *, source_words: int | None = None, title: str = "", author: str = "",
+    *, source_words: int | None = None, source_total_words: int | None = None,
+    title: str = "", author: str = "",
 ) -> int:
     """Refresh a user's existing saved item for `source` in place, or create
     one if they don't have one yet. Unlike `save_item` (always inserts, so
@@ -748,22 +754,26 @@ def upsert_item_by_source(
             # not clobber perfectly good values the original run already stored.
             conn.execute(
                 "UPDATE items SET source_type = ?, content = ?, analysis = ?, "
-                "source_words = ?, title = COALESCE(NULLIF(?, ''), title), "
+                "source_words = ?, source_total_words = ?, "
+                "title = COALESCE(NULLIF(?, ''), title), "
                 "author = COALESCE(NULLIF(?, ''), author) WHERE id = ?",
-                (source_type, content, analysis, source_words, title, author, row["id"]),
+                (source_type, content, analysis, source_words, source_total_words,
+                 title, author, row["id"]),
             )
             return row["id"]
         cur = conn.execute(
             "INSERT INTO items (user_id, source_type, source, content, analysis, "
-            "source_words, title, author) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (user_id, source_type, source, content, analysis, source_words, title, author),
+            "source_words, source_total_words, title, author) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (user_id, source_type, source, content, analysis, source_words,
+             source_total_words, title, author),
         )
         return cur.lastrowid
 
 
 _ITEM_COLS = (
     "id, user_id, source_type, source, content, analysis, user_note, file_path, "
-    "source_words, title, author, created_at"
+    "source_words, source_total_words, title, author, created_at"
 )
 
 
