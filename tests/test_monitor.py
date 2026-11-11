@@ -249,6 +249,19 @@ class TestPollSubscription:
         stats = polling.poll()
         assert stats["new"] == 0 and stats["analyzed"] == 0
 
+    def test_paused_user_records_but_never_analyzes(self, polling):
+        polling.entries = []
+        polling.poll()  # seed (empty)
+        polling.db.set_channels_paused(polling.user_id, True)
+        polling.entries = [{"url": "https://ex.com/new", "title": "New"}]
+        stats = polling.poll()
+        assert stats["new"] == 1 and stats["analyzed"] == 0
+        assert polling.analyzed == []
+        assert polling.statuses() == {"https://ex.com/new": "seeded"}
+        # Resuming doesn't backfill what dropped while paused.
+        polling.db.set_channels_paused(polling.user_id, False)
+        assert polling.poll()["analyzed"] == 0
+
     def test_done_entry_links_item_and_verdict(self, polling):
         polling.entries = []
         polling.poll()  # seed (empty)
@@ -403,6 +416,17 @@ class TestSubscriptionEndpoints:
                           headers=auth_headers)
         assert r.status_code == 204
         assert client.get(f"/api/subscriptions?user_id={uid}", headers=auth_headers).json() == []
+
+    def test_pause_toggle_roundtrip(self, client, auth_headers, db):
+        uid = db.upsert_user_by_email("u@example.com")
+        url = f"/api/subscriptions/paused?user_id={uid}"
+        assert client.get(url, headers=auth_headers).json() == {"paused": False}
+        r = client.put("/api/subscriptions/paused", headers=auth_headers,
+                       json={"user_id": uid, "paused": True})
+        assert r.json() == {"paused": True}
+        assert client.get(url, headers=auth_headers).json() == {"paused": True}
+        assert client.put("/api/subscriptions/paused", headers=auth_headers,
+                          json={"user_id": 99999, "paused": True}).status_code == 404
 
     def test_duplicate_subscription_is_409(self, client, auth_headers, db, resolved):
         uid = db.upsert_user_by_email("u@example.com")

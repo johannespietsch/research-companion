@@ -271,18 +271,21 @@ async def poll_subscription(sub, *, analysis_budget: int) -> dict:
     entries = await asyncio.to_thread(fetch_entries, sub["feed_url"])
 
     first_poll = not sub["last_polled_at"]
+    # A paused user's entries are recorded as seen-but-never-analyzed too, so
+    # resuming doesn't dump the whole paused window into the LLM queue.
+    paused = bool(sub["paused"])
     # Subscribing must not trigger a backfill: everything already in the feed
     # is recorded as seen-but-never-analyzed.
-    status = "seeded" if first_poll else "pending"
+    status = "seeded" if first_poll or paused else "pending"
     for e in entries:
         # Shorts stay in the ledger (so they never look new later) but are
         # never analyzed; first-poll entries are already 'seeded'.
-        entry_status = "skipped_format" if not first_poll and is_short(e["url"]) else status
+        entry_status = "skipped_format" if status == "pending" and is_short(e["url"]) else status
         if record_subscription_entry(sub["id"], sub["user_id"], e["url"], e["title"],
                                      status=entry_status, published_at=e.get("published", "")):
             stats["new"] += 1
     mark_subscription_polled(sub["id"])
-    if first_poll:
+    if first_poll or paused:
         return stats
 
     # Shorts queued before this rule existed would otherwise hold pending slots.
