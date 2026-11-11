@@ -528,6 +528,10 @@ def _init() -> None:
                        "digest_opt_out INTEGER NOT NULL DEFAULT 0")
         _ensure_column(conn, "users", "digest_last_sent_at",
                        "digest_last_sent_at TEXT NOT NULL DEFAULT ''")
+        # Channel monitoring master switch: while set, the poller still records
+        # new feed entries but never analyzes them (no LLM spend).
+        _ensure_column(conn, "users", "channels_paused",
+                       "channels_paused INTEGER NOT NULL DEFAULT 0")
         conn.execute(_CREATE_LLM_CALLS_SQL)
         conn.execute(_CREATE_ANALYZE_TRACES_SQL)
         conn.execute(_CREATE_PROCESSED_UPDATES_SQL)
@@ -1085,9 +1089,28 @@ def get_all_subscriptions() -> list[sqlite3.Row]:
     """Every subscription across users — the poller's worklist."""
     with _get_conn() as conn:
         return conn.execute(
-            "SELECT id, user_id, feed_url, title, source_kind, last_polled_at "
-            "FROM subscriptions ORDER BY id"
+            "SELECT s.id, s.user_id, s.feed_url, s.title, s.source_kind, s.last_polled_at, "
+            "COALESCE(u.channels_paused, 0) AS paused "
+            "FROM subscriptions s LEFT JOIN users u ON u.id = s.user_id ORDER BY s.id"
         ).fetchall()
+
+
+def get_channels_paused(user_id: int) -> bool:
+    with _get_conn() as conn:
+        row = conn.execute(
+            "SELECT channels_paused FROM users WHERE id = ?", (user_id,)
+        ).fetchone()
+        return bool(row and row["channels_paused"])
+
+
+def set_channels_paused(user_id: int, paused: bool) -> bool:
+    """Pause/resume all of a user's channels. Returns False for unknown users."""
+    with _get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE users SET channels_paused = ? WHERE id = ?",
+            (1 if paused else 0, user_id),
+        )
+        return cur.rowcount > 0
 
 
 def delete_subscription(sub_id: int, user_id: int) -> bool:

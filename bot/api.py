@@ -44,6 +44,8 @@ from bot.db import (
     delete_item,
     delete_saved_suggestion,
     delete_subscription,
+    get_channels_paused,
+    set_channels_paused,
     delete_user,
     get_all_items,
     get_item,
@@ -649,6 +651,26 @@ async def subscriptions_list(user_id: int, _: None = Depends(_require_try_secret
         }
         for s in get_subscriptions(user_id)
     ]
+
+
+class _ChannelsPausedRequest(BaseModel):
+    user_id: int
+    paused: bool
+
+
+@router.get("/subscriptions/paused")
+async def subscriptions_paused_get(user_id: int, _: None = Depends(_require_try_secret)):
+    return {"paused": get_channels_paused(user_id)}
+
+
+@router.put("/subscriptions/paused")
+async def subscriptions_paused_set(
+    req: _ChannelsPausedRequest, _: None = Depends(_require_try_secret)
+):
+    """Master switch: pause/resume monitoring for all of a user's channels."""
+    if not set_channels_paused(req.user_id, req.paused):
+        raise HTTPException(status_code=404, detail={"error": "not-found"})
+    return {"paused": req.paused}
 
 
 @router.delete("/subscriptions/{sub_id}", status_code=204)
