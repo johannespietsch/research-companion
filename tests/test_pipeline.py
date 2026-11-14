@@ -595,3 +595,76 @@ class TestAnalyzeText:
         ))
         assert result.saved_id is None
         assert db.get_all_items(None) == []
+
+
+class TestLongSourceLimits:
+    """Per-tier source limits: standard users are cut at MAX_CONTENT_CHARS and
+    told how much was dropped; VIPs get the deep-reading limits."""
+
+    @staticmethod
+    def _long_fetch(pipeline, monkeypatch, n_words):
+        text = " ".join(["word"] * n_words)  # 5 chars per word incl. space
+
+        async def fake_fetch(url, **kwargs):
+            fake_fetch.kwargs = kwargs
+            return {"text": text, "title": "Long talk", "source_type": "youtube", "image_urls": []}
+
+        monkeypatch.setattr(pipeline, "fetch_url", fake_fetch)
+        return fake_fetch
+
+    def test_standard_user_truncation_is_recorded(self, pipeline, db, monkeypatch):
+        from bot.analyzer import UsageContext
+        from bot.config import MAX_CONTENT_CHARS
+        self._long_fetch(pipeline, monkeypatch, 60_000)  # ~300k chars
+        uid = db.get_or_create_user_by_telegram(1)
+        result = asyncio.run(pipeline.analyze_url(
+            "https://youtu.be/x", ctx=UsageContext(user_id=uid), save_for_user_id=uid,
+        ))
+        assert result.source_total_words == 60_000
+        assert result.source_words < 60_000
+        assert result.source_words * 5 <= MAX_CONTENT_CHARS
+        row = db.get_item(result.saved_id, user_id=uid)
+        assert row["source_total_words"] == 60_000
+        assert row["source_words"] == result.source_words
+
+    def test_untruncated_source_has_no_total(self, pipeline, db):
+        from bot.analyzer import UsageContext
+        uid = db.get_or_create_user_by_telegram(1)
+        result = asyncio.run(pipeline.analyze_url(
+            "https://example.com/post", ctx=UsageContext(user_id=uid), save_for_user_id=uid,
+        ))
+        assert result.source_total_words is None
+        assert db.get_item(result.saved_id, user_id=uid)["source_total_words"] is None
+
+    def test_vip_gets_full_transcript_and_long_whisper_cap(self, pipeline, db, monkeypatch):
+        from bot import config
+        from bot.analyzer import UsageContext
+        from bot.fetcher import WHISPER_MAX_DURATION_VIP_S
+        fake = self._long_fetch(pipeline, monkeypatch, 60_000)
+        uid = db.get_or_create_user_by_telegram(1)
+        monkeypatch.setattr(config, "VIP_USER_IDS", frozenset({uid}))
+        result = asyncio.run(pipeline.analyze_url(
+            "https://youtu.be/x", ctx=UsageContext(user_id=uid), save_for_user_id=uid,
+        ))
+        assert result.source_words == 60_000
+        assert result.source_total_words is None
+        assert fake.kwargs["max_whisper_duration"] == WHISPER_MAX_DURATION_VIP_S
+
+    def test_vip_still_capped_at_vip_limit(self, pipeline, db, monkeypatch):
+        from bot import config
+        from bot.analyzer import UsageContext
+        self._long_fetch(pipeline, monkeypatch, 200_000)  # ~1M chars
+        uid = db.get_or_create_user_by_telegram(1)
+        monkeypatch.setattr(config, "VIP_USER_IDS", frozenset({uid}))
+        result = asyncio.run(pipeline.analyze_url(
+            "https://youtu.be/x", ctx=UsageContext(user_id=uid)
+        ))
+        assert result.source_total_words == 200_000
+        assert result.source_words * 5 <= config.VIP_MAX_CONTENT_CHARS
+
+    def test_pasted_text_truncation_is_recorded(self, pipeline):
+        from bot.analyzer import UsageContext
+        result = asyncio.run(pipeline.analyze_text(
+            " ".join(["word"] * 60_000), ctx=UsageContext()
+        ))
+        assert result.source_total_words == 60_000

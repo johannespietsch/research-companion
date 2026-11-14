@@ -11,7 +11,7 @@ import requests
 
 from bot import fetch_errors
 from bot import config
-from bot.config import CONTACT_EMAIL, MAX_CONTENT_CHARS
+from bot.config import CONTACT_EMAIL, FETCH_MAX_CHARS
 from bot.ssrf import BlockedURLError, assert_public_url
 
 logger = logging.getLogger(__name__)
@@ -134,6 +134,9 @@ WHISPER_MAX_DURATION_ANON_S = 30 * 60        # 30 min — anonymous web tries
 # this adds headroom above the platform's own ceiling rather than matching it
 # exactly. Same constant for every signed-in user — no per-account override.
 WHISPER_MAX_DURATION_SIGNED_IN_S = int(2.5 * 60 * 60)
+# VIP accounts (config.VIP_USER_IDS): multi-hour talks and podcasts, up to 12 h.
+# The transcriber splits audio into chunks to fit the provider's upload limit.
+WHISPER_MAX_DURATION_VIP_S = 12 * 60 * 60
 
 
 # Source types whose content *is* the transcript. A description-only fetch of
@@ -141,8 +144,10 @@ WHISPER_MAX_DURATION_SIGNED_IN_S = int(2.5 * 60 * 60)
 VIDEO_SOURCE_TYPES: frozenset[str] = frozenset({"youtube", "video", "audio"})
 
 
-def whisper_cap_for(*, signed_in: bool) -> int:
+def whisper_cap_for(*, signed_in: bool, vip: bool = False) -> int:
     """Default per-tier transcription duration ceiling (seconds)."""
+    if vip:
+        return WHISPER_MAX_DURATION_VIP_S
     return WHISPER_MAX_DURATION_SIGNED_IN_S if signed_in else WHISPER_MAX_DURATION_ANON_S
 
 
@@ -279,7 +284,7 @@ def _youtube_transcript_via(
             meta = _youtube_oembed_metadata(url, proxy=proxy) or {}
             title = meta.get("title") or f"YouTube video ({video_id})"
             return {
-                "text": f"{title}\n\nTranscript:\n{text}"[:MAX_CONTENT_CHARS],
+                "text": f"{title}\n\nTranscript:\n{text}"[:FETCH_MAX_CHARS],
                 "title": title,
                 "author": meta.get("author") or "",
                 "source_type": "youtube",
@@ -324,7 +329,7 @@ def _youtube_transcript_via(
             f"YouTube {video_id}: no subtitles, trying audio + Whisper "
             f"(duration {duration}s, cap {max_whisper_duration}s)"
         )
-        whisper = _yt_dlp_transcribe(url, proxy=proxy)
+        whisper = _yt_dlp_transcribe(url, proxy=proxy, max_duration=max_whisper_duration)
         if whisper.get("text"):
             whisper["source_type"] = "youtube"
             whisper.setdefault("image_urls", []).append(thumb)
@@ -414,7 +419,7 @@ def _vimeo_native_transcript(config: dict, video_id: str) -> dict | None:
     thumbs = video_meta.get("thumbs") or {}
     image_urls = [thumbs[max(thumbs, key=lambda k: int(k) if k.isdigit() else 0)]] if thumbs else []
     return {
-        "text": f"{title}\n\nTranscript:\n{text}"[:MAX_CONTENT_CHARS],
+        "text": f"{title}\n\nTranscript:\n{text}"[:FETCH_MAX_CHARS],
         "title": title,
         "author": (video_meta.get("owner") or {}).get("name") or "",
         "source_type": "video",
@@ -454,7 +459,7 @@ def _vimeo_transcript(url: str, max_whisper_duration: int = WHISPER_MAX_DURATION
             f"Vimeo {url}: no subtitles, trying audio + Whisper "
             f"(duration {duration}s, cap {max_whisper_duration}s)"
         )
-        whisper = _yt_dlp_transcribe(url)
+        whisper = _yt_dlp_transcribe(url, max_duration=max_whisper_duration)
         if whisper.get("text"):
             whisper["source_type"] = "video"
             whisper["transcript_source"] = "whisper"
@@ -537,11 +542,11 @@ def _format_fxtwitter(tweet: dict, url: str) -> dict:
             or tweet.get("text", "")
         )
         text = f"X Article by @{handle}: {title}\n\n{body}"
-        return {"text": text[:MAX_CONTENT_CHARS], "title": title or f"Article by @{handle}",
+        return {"text": text[:FETCH_MAX_CHARS], "title": title or f"Article by @{handle}",
                 "author": author or f"@{handle}", "source_type": "social", "image_urls": image_urls}
 
     text = f"@{handle} ({author}):\n\n{tweet.get('text', '')}"
-    return {"text": text[:MAX_CONTENT_CHARS], "title": f"Post by @{handle}",
+    return {"text": text[:FETCH_MAX_CHARS], "title": f"Post by @{handle}",
             "author": author or f"@{handle}", "source_type": "social", "image_urls": image_urls}
 
 
@@ -554,7 +559,7 @@ def _format_syndication(data: dict, url: str) -> dict:
         if m.get("type") == "photo" and m.get("media_url_https")
     ]
     text = f"@{handle} ({author}):\n\n{data.get('text', '')}"
-    return {"text": text[:MAX_CONTENT_CHARS], "title": f"Post by @{handle}",
+    return {"text": text[:FETCH_MAX_CHARS], "title": f"Post by @{handle}",
             "author": author or f"@{handle}", "source_type": "social", "image_urls": image_urls}
 
 
@@ -578,10 +583,10 @@ def _tweet_video_transcript(
     if not duration:
         return result
 
-    whisper = _yt_dlp_transcribe(url)
+    whisper = _yt_dlp_transcribe(url, max_duration=max_whisper_duration)
     transcript = whisper.get("transcript") or whisper.get("text")
     if transcript:
-        result["text"] = f"{result['text']}\n\nVideo transcript:\n{transcript}"[:MAX_CONTENT_CHARS]
+        result["text"] = f"{result['text']}\n\nVideo transcript:\n{transcript}"[:FETCH_MAX_CHARS]
         result["transcript_source"] = "whisper"
         result["duration"] = duration
     else:
@@ -618,7 +623,7 @@ def _fetch_tweet(url: str, max_whisper_duration: int = WHISPER_MAX_DURATION_ANON
 
     duration = extract.get("duration") or 0
     if duration and duration <= max_whisper_duration:
-        whisper = _yt_dlp_transcribe(url)
+        whisper = _yt_dlp_transcribe(url, max_duration=max_whisper_duration)
         if whisper.get("text"):
             whisper["source_type"] = "social"
             whisper["transcript_source"] = "whisper"
@@ -760,7 +765,7 @@ def _yt_dlp_extract(url: str, proxy: str | None = None) -> dict:
         text = f"{title}\nBy: {uploader}\n\n{description}".strip()
 
     return {
-        "text": text[:MAX_CONTENT_CHARS],
+        "text": text[:FETCH_MAX_CHARS],
         "title": title,
         "author": uploader,
         "source_type": source_type,
@@ -771,7 +776,9 @@ def _yt_dlp_extract(url: str, proxy: str | None = None) -> dict:
     }
 
 
-def _yt_dlp_transcribe(url: str, proxy: str | None = None) -> dict:
+def _yt_dlp_transcribe(
+    url: str, proxy: str | None = None, max_duration: int | None = None
+) -> dict:
     """Download audio from a video URL via yt-dlp and transcribe with Whisper.
     `proxy` routes the download (YouTube only, #128); None = direct."""
     import yt_dlp
@@ -790,7 +797,9 @@ def _yt_dlp_transcribe(url: str, proxy: str | None = None) -> dict:
         # Safety net for direct-audio URLs whose duration can't be probed: cap
         # the transient download so a runaway file can't fill the 1 GB box.
         # ~64 kbps × this ≈ 7 h of audio, well past any real episode.
-        "max_filesize": 200 * 1024 * 1024,
+        # A caller that already vetted the duration against a longer cap (VIP)
+        # passes it so the size net scales with it: 64 kbps = 8 kB/s, +50%.
+        "max_filesize": max(200 * 1024 * 1024, int((max_duration or 0) * 8_000 * 1.5)),
     }
     if proxy:
         ydl_opts["proxy"] = proxy
@@ -818,7 +827,7 @@ def _yt_dlp_transcribe(url: str, proxy: str | None = None) -> dict:
         title = info.get("title") or url
         text = f"{title}\nBy: {uploader}\n\nTranscript:\n{transcript}".strip()
         return {
-            "text": text[:MAX_CONTENT_CHARS],
+            "text": text[:FETCH_MAX_CHARS],
             "title": title,
             "author": uploader,
             "source_type": "video",
@@ -903,7 +912,7 @@ async def _streamyard_fetch(url: str) -> dict:
         loop = asyncio.get_running_loop()
         transcript = await loop.run_in_executor(None, _transcribe_sync, tmp_path)
         text = f"{title}\n\nTranscript:\n{transcript}".strip()
-        return {"text": text[:MAX_CONTENT_CHARS], "title": title, "source_type": "video"}
+        return {"text": text[:FETCH_MAX_CHARS], "title": title, "source_type": "video"}
     except Exception as e:
         logger.warning(f"StreamYard transcription failed for {url}: {e}")
         return {"text": title, "title": title, "source_type": "video", "reason": fetch_errors.WHISPER_FAILED}
@@ -937,7 +946,7 @@ def _pdf_extract(pdf_bytes: bytes, url: str) -> dict:
         logger.warning(f"PDF at {url} yielded no text — likely image-based; OCR not available")
         return {"text": "", "title": title, "source_type": "pdf", "reason": fetch_errors.IMAGE_ONLY_PDF}
 
-    return {"text": text[:MAX_CONTENT_CHARS], "title": title, "source_type": "pdf"}
+    return {"text": text[:FETCH_MAX_CHARS], "title": title, "source_type": "pdf"}
 
 
 async def _pdf_fetch(url: str) -> dict:
@@ -1116,7 +1125,7 @@ async def _generic_fetch(url: str) -> dict:
             logger.info(f"Wall detected ({reason}) for {url}: {(text or '').strip()[:80]!r}")
         return {"text": "", "title": title, "source_type": "article", "reason": reason}
 
-    return {"text": text[:MAX_CONTENT_CHARS], "title": title, "source_type": "article"}
+    return {"text": text[:FETCH_MAX_CHARS], "title": title, "source_type": "article"}
 
 
 def _domain_matches(domain: str, *targets: str) -> bool:
@@ -1181,7 +1190,7 @@ def _transcribe_audio_url(url: str, max_whisper_duration: int) -> dict:
         return {"text": title, "title": title, "source_type": "audio",
                 "reason": fetch_errors.VIDEO_TOO_LONG_FOR_WHISPER}
 
-    result = _yt_dlp_transcribe(url)
+    result = _yt_dlp_transcribe(url, max_duration=max_whisper_duration)
     result["source_type"] = "audio"
     return result
 
@@ -1376,7 +1385,7 @@ async def _academic_fetch(url: str, doi: str) -> dict | None:
         header = title if not meta.get("authors") else f"{title}\nBy: {meta['authors']}"
         logger.info("Academic abstract recovered for DOI %s via Crossref", doi)
         return {
-            "text": f"{header}\n\nAbstract:\n{meta['abstract']}"[:MAX_CONTENT_CHARS],
+            "text": f"{header}\n\nAbstract:\n{meta['abstract']}"[:FETCH_MAX_CHARS],
             "title": title,
             "source_type": "academic",
         }

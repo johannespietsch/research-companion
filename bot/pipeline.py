@@ -43,7 +43,7 @@ from bot.analyzer import (
 )
 from bot import fetch_errors
 from bot.concurrency import CapacityError, heavy
-from bot.config import MAX_CONTENT_CHARS
+from bot.config import MAX_CONTENT_CHARS, is_vip, max_content_chars_for
 from bot.db import record_processed_url, save_item
 from bot.fetcher import VIDEO_SOURCE_TYPES, fetch_url, whisper_cap_for
 
@@ -102,6 +102,11 @@ class PipelineResult:
     # Words in the source text fed to the summarizer (before any appended
     # image descriptions) — lets the UI say how much the brief condensed.
     source_words: int | None = None
+    # Words in the source *before* it was cut to the caller's size limit. Set
+    # only when something was dropped (so > source_words); None = nothing lost.
+    # Lets every surface say "briefed the first N of M words" instead of
+    # implying a complete read.
+    source_total_words: int | None = None
 
     @property
     def source_type(self) -> str:
@@ -118,6 +123,21 @@ class PipelineResult:
     @property
     def image_urls(self) -> list[str]:
         return self.fetched.get("image_urls") or []
+
+
+def _fit_to_limit(text: str, max_chars: int) -> tuple[str, int, int | None]:
+    """Cut `text` to `max_chars` on a word boundary. Returns the (possibly cut)
+    text, its word count, and the original word count if anything was dropped
+    (else None)."""
+    if len(text) <= max_chars:
+        return text, len(text.split()), None
+    total_words = len(text.split())
+    cut = text[:max_chars]
+    if not text[max_chars].isspace():
+        head, _, _ = cut.rpartition(" ")
+        cut = head or cut
+    cut = cut.rstrip()
+    return cut, len(cut.split()), total_words
 
 
 async def analyze_url(
@@ -177,7 +197,9 @@ async def analyze_url(
                 logger.exception("pipeline on_step callback raised; ignoring")
 
     if max_whisper_duration is None:
-        max_whisper_duration = whisper_cap_for(signed_in=ctx.user_id is not None)
+        max_whisper_duration = whisper_cap_for(
+            signed_in=ctx.user_id is not None, vip=is_vip(ctx.user_id)
+        )
 
     # Bound total concurrent heavy work across EVERY entry point (web /try, the
     # async job runner, /library/add, Telegram) by taking a slot before any
@@ -241,7 +263,11 @@ async def analyze_url(
         if not ctx.source_type:
             ctx.source_type = source_type
 
-        source_words = len(text.split())
+        # The fetch layer returns far more than a standard user may feed the
+        # summarizer; cut to this caller's limit, remembering how much went.
+        text, source_words, source_total_words = _fit_to_limit(
+            text, max_content_chars_for(ctx.user_id)
+        )
 
         # Inline image descriptions: append to text so they enter the summary
         # (and therefore the analyze input) deterministically. analyze_image()
@@ -288,13 +314,14 @@ async def analyze_url(
                 analysis=to_json_str(analysis),
                 user_note=user_note,
                 source_words=source_words,
+                source_total_words=source_total_words,
                 title=fetched.get("title") or "",
                 author=fetched.get("author") or "",
             )
 
         return PipelineResult(
             fetched=fetched, summary=summary, analysis=analysis, saved_id=saved_id,
-            source_words=source_words,
+            source_words=source_words, source_total_words=source_total_words,
         )
     except PipelineError as e:
         # Pull whatever the exception carries — for ERR_NO_TEXT / ERR_NO_TRANSCRIPT
@@ -357,9 +384,12 @@ async def analyze_text(
             except Exception:
                 logger.exception("pipeline on_step callback raised; ignoring")
 
-    text = (text or "").strip()[:MAX_CONTENT_CHARS]
+    text = (text or "").strip()
     if not text:
         raise PipelineError(ERR_NO_TEXT)
+    text, source_words, source_total_words = _fit_to_limit(
+        text, max_content_chars_for(ctx.user_id)
+    )
 
     source_type = "text"
     if not ctx.source_type:
@@ -373,7 +403,6 @@ async def analyze_text(
 
     started = time.monotonic()
     fetched: dict = {"title": title, "source_type": source_type, "text": text}
-    source_words = len(text.split())
     audit_status = "ok"
     audit_error_code = ""
     try:
@@ -398,12 +427,13 @@ async def analyze_text(
                 analysis=to_json_str(analysis),
                 user_note=user_note,
                 source_words=source_words,
+                source_total_words=source_total_words,
                 title=title,
             )
 
         return PipelineResult(
             fetched=fetched, summary=summary, analysis=analysis, saved_id=saved_id,
-            source_words=source_words,
+            source_words=source_words, source_total_words=source_total_words,
         )
     except PipelineError as e:
         if e.fetched:

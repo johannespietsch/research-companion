@@ -67,22 +67,56 @@ def test_hosted_upload_compresses_and_cleans_up(tmp_path):
     assert src.exists()
 
 
-def test_hosted_rejects_oversize_upload_and_cleans_up(tmp_path):
+def test_hosted_oversize_upload_is_split_and_joined(tmp_path):
     src = tmp_path / "audio.mp3"
     src.write_bytes(b"fake-audio")
     compressed = tmp_path / "big.ogg"
     compressed.write_bytes(b"x" * (transcriber._MAX_UPLOAD_BYTES + 1))
+    segs = []
+    for i in range(3):
+        seg = tmp_path / f"seg_{i}.ogg"
+        seg.write_bytes(b"s")
+        segs.append(str(seg))
 
-    fake_client = MagicMock()
+    with patch.object(transcriber, "_compress_for_upload", return_value=str(compressed)), \
+         patch.object(transcriber, "_split_audio", return_value=segs), \
+         patch.object(transcriber, "_upload_once", side_effect=["one", "two", "three"]) as up:
+        out = transcriber._transcribe_hosted(str(src))
 
-    with patch.object(transcriber, "_get_hosted_client", return_value=fake_client), \
-         patch.object(transcriber, "_compress_for_upload", return_value=str(compressed)):
+    assert out == "one\n\ntwo\n\nthree"
+    assert up.call_count == 3
+    # The temp upload is still cleaned up; the caller's original is untouched.
+    assert not compressed.exists()
+    assert src.exists()
+
+
+def test_segment_upload_retries_then_succeeds():
+    with patch.object(transcriber, "_upload_once", side_effect=[RuntimeError("429"), "ok"]), \
+         patch.object(transcriber.time, "sleep") as sleep:
+        assert transcriber._upload_segment("/tmp/x.ogg") == "ok"
+    sleep.assert_called_once()
+
+
+def test_segment_upload_gives_up_after_attempts():
+    with patch.object(transcriber, "_upload_once", side_effect=RuntimeError("down")) as up, \
+         patch.object(transcriber.time, "sleep"):
+        try:
+            transcriber._upload_segment("/tmp/x.ogg")
+            assert False, "expected failure to propagate"
+        except RuntimeError:
+            pass
+    assert up.call_count == transcriber._SEGMENT_ATTEMPTS
+
+
+def test_uncompressed_oversize_audio_is_rejected(tmp_path):
+    src = tmp_path / "audio.mp3"
+    src.write_bytes(b"x" * (transcriber._MAX_UPLOAD_BYTES + 1))
+    with patch.object(transcriber, "_compress_for_upload", return_value=str(src)), \
+         patch.object(transcriber, "_upload_once") as up:
         try:
             transcriber._transcribe_hosted(str(src))
-            assert False, "expected oversize upload to raise"
+            assert False, "expected ValueError"
         except ValueError:
             pass
-
-    # We bail before hitting the provider, and still clean up the temp upload.
-    fake_client.audio.transcriptions.create.assert_not_called()
-    assert not compressed.exists()
+    up.assert_not_called()
+    assert src.exists()

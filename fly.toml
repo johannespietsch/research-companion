@@ -10,6 +10,9 @@ primary_region = 'fra'
 
 [env]
   DATA_DIR = '/data'
+  # users.id values with the deep-reading limits (12 h transcription, 800k-char
+  # sources, briefed part by part) — see bot/config.py.
+  VIP_USER_IDS = '2'
   # Tailscale exit node for YouTube egress (#128); tailscaled only starts when
   # the TS_AUTHKEY secret is set (see docker-entrypoint.sh).
   TS_EXIT_NODE = 'admins-macbook-pro'
