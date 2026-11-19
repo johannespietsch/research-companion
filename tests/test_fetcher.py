@@ -1489,3 +1489,39 @@ class TestExtensionlessPdf:
 
         assert result["reason"] == fetch_errors.IMAGE_ONLY_PDF
         assert result["title"] == "Scan"
+
+
+class TestSizePrecheck:
+    """An oversized direct file must be refused from headers alone (prod OOM)."""
+
+    def _run(self, length, ctype, url="https://cdn.example/big.mp4"):
+        import asyncio
+        from unittest.mock import AsyncMock, patch
+        from bot import fetcher
+
+        with patch.object(fetcher, "assert_public_url"), \
+             patch.object(fetcher, "_probe_download", return_value=(length, ctype)), \
+             patch.object(fetcher, "_transcribe_audio_url", return_value={"text": "t"}) as tr, \
+             patch.object(fetcher, "_generic_fetch", new=AsyncMock(return_value={"text": "g"})) as gen:
+            res = asyncio.run(fetcher._fetch_url_uncached(url))
+        return res, tr, gen
+
+    def test_huge_video_refused_without_download(self):
+        res, tr, gen = self._run(867_249_239, "video/mp4")
+        assert res["reason"] == "file_too_large"
+        tr.assert_not_called(); gen.assert_not_called()
+
+    def test_huge_document_refused(self):
+        res, _, gen = self._run(80 * 1024 * 1024, "text/html", "https://example.com/x")
+        assert res["reason"] == "file_too_large"
+        gen.assert_not_called()
+
+    def test_small_direct_video_is_transcribed(self):
+        res, tr, gen = self._run(5_000_000, "video/mp4")
+        assert res == {"text": "t"}
+        gen.assert_not_called()
+
+    def test_normal_article_unaffected(self):
+        res, tr, gen = self._run(None, "text/html", "https://example.com/post")
+        assert res["text"] == "g"
+        tr.assert_not_called()

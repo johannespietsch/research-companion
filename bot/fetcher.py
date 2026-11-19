@@ -1147,6 +1147,34 @@ def _to_old_reddit(url: str) -> str:
 _AUDIO_SUFFIXES = (".mp3", ".m4a", ".aac", ".wav", ".ogg", ".oga", ".opus", ".flac", ".m4b")
 
 
+# Pre-download size ceilings. The prod box has ~1 GB of RAM and disk: an 867 MB
+# .mp4 fell through to the generic fetcher, which buffers the whole body in
+# memory, and took the backend down. Check Content-Length from the response
+# headers *before* any body is read.
+MAX_MEDIA_BYTES = 200 * 1024 * 1024
+MAX_DOCUMENT_BYTES = 50 * 1024 * 1024
+
+
+def _probe_download(url: str) -> tuple[int | None, str]:
+    """Return (content_length or None, content-type) from response headers only.
+
+    Streams the GET and closes before reading any body (some CDNs reject HEAD).
+    Any failure returns (None, "") so the normal fetch path decides what to do.
+    """
+    try:
+        with httpx.stream(
+            "GET", url, follow_redirects=True, timeout=10,
+            headers={"Accept-Encoding": "identity"},
+        ) as r:
+            raw = r.headers.get("content-length")
+            length = int(raw) if raw and raw.isdigit() else None
+            ctype = (r.headers.get("content-type") or "").split(";")[0].strip().lower()
+            return length, ctype
+    except Exception as e:
+        logger.info("size probe failed for %s: %s", url, e)
+        return None, ""
+
+
 def _looks_like_audio(url: str) -> bool:
     try:
         return urlparse(url).path.lower().endswith(_AUDIO_SUFFIXES)
@@ -1427,8 +1455,21 @@ async def _fetch_url_uncached(
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, _fetch_tweet, url, max_whisper_duration)
 
-    if _looks_like_audio(url):
-        loop = asyncio.get_running_loop()
+    looks_audio = _looks_like_audio(url)
+    loop = asyncio.get_running_loop()
+    length, ctype = await loop.run_in_executor(None, _probe_download, url)
+    is_media = looks_audio or ctype.startswith(("audio/", "video/"))
+    limit = MAX_MEDIA_BYTES if is_media else MAX_DOCUMENT_BYTES
+    if length is not None and length > limit:
+        logger.warning("Refusing %s: %d bytes exceeds %d (%s)", url, length, limit, ctype or "unknown type")
+        return {
+            "text": "", "title": url, "source_type": "video" if is_media else "unknown",
+            "reason": fetch_errors.FILE_TOO_LARGE,
+        }
+
+    # Direct audio/video file (e.g. a bare .mp4 on a CDN): transcribe it rather
+    # than feeding the bytes to the HTML extractor.
+    if is_media:
         return await loop.run_in_executor(
             None, _transcribe_audio_url, url, max_whisper_duration
         )

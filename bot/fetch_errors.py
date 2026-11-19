@@ -23,6 +23,7 @@ VIDEO_UNAVAILABLE = "video_unavailable"
 JS_REQUIRED = "js_required"
 PAYWALLED = "paywalled"
 BLOCKED_URL = "blocked_url"
+FILE_TOO_LARGE = "file_too_large"
 YOUTUBE_CHANNEL = "youtube_channel"
 # Retryable: a fresh video whose captions YouTube hasn't generated (or hasn't
 # finished generating in the spoken language) yet. Only returned when the
@@ -43,6 +44,11 @@ _USER_MESSAGES: dict[str, str] = {
         "This video has no subtitles and is too long for us to transcribe "
         "automatically. Try a video with captions, or a shorter one. Signing in "
         "raises the length limit."
+    ),
+    FILE_TOO_LARGE: (
+        "That file is too large for us to download and process (limit: 200 MB for "
+        "audio/video, 50 MB for pages and documents). Try a link to a shorter "
+        "recording, or one with captions."
     ),
     WHISPER_FAILED: (
         "Couldn't transcribe this video's audio. The source may be blocking "
