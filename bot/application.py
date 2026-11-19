@@ -58,8 +58,22 @@ async def _check_allowlist(update: Update, context) -> None:
 from telegram.ext import ApplicationHandlerStop  # noqa: E402
 
 
+async def _on_error(update: object, context) -> None:
+    """Last-resort handler: log the traceback and tell the user, so an unhandled
+    exception in any handler never leaves a chat silent after an ack message."""
+    logger.error("Unhandled exception in Telegram handler", exc_info=context.error)
+    message = getattr(update, "effective_message", None)
+    if message is None:
+        return
+    try:
+        await message.reply_text("Something went wrong on my side. Please try again in a bit.")
+    except Exception:
+        logger.exception("Could not send error notice to user")
+
+
 def build_application(token: str) -> Application:
     app = Application.builder().token(token).build()
+    app.add_error_handler(_on_error)
 
     # Allowlist check runs first for every update (group -1)
     app.add_handler(TypeHandler(Update, _check_allowlist), group=-1)

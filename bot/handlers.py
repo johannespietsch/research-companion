@@ -1,5 +1,8 @@
+import asyncio
 import base64
+import html
 import logging
+import re
 import tempfile
 from pathlib import Path
 
@@ -12,7 +15,7 @@ from bot.config import MAX_CONTENT_CHARS
 from bot.db import get_item, get_or_create_user_by_telegram, get_user_profile, save_item
 from bot.fetch_errors import user_message as fetch_error_message
 from bot.formatting import format_agent_brief, format_analysis
-from bot.pipeline import PipelineError, analyze_url, title_from_text
+from bot.pipeline import ERR_ANALYZE_FAILED, ERR_BUSY, PipelineError, analyze_url, title_from_text
 from bot.storage import save_file_from_path
 from bot.transcriber import transcribe
 
@@ -49,13 +52,35 @@ def _suggestions_keyboard(analysis: dict, item_id: int | None) -> InlineKeyboard
     return InlineKeyboardMarkup(rows)
 
 
+# Hard ceiling on one URL's fetch+analyse run from Telegram. Whisper may legitimately
+# take a long time, but past this the user is better served by a clear message than
+# by silence after "Fetching and analysing …".
+URL_ANALYSIS_TIMEOUT_S = 20 * 60
+_TELEGRAM_MAX_MESSAGE_CHARS = 4096
+_GENERIC_ERROR_MSG = "Something went wrong on my side and I couldn't finish that. Please try again in a bit."
+
+
 async def _reply_analysis(message, analysis: dict, item_id: int | None) -> None:
-    """Send the analysis with a 'try it' button per suggestion (brief on demand)."""
-    await message.reply_text(
-        format_analysis(analysis),
-        parse_mode="HTML",
-        reply_markup=_suggestions_keyboard(analysis, item_id),
-    )
+    """Send the analysis with a 'try it' button per suggestion (brief on demand).
+
+    Telegram rejects HTML it can't parse and anything over 4096 chars; either used
+    to propagate and leave the chat silent after the "Fetching…" ack. Fall back to
+    tag-stripped plain text, split to fit.
+    """
+    formatted = format_analysis(analysis)
+    keyboard = _suggestions_keyboard(analysis, item_id)
+    try:
+        await message.reply_text(formatted, parse_mode="HTML", reply_markup=keyboard)
+        return
+    except Exception:
+        logger.exception("Sending formatted analysis failed; falling back to plain text")
+    plain = html.unescape(re.sub(r"<[^>]+>", "", formatted))
+    chunks = [
+        plain[i : i + _TELEGRAM_MAX_MESSAGE_CHARS]
+        for i in range(0, len(plain), _TELEGRAM_MAX_MESSAGE_CHARS)
+    ] or ["(empty analysis)"]
+    for n, chunk in enumerate(chunks):
+        await message.reply_text(chunk, reply_markup=keyboard if n == len(chunks) - 1 else None)
 
 
 async def on_try_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -149,14 +174,32 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         for url in urls:
             await message.reply_text(f"Fetching and analysing {url} ...")
             try:
-                result = await analyze_url(
-                    url,
-                    ctx=UsageContext(user_id=user_id),
-                    save_for_user_id=user_id,
-                    user_note=user_note,
+                result = await asyncio.wait_for(
+                    analyze_url(
+                        url,
+                        ctx=UsageContext(user_id=user_id),
+                        save_for_user_id=user_id,
+                        user_note=user_note,
+                    ),
+                    timeout=URL_ANALYSIS_TIMEOUT_S,
                 )
             except PipelineError as e:
-                await message.reply_text(fetch_error_message(e.fetched.get("reason"), url))
+                logger.warning("Telegram URL analysis failed for %s: %s", url, e.code)
+                if e.code in (ERR_BUSY, ERR_ANALYZE_FAILED):
+                    await message.reply_text(str(e) if e.code == ERR_BUSY else _GENERIC_ERROR_MSG)
+                else:
+                    await message.reply_text(fetch_error_message(e.fetched.get("reason"), url))
+                continue
+            except asyncio.TimeoutError:
+                logger.error("Telegram URL analysis timed out after %ss for %s", URL_ANALYSIS_TIMEOUT_S, url)
+                await message.reply_text(
+                    f"That took too long (over {URL_ANALYSIS_TIMEOUT_S // 60} min), so I gave up on {url}. "
+                    "Try again, or send a shorter source."
+                )
+                continue
+            except Exception:
+                logger.exception("Telegram URL analysis crashed for %s", url)
+                await message.reply_text(_GENERIC_ERROR_MSG)
                 continue
             await _reply_analysis(message, result.analysis, result.saved_id)
     else:
